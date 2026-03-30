@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+venv/
+*.db
+secretary_pro.db
+debug_network.py
+deploy.ps1
