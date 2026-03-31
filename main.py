@@ -17,6 +17,44 @@ from datetime import datetime
 
 app = FastAPI(title="Secretary CRM - DesignLeaf")
 
+TASKS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT,
+    task_type TEXT DEFAULT 'interni_poznamka',
+    status TEXT DEFAULT 'novy',
+    priority TEXT DEFAULT 'bezna',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    deadline TEXT,
+    planned_date TEXT,
+    time_window_start TEXT,
+    time_window_end TEXT,
+    estimated_minutes INTEGER,
+    actual_minutes INTEGER,
+    created_by TEXT,
+    assigned_to TEXT,
+    delegated_by TEXT,
+    client_id BIGINT,
+    client_name TEXT,
+    job_id BIGINT,
+    property_id BIGINT,
+    property_address TEXT,
+    is_recurring BOOLEAN DEFAULT FALSE,
+    recurrence_rule TEXT,
+    result TEXT,
+    notes JSONB DEFAULT '[]',
+    communication_method TEXT,
+    source TEXT DEFAULT 'manualne',
+    is_billable BOOLEAN DEFAULT FALSE,
+    has_cost BOOLEAN DEFAULT FALSE,
+    waiting_for_payment BOOLEAN DEFAULT FALSE,
+    checklist JSONB DEFAULT '[]',
+    is_completed BOOLEAN DEFAULT FALSE,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+"""
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 print(f"OPENAI_API_KEY present: {bool(OPENAI_API_KEY)} (length: {len(OPENAI_API_KEY)})")
 if not OPENAI_API_KEY:
@@ -38,6 +76,12 @@ def init_pool():
     try:
         db_pool = pool.ThreadedConnectionPool(2, 10, **DB_CONFIG)
         print(f"DB pool OK: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}")
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute(TASKS_TABLE_SQL)
+            conn.commit()
+        db_pool.putconn(conn)
+        print("Tasks table ready")
     except Exception as e:
         print(f"DB pool FAIL: {e}")
 
@@ -315,6 +359,74 @@ async def test_ai():
         return {"status":"ok", "response": r.choices[0].message.content, "key_length": len(OPENAI_API_KEY)}
     except Exception as e:
         return {"status":"error", "message": f"{type(e).__name__}: {str(e)}", "key_length": len(OPENAI_API_KEY)}
+
+@app.get("/crm/tasks")
+async def get_tasks(status: Optional[str] = None, completed: Optional[bool] = None):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = "SELECT * FROM tasks WHERE 1=1"
+            params = []
+            if status: sql += " AND status = %s"; params.append(status)
+            if completed is not None: sql += " AND is_completed = %s"; params.append(completed)
+            sql += " ORDER BY created_at DESC"
+            cur.execute(sql, params)
+            return cur.fetchall()
+    finally: release_conn(conn)
+
+@app.post("/crm/tasks")
+async def create_task(data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            tid = data.get("id", str(uuid.uuid4()))
+            cur.execute("""INSERT INTO tasks (id,title,description,task_type,status,priority,deadline,planned_date,
+                time_window_start,time_window_end,estimated_minutes,created_by,assigned_to,delegated_by,
+                client_id,client_name,job_id,property_id,property_address,is_recurring,recurrence_rule,
+                communication_method,source,is_billable,has_cost,checklist)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (tid, data.get("title",""), data.get("description"), data.get("task_type","interni_poznamka"),
+                 data.get("status","novy"), data.get("priority","bezna"), data.get("deadline"),
+                 data.get("planned_date"), data.get("time_window_start"), data.get("time_window_end"),
+                 data.get("estimated_minutes"), data.get("created_by","Marek"), data.get("assigned_to"),
+                 data.get("delegated_by"), data.get("client_id"), data.get("client_name"),
+                 data.get("job_id"), data.get("property_id"), data.get("property_address"),
+                 data.get("is_recurring",False), data.get("recurrence_rule"),
+                 data.get("communication_method"), data.get("source","manualne"),
+                 data.get("is_billable",False), data.get("has_cost",False),
+                 json.dumps(data.get("checklist",[]))))
+            conn.commit()
+            return {"id": tid, "status": "created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.put("/crm/tasks/{task_id}")
+async def update_task(task_id: str, data: dict):
+    conn = get_db_conn()
+    try:
+        sets = []; vals = []
+        for k in ["title","description","task_type","status","priority","deadline","assigned_to","result","is_completed","actual_minutes"]:
+            if k in data: sets.append(f"{k} = %s"); vals.append(data[k])
+        if "notes" in data: sets.append("notes = %s"); vals.append(json.dumps(data["notes"]))
+        if "checklist" in data: sets.append("checklist = %s"); vals.append(json.dumps(data["checklist"]))
+        sets.append("updated_at = now()")
+        vals.append(task_id)
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = %s", vals)
+            conn.commit()
+            return {"status": "updated"}
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.delete("/crm/tasks/{task_id}")
+async def delete_task(task_id: str):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
+            conn.commit()
+            return {"status": "deleted"}
+    finally: release_conn(conn)
 
 @app.get("/health")
 async def health():
