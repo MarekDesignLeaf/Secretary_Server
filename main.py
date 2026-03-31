@@ -147,7 +147,7 @@ PRAVIDLA: Odpovez cesky, strucne, lidsky. Pamatuj si celou historii. Pro kontakt
             {"type":"function","function":{"name":"search_contacts","description":"Hleda v CRM i telefonu","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
             {"type":"function","function":{"name":"call_contact","description":"Zavola cislo","parameters":{"type":"object","properties":{"phone":{"type":"string"}},"required":["phone"]}}},
             {"type":"function","function":{"name":"create_client","description":"Novy klient","parameters":{"type":"object","properties":{"name":{"type":"string"},"email":{"type":"string"},"phone":{"type":"string"}},"required":["name"]}}},
-            {"type":"function","function":{"name":"create_task","description":"Novy ukol","parameters":{"type":"object","properties":{"title":{"type":"string"},"priority":{"type":"string","enum":["low","normal","high","urgent"]}},"required":["title"]}}},
+            {"type":"function","function":{"name":"create_task","description":"Vytvori novy ukol/task. Pouzij pro vse co se ma udelat, zavolat, objednat, naplanovany atd.","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev ukolu"},"description":{"type":"string","description":"Detailni popis co se ma udelat"},"task_type":{"type":"string","enum":["volat","email","schuzka","zmenit_schuzku","zrusit_schuzku","objednat_material","vytvorit_kalkulaci","poslat_kalkulaci","navsteva_klienta","zamereni","realizace","kontrola","reklamace","pripomenout_se","interni_poznamka","fotodokumentace"],"description":"Typ ukolu"},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"deadline":{"type":"string","description":"Deadline ve formatu YYYY-MM-DD"},"assigned_to":{"type":"string","description":"Komu je prirazen"},"client_name":{"type":"string","description":"Jmeno klienta pokud souvisi"},"status":{"type":"string","enum":["novy","ceka","naplanovany","v_reseni","ceka_na_klienta","ceka_na_material","ceka_na_platbu"]}},"required":["title"]}}},
             {"type":"function","function":{"name":"send_email","description":"Posle email","parameters":{"type":"object","properties":{"to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},"required":["to","subject","body"]}}},
             {"type":"function","function":{"name":"import_database","description":"Import dat (vyzaduje potvrzeni)","parameters":{"type":"object","properties":{"table":{"type":"string"},"source":{"type":"string"}},"required":["table"]}}}
         ]
@@ -170,6 +170,9 @@ PRAVIDLA: Odpovez cesky, strucne, lidsky. Pamatuj si celou historii. Pro kontakt
                 return {"reply_cs": ai_msg.content or f"Hledam '{q}'...", "action_type":"SEARCH_CONTACTS", "action_data":{"query":q,"crm_results":[dict(r) for r in crm]}, "is_question":True}
             if action == "IMPORT_DATABASE":
                 return {"reply_cs": ai_msg.content or "Potvrd import.", "action_type":"IMPORT_DATABASE", "action_data":args, "needs_confirmation":True, "is_question":True}
+            if action == "CREATE_TASK":
+                title = args.get("title", "Ukol")
+                return {"reply_cs": f"Vytvořila jsem úkol: {title}.", "action_type":"CREATE_TASK", "action_data":args}
             return {"reply_cs": ai_msg.content or f"Provadim {call.function.name}...", "action_type":action, "action_data":args}
         reply = ai_msg.content or "Rozumim."
         return {"reply_cs": reply, "is_question": "?" in reply}
