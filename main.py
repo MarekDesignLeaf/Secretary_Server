@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS activity_timeline (
     description TEXT NOT NULL, user_name TEXT DEFAULT 'Marek',
     created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS photos (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+    filename TEXT NOT NULL, description TEXT,
+    file_path TEXT, thumbnail_base64 TEXT,
+    created_by TEXT DEFAULT 'Marek', created_at TIMESTAMPTZ DEFAULT now()
+);
 DO $$ BEGIN
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name TEXT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email TEXT;
@@ -59,6 +66,9 @@ DO $$ BEGIN
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS client_id BIGINT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS job_id BIGINT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS comm_type TEXT DEFAULT 'telefon';
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS job_id BIGINT;
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS notes TEXT;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 """
@@ -754,13 +764,16 @@ async def create_invoice(data: dict):
 
 # ========== REST API: COMMUNICATIONS ==========
 @app.get("/crm/communications")
-async def get_communications(client_id: Optional[int]=None):
+async def get_communications(client_id: Optional[int]=None, job_id: Optional[int]=None):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            if client_id: cur.execute("SELECT id,client_id,subject,message_summary,sent_at::text,direction FROM communications WHERE client_id=%s ORDER BY created_at DESC",(client_id,))
-            else: cur.execute("SELECT id,client_id,subject,message_summary,sent_at::text,direction FROM communications ORDER BY created_at DESC LIMIT 50")
-            return cur.fetchall()
+            sql = "SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes FROM communications WHERE 1=1"
+            params = []
+            if client_id: sql += " AND client_id=%s"; params.append(client_id)
+            if job_id: sql += " AND job_id=%s"; params.append(job_id)
+            sql += " ORDER BY created_at DESC LIMIT 50"
+            cur.execute(sql, params); return cur.fetchall()
     finally: release_conn(conn)
 
 @app.post("/crm/communications")
@@ -768,10 +781,46 @@ async def log_communication(data: dict):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO communications (client_id,subject,message_summary,direction,sent_at) VALUES (%s,%s,%s,%s,now()) RETURNING id",
-                (data.get("client_id"),data.get("subject"),data.get("message",data.get("message_summary","")),data.get("direction","outbound")))
-            cid = cur.fetchone()['id']; conn.commit()
-        return {"id":cid,"status":"logged"}
+            cur.execute("""INSERT INTO communications (client_id,job_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,now()) RETURNING id,comm_type,subject,direction""",
+                (data.get("client_id"),data.get("job_id"),data.get("comm_type","telefon"),
+                 data.get("subject"),data.get("message",data.get("message_summary","")),
+                 data.get("direction","outbound"),data.get("notes")))
+            comm = dict(cur.fetchone())
+            if data.get("client_id"):
+                log_activity(conn,"client",data["client_id"],"communication",f"{comm.get('comm_type','')}: {comm.get('subject','')}")
+            conn.commit()
+        return comm
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+# ========== REST API: PHOTOS ==========
+@app.get("/crm/photos")
+async def get_photos(entity_type: Optional[str]=None, entity_id: Optional[str]=None):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = "SELECT id,entity_type,entity_id,filename,description,created_by,created_at::text FROM photos WHERE 1=1"
+            params = []
+            if entity_type: sql += " AND entity_type=%s"; params.append(entity_type)
+            if entity_id: sql += " AND entity_id=%s"; params.append(entity_id)
+            sql += " ORDER BY created_at DESC"
+            cur.execute(sql, params); return cur.fetchall()
+    finally: release_conn(conn)
+
+@app.post("/crm/photos")
+async def add_photo(data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO photos (entity_type,entity_id,filename,description,file_path,created_by)
+                VALUES (%s,%s,%s,%s,%s,%s) RETURNING id,filename,created_at::text""",
+                (data.get("entity_type","job"),data.get("entity_id","0"),data.get("filename","photo.jpg"),
+                 data.get("description"),data.get("file_path"),data.get("created_by","Marek")))
+            photo = dict(cur.fetchone())
+            log_activity(conn,data.get("entity_type","job"),str(data.get("entity_id","0")),"photo",f"Foto: {data.get('filename','')}")
+            conn.commit()
+        return photo
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
