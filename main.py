@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS activity_timeline (
     description TEXT NOT NULL, user_name TEXT DEFAULT 'Marek',
     created_at TIMESTAMPTZ DEFAULT now()
 );
+DO $$ BEGIN
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name TEXT;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email TEXT;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_phone TEXT;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS description TEXT;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS client_id BIGINT;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS job_id BIGINT;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
 """
 
 # === CONFIG ===
@@ -255,7 +266,9 @@ PRAVIDLA:
                 try:
                     code = f"LED-{uuid.uuid4().hex[:6].upper()}"
                     with conn.cursor() as cur:
-                        cur.execute("INSERT INTO leads (lead_code,lead_source,status) VALUES (%s,%s,'new') RETURNING id",(code,args.get("source","jiny")))
+                        cur.execute("""INSERT INTO leads (lead_code,lead_source,status,contact_name,contact_email,contact_phone,description)
+                            VALUES (%s,%s,'new',%s,%s,%s,%s) RETURNING id""",
+                            (code,args.get("source","jiny"),n,args.get("email"),args.get("phone"),args.get("note",args.get("description"))))
                         lid = cur.fetchone()['id']
                         log_activity(conn,"lead",lid,"create",f"Lead '{n}' z {args.get('source','?')}")
                         conn.commit()
@@ -626,12 +639,91 @@ async def create_lead(data: dict):
     try:
         code = f"LED-{uuid.uuid4().hex[:6].upper()}"
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO leads (lead_code,lead_source,status) VALUES (%s,%s,'new') RETURNING id,lead_code,status,received_at::text",
-                (code,data.get("source","jiny")))
+            cur.execute("""INSERT INTO leads (lead_code,lead_source,status,contact_name,contact_email,contact_phone,description)
+                VALUES (%s,%s,'new',%s,%s,%s,%s) RETURNING id,lead_code,status,received_at::text""",
+                (code,data.get("source","jiny"),data.get("name",data.get("contact_name")),
+                 data.get("email",data.get("contact_email")),data.get("phone",data.get("contact_phone")),
+                 data.get("description")))
             lead = dict(cur.fetchone())
             log_activity(conn,"lead",lead['id'],"create",f"Lead {code} vytvoren")
             conn.commit()
         return lead
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.get("/crm/leads/{lead_id}")
+async def get_lead_detail(lead_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM leads WHERE id=%s",(lead_id,))
+            lead = cur.fetchone()
+            if not lead: raise HTTPException(404)
+            return dict(lead)
+    finally: release_conn(conn)
+
+@app.put("/crm/leads/{lead_id}")
+async def update_lead(lead_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        sets = []; vals = []
+        for k in ["status","lead_source","contact_name","contact_email","contact_phone","description","notes"]:
+            if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
+        if not sets: raise HTTPException(400)
+        sets.append("updated_at=now()"); vals.append(lead_id)
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE leads SET {','.join(sets)} WHERE id=%s",vals)
+            log_activity(conn,"lead",lead_id,"update",f"Lead upraven: {list(data.keys())}")
+            conn.commit()
+        return {"status":"updated"}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.post("/crm/leads/{lead_id}/convert-to-client")
+async def convert_lead_to_client(lead_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM leads WHERE id=%s",(lead_id,))
+            lead = cur.fetchone()
+            if not lead: raise HTTPException(404,"Lead nenalezen")
+            name = data.get("name",lead.get("contact_name","Nový klient"))
+            email = data.get("email",lead.get("contact_email"))
+            phone = data.get("phone",lead.get("contact_phone"))
+            code = f"CL-{uuid.uuid4().hex[:6].upper()}"
+            cur.execute("INSERT INTO clients (client_code,client_type,display_name,email_primary,phone_primary,status) VALUES (%s,'domestic',%s,%s,%s,'active') RETURNING id",
+                (code,name,email,phone))
+            cid = cur.fetchone()['id']
+            cur.execute("UPDATE leads SET status='preveden_na_klienta',client_id=%s,updated_at=now() WHERE id=%s",(cid,lead_id))
+            log_activity(conn,"lead",lead_id,"convert","Lead preveden na klienta "+code)
+            log_activity(conn,"client",cid,"create","Klient vytvoren z leadu "+lead.get('lead_code',''))
+            conn.commit()
+        return {"client_id":cid,"client_code":code,"status":"converted"}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.post("/crm/leads/{lead_id}/convert-to-job")
+async def convert_lead_to_job(lead_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM leads WHERE id=%s",(lead_id,))
+            lead = cur.fetchone()
+            if not lead: raise HTTPException(404)
+            jcode = f"JOB-{uuid.uuid4().hex[:6].upper()}"
+            title = data.get("title","Zakázka z leadu "+lead.get('lead_code',''))
+            client_id = data.get("client_id",lead.get("client_id"))
+            cur.execute("INSERT INTO jobs (job_number,client_id,job_title,job_status) VALUES (%s,%s,%s,'nova') RETURNING id",
+                (jcode,client_id,title))
+            jid = cur.fetchone()['id']
+            cur.execute("UPDATE leads SET status='preveden_na_zakazku',job_id=%s,updated_at=now() WHERE id=%s",(jid,lead_id))
+            log_activity(conn,"lead",lead_id,"convert","Lead preveden na zakazku "+jcode)
+            log_activity(conn,"job",jid,"create","Zakazka vytvorena z leadu "+lead.get('lead_code',''))
+            conn.commit()
+        return {"job_id":jid,"job_number":jcode,"status":"converted"}
+    except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
