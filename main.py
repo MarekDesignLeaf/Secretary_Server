@@ -1292,7 +1292,7 @@ async def voice_session_input(data: dict):
                     whatsapp = generate_whatsapp(ctx)
                     reply = get_prompt("confirm",lang)
                     return {"session_id":sid,"step":"done","prompt":reply,"work_report_id":rid,"whatsapp_message":whatsapp,"summary":generate_summary(ctx,lang)}
-                except Exception as e:
+                  except Exception as e:
                     conn.rollback(); raise HTTPException(500,f"Save error: {e}")
 
             # === AUDIT: structured voice step log ===
