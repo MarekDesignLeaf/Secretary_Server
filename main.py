@@ -143,7 +143,18 @@ async def process_message(msg: MessageRequest):
         system_prompt = f"""Jsi inteligentni sekretarka firmy DesignLeaf (zahradnicke sluzby, Oxfordshire UK).
 CAS: {now}. KONTEXT: {entity_ctx or 'Zadny.'}
 KALENDAR: {msg.calendar_context or 'Neni.'}
-PRAVIDLA: Odpovez cesky, strucne, lidsky. Pamatuj historii. NIKDY nerci 'provadim...' — vzdy odpovez lidsky co jsi udelala."""
+PRAVIDLA:
+- Odpovez cesky, strucne, lidsky. Pamatuj historii.
+- NIKDY nerci 'provadim...' — vzdy odpovez lidsky co jsi udelala.
+- Pro vytvoreni ukolu pouzij create_task. Pro zmenu stavu update_task. Pro dokonceni complete_task.
+- Pro seznam ukolu pouzij list_tasks.
+- Pro zakazky: create_job pro novou, update_job pro zmenu stavu.
+- Pro poznamky: add_note s entity_type 'client' nebo 'job'.
+- Pro leady: create_lead.
+- Pro kalendar: list_calendar_events, add/modify/delete_calendar_event.
+- Pro kontakty: search_contacts, call_contact.
+- Kdyz se Marek zepta 'co mam delat' nebo 'jake mam ukoly', pouzij list_tasks.
+- Kdyz rekne 'hotovo' nebo 'splneno' u ukolu, pouzij complete_task."""
 
         tools = [
             {"type":"function","function":{"name":"add_calendar_event","description":"Prida schuzku do kalendare","parameters":{"type":"object","properties":{"title":{"type":"string"},"start_time":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"duration":{"type":"integer","description":"minuty"}},"required":["title","start_time"]}}},
@@ -158,6 +169,10 @@ PRAVIDLA: Odpovez cesky, strucne, lidsky. Pamatuj historii. NIKDY nerci 'provadi
             {"type":"function","function":{"name":"create_job","description":"Vytvori novou zakazku","parameters":{"type":"object","properties":{"title":{"type":"string"},"client_name":{"type":"string"},"description":{"type":"string"},"start_date":{"type":"string"}},"required":["title"]}}},
             {"type":"function","function":{"name":"add_note","description":"Prida poznamku ke klientovi nebo zakazce","parameters":{"type":"object","properties":{"entity_type":{"type":"string","enum":["client","job"]},"entity_name":{"type":"string"},"note":{"type":"string"}},"required":["entity_type","note"]}}},
             {"type":"function","function":{"name":"create_lead","description":"Vytvori novy lead/poptavku","parameters":{"type":"object","properties":{"name":{"type":"string"},"source":{"type":"string","enum":["checkatrade","web","telefon","doporuceni","jiny"]},"note":{"type":"string"}},"required":["name","source"]}}},
+            {"type":"function","function":{"name":"update_task","description":"Zmeni stav, prioritu nebo vysledek ukolu","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev ukolu k nalezeni"},"status":{"type":"string","enum":["novy","naplanovany","v_reseni","ceka_na_klienta","ceka_na_material","ceka_na_platbu","hotovo","zruseno","predano_dal"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"result":{"type":"string","description":"Vysledek ukolu"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"update_job","description":"Zmeni stav zakazky","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev zakazky"},"status":{"type":"string","enum":["nova","v_reseni","ceka_na_klienta","ceka_na_material","naplanovano","v_realizaci","dokonceno","vyfakturovano","uzavreno","pozastaveno","zruseno"]}},"required":["title"]}}},
+            {"type":"function","function":{"name":"list_tasks","description":"Vypise ukoly podle filtru","parameters":{"type":"object","properties":{"status":{"type":"string"},"client_name":{"type":"string"},"only_active":{"type":"boolean","default":true}}}}},
+            {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
         ]
 
         messages = [{"role":"system","content":system_prompt}]
@@ -272,6 +287,77 @@ PRAVIDLA: Odpovez cesky, strucne, lidsky. Pamatuj historii. NIKDY nerci 'provadi
                             else: return {"reply_cs":f"Zakazka '{ename}' nenalezena."}
                         conn.commit()
                     return {"reply_cs":f"Poznámka přidána.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                finally: release_conn(conn)
+
+            if action == "UPDATE_TASK":
+                title_q = args.get("title","")
+                conn = get_db_conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id,title FROM tasks WHERE title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
+                        row = cur.fetchone()
+                        if not row: return {"reply_cs":f"Úkol '{title_q}' nenalezen."}
+                        sets = []; vals = []
+                        if "status" in args: sets.append("status=%s"); vals.append(args["status"])
+                        if "priority" in args: sets.append("priority=%s"); vals.append(args["priority"])
+                        if "result" in args: sets.append("result=%s"); vals.append(args["result"])
+                        if sets:
+                            sets.append("updated_at=now()"); vals.append(row['id'])
+                            cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=%s",vals)
+                            log_activity(conn,"task",row['id'],"update",f"Ukol '{row['title']}' upraven")
+                            conn.commit()
+                        changes = ", ".join([f"{k}={v}" for k,v in args.items() if k != "title"])
+                    return {"reply_cs":f"Úkol '{row['title']}' upraven: {changes}.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                finally: release_conn(conn)
+
+            if action == "UPDATE_JOB":
+                title_q = args.get("title","")
+                conn = get_db_conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id,job_title,job_status FROM jobs WHERE job_title ILIKE %s AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
+                        row = cur.fetchone()
+                        if not row: return {"reply_cs":f"Zakázka '{title_q}' nenalezena."}
+                        new_status = args.get("status",row['job_status'])
+                        cur.execute("UPDATE jobs SET job_status=%s,updated_at=now() WHERE id=%s",(new_status,row['id']))
+                        log_activity(conn,"job",row['id'],"status_change",f"Zakazka '{row['job_title']}': {row['job_status']} -> {new_status}")
+                        conn.commit()
+                    return {"reply_cs":f"Zakázka '{row['job_title']}' změněna na: {new_status}.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                finally: release_conn(conn)
+
+            if action == "LIST_TASKS":
+                conn = get_db_conn()
+                try:
+                    with conn.cursor() as cur:
+                        sql = "SELECT title,status,priority,client_name,deadline FROM tasks WHERE 1=1"
+                        params = []
+                        if args.get("only_active",True): sql += " AND is_completed=FALSE AND status NOT IN ('hotovo','zruseno')"
+                        if args.get("status"): sql += " AND status=%s"; params.append(args["status"])
+                        if args.get("client_name"): sql += " AND client_name ILIKE %s"; params.append(f"%{args['client_name']}%")
+                        sql += " ORDER BY CASE priority WHEN 'kriticka' THEN 1 WHEN 'urgentni' THEN 2 WHEN 'vysoka' THEN 3 ELSE 4 END LIMIT 15"
+                        cur.execute(sql,params)
+                        rows = cur.fetchall()
+                    if not rows: return {"reply_cs":"Nemáš žádné aktivní úkoly."}
+                    items = [f"- {r['title']} ({r['priority']}, {r['status']})" + (f" klient: {r['client_name']}" if r.get('client_name') else "") + (f" DL: {r['deadline']}" if r.get('deadline') else "") for r in rows]
+                    return {"reply_cs":f"Máš {len(rows)} úkolů:\n" + "\n".join(items),"action_type":"LIST_TASKS"}
+                finally: release_conn(conn)
+
+            if action == "COMPLETE_TASK":
+                title_q = args.get("title","")
+                conn = get_db_conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id,title FROM tasks WHERE title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
+                        row = cur.fetchone()
+                        if not row: return {"reply_cs":f"Úkol '{title_q}' nenalezen nebo už je hotový."}
+                        result = args.get("result","Dokončeno")
+                        cur.execute("UPDATE tasks SET status='hotovo',is_completed=TRUE,result=%s,updated_at=now() WHERE id=%s",(result,row['id']))
+                        log_activity(conn,"task",row['id'],"complete",f"Ukol '{row['title']}' dokoncen: {result}")
+                        conn.commit()
+                    return {"reply_cs":f"Úkol '{row['title']}' dokončen. Výsledek: {result}","action_type":"REFRESH"}
                 except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
