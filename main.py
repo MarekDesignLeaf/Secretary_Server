@@ -57,6 +57,53 @@ CREATE TABLE IF NOT EXISTS photos (
     file_path TEXT, thumbnail_base64 TEXT,
     created_by TEXT DEFAULT 'Marek', created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS work_reports (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT DEFAULT 1, client_id BIGINT NOT NULL, property_id BIGINT,
+    job_id BIGINT, work_date DATE NOT NULL, total_hours DECIMAL NOT NULL,
+    total_price DECIMAL DEFAULT 0, currency TEXT DEFAULT 'GBP',
+    notes TEXT, created_by BIGINT, input_type TEXT DEFAULT 'voice',
+    status TEXT DEFAULT 'draft', created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS work_report_workers (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    work_report_id BIGINT NOT NULL, user_id BIGINT,
+    worker_name TEXT NOT NULL, hours DECIMAL NOT NULL,
+    hourly_rate DECIMAL DEFAULT 0, total_price DECIMAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS work_report_entries (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    work_report_id BIGINT NOT NULL, type TEXT NOT NULL,
+    description TEXT, hours DECIMAL DEFAULT 0,
+    unit_rate DECIMAL DEFAULT 0, total_price DECIMAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS work_report_materials (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    work_report_id BIGINT NOT NULL, material_name TEXT NOT NULL,
+    quantity DECIMAL DEFAULT 0, unit TEXT DEFAULT 'ks',
+    unit_price DECIMAL DEFAULT 0, total_price DECIMAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS work_report_waste (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    work_report_id BIGINT NOT NULL, quantity DECIMAL DEFAULT 0,
+    unit TEXT DEFAULT 'bulkbag', unit_price DECIMAL DEFAULT 0,
+    total_price DECIMAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS voice_sessions (
+    id TEXT PRIMARY KEY, tenant_id INT DEFAULT 1,
+    user_id BIGINT, session_type TEXT DEFAULT 'work_report',
+    state TEXT DEFAULT 'init', dialog_step TEXT DEFAULT 'client',
+    context JSONB DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(), expires_at TIMESTAMPTZ DEFAULT now() + interval '1 hour'
+);
+CREATE TABLE IF NOT EXISTS pricing_rules (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT DEFAULT 1, scope TEXT DEFAULT 'system',
+    scope_id BIGINT, rule_type TEXT NOT NULL,
+    rule_key TEXT, rate DECIMAL NOT NULL,
+    currency TEXT DEFAULT 'GBP', created_at TIMESTAMPTZ DEFAULT now()
+);
 DO $$ BEGIN
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name TEXT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email TEXT;
@@ -69,6 +116,12 @@ DO $$ BEGIN
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS comm_type TEXT DEFAULT 'telefon';
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS job_id BIGINT;
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    ALTER TABLE clients ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
+    ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
+    ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS user_id_ref TEXT;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 """
@@ -110,10 +163,16 @@ def release_conn(conn):
     if db_pool: db_pool.putconn(conn)
     else: conn.close()
 
-def log_activity(conn, entity_type, entity_id, action, description):
+def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1, user_id=None, details=None):
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO activity_timeline (entity_type,entity_id,action,description) VALUES (%s,%s,%s,%s)",
-            (entity_type, str(entity_id), action, description))
+        cur.execute("""INSERT INTO activity_timeline
+            (entity_type, entity_id, action, description, user_name, tenant_id, user_id_ref, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())""",
+            (entity_type, str(entity_id), action,
+             description[:500] if description else "",
+             str(user_id) if user_id else "system",
+             tenant_id,
+             str(user_id) if user_id else None))
 
 @app.on_event("startup")
 async def startup():
@@ -924,6 +983,417 @@ async def test_ai():
         return {"status":"ok","response":r.choices[0].message.content}
     except Exception as e: return {"status":"error","message":str(e)}
 
+# ========== PRICING ENGINE ==========
+def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_id=None):
+    """Priority: job → client → system default"""
+    with conn.cursor() as cur:
+        if job_id:
+            cur.execute("SELECT rate FROM pricing_rules WHERE tenant_id=%s AND scope='job' AND scope_id=%s AND rule_type=%s AND (rule_key=%s OR rule_key IS NULL) ORDER BY rule_key DESC NULLS LAST LIMIT 1",
+                (tenant_id,job_id,rule_type,rule_key))
+            r = cur.fetchone()
+            if r: return float(r['rate'])
+        if client_id:
+            cur.execute("SELECT rate FROM pricing_rules WHERE tenant_id=%s AND scope='client' AND scope_id=%s AND rule_type=%s AND (rule_key=%s OR rule_key IS NULL) ORDER BY rule_key DESC NULLS LAST LIMIT 1",
+                (tenant_id,client_id,rule_type,rule_key))
+            r = cur.fetchone()
+            if r: return float(r['rate'])
+        cur.execute("SELECT rate FROM pricing_rules WHERE tenant_id=%s AND scope='system' AND rule_type=%s AND (rule_key=%s OR rule_key IS NULL) ORDER BY rule_key DESC NULLS LAST LIMIT 1",
+            (tenant_id,rule_type,rule_key))
+        r = cur.fetchone()
+        if r: return float(r['rate'])
+    defaults = {"worker_rate":35.0,"task_rate":35.0,"waste_rate":80.0,"material_price":0.0}
+    return defaults.get(rule_type, 0.0)
+
+# ========== DIALOG STATE MACHINE ==========
+DIALOG_STEPS = ["client","workers","total_hours","entries","validate_hours","materials","waste","notes","summary","confirm"]
+VALID_TRANSITIONS = {
+    "client": ["client","workers"],
+    "workers": ["workers","total_hours"],
+    "total_hours": ["total_hours","entries"],
+    "entries": ["entries","validate_hours","materials"],
+    "validate_hours": ["validate_hours","materials","entries"],
+    "materials": ["materials","waste"],
+    "waste": ["waste","notes"],
+    "notes": ["notes","summary"],
+    "summary": ["summary","confirm","client","workers","total_hours","entries","materials","waste","notes"],
+    "confirm": ["confirm"],
+}
+def validate_transition(current_step, next_step):
+    return next_step in VALID_TRANSITIONS.get(current_step, [])
+DIALOG_PROMPTS = {
+    "client": {"en":"Which client did you work for?","cs":"U kterého klienta jsi pracoval?","pl":"U którego klienta pracowałeś?"},
+    "workers": {"en":"Who worked? (names)","cs":"Kdo pracoval? (jména)","pl":"Kto pracował? (imiona)"},
+    "total_hours": {"en":"How many hours total?","cs":"Kolik hodin celkem?","pl":"Ile godzin łącznie?"},
+    "entries": {"en":"How many hours for each type of work? (e.g. pruning 4, maintenance 2)","cs":"Kolik hodin na každý typ práce? (např. prořez 4, údržba 2)","pl":"Ile godzin na każdy rodzaj pracy?"},
+    "validate_hours": {"en":"Hours don't match total. Fix entries or total.","cs":"Hodiny nesedí s celkem. Oprav položky nebo celkem.","pl":"Godziny się nie zgadzają. Popraw pozycje lub sumę."},
+    "materials": {"en":"Any materials used? (name, quantity, price) or 'no'","cs":"Použili jste materiál? (název, množství, cena) nebo 'ne'","pl":"Czy użyto materiałów? (nazwa, ilość, cena) lub 'nie'"},
+    "waste": {"en":"How many bulk bags of waste? (number or 'none')","cs":"Kolik pytlů odpadu? (číslo nebo 'žádný')","pl":"Ile worków odpadów? (liczba lub 'żaden')"},
+    "notes": {"en":"Any notes? (or 'no')","cs":"Chceš přidat poznámku? (nebo 'ne')","pl":"Chcesz dodać notatkę? (lub 'nie')"},
+    "summary": {"en":"Here is the summary. Say 'confirm' to save or 'edit [field]' to change.","cs":"Tady je shrnutí. Řekni 'potvrdit' pro uložení nebo 'oprav [pole]' pro změnu.","pl":"Oto podsumowanie. Powiedz 'potwierdź' aby zapisać lub 'popraw [pole]' aby zmienić."},
+    "confirm": {"en":"Work report saved.","cs":"Report uložen.","pl":"Raport zapisany."},
+}
+def get_prompt(step, lang="en"):
+    return DIALOG_PROMPTS.get(step,{}).get(lang, DIALOG_PROMPTS.get(step,{}).get("en",""))
+
+def generate_summary(ctx, lang="en"):
+    c = ctx
+    lines = []
+    client = c.get("client_name","?")
+    lines.append(f"Client: {client}" if lang=="en" else f"Klient: {client}" if lang=="cs" else f"Klient: {client}")
+    lines.append(f"Date: {c.get('work_date','today')}")
+    lines.append(f"Total hours: {c.get('total_hours',0)}")
+    for w in c.get("workers",[]):
+        lines.append(f"  {w.get('name','?')}: {w.get('hours',0)}h × £{w.get('rate',35)}/h = £{w.get('total',0):.2f}")
+    for e in c.get("entries",[]):
+        lines.append(f"  {e.get('type','work')}: {e.get('hours',0)}h × £{e.get('rate',35)}/h = £{e.get('total',0):.2f}")
+    for m in c.get("materials",[]):
+        lines.append(f"  Material: {m.get('name','?')} {m.get('qty',0)} × £{m.get('price',0)} = £{m.get('total',0):.2f}")
+    waste = c.get("waste",{})
+    if waste.get("qty",0) > 0:
+        lines.append(f"  Waste: {waste['qty']} bags × £{waste.get('rate',80)} = £{waste.get('total',0):.2f}")
+    lines.append(f"TOTAL: £{c.get('grand_total',0):.2f}")
+    if c.get("notes"): lines.append(f"Notes: {c['notes']}")
+    return "\n".join(lines)
+
+def generate_whatsapp(ctx):
+    c = ctx
+    lines = [f"Hello {c.get('client_name','')},", "", "Here is the summary of today's work:", ""]
+    for e in c.get("entries",[]):
+        lines.append(f"{e.get('type','Work')}: {e.get('hours',0)} hours × £{e.get('rate',35):.0f} = £{e.get('total',0):.2f}")
+    waste = c.get("waste",{})
+    if waste.get("qty",0) > 0:
+        lines.append(f"\nGarden waste disposal: {waste['qty']} bulk bags × £{waste.get('rate',80):.0f} = £{waste.get('total',0):.2f}")
+    for m in c.get("materials",[]):
+        lines.append(f"Material - {m.get('name','')}: {m.get('qty',0)} × £{m.get('price',0):.2f} = £{m.get('total',0):.2f}")
+    lines.append(f"\nTotal: £{c.get('grand_total',0):.2f}")
+    lines.append(f"\nMarek\nDesignLeaf\n07395 813008")
+    return "\n".join(lines)
+
+# ========== VOICE SESSION API ==========
+@app.post("/voice/session/start")
+async def voice_session_start(data: dict):
+    conn = get_db_conn()
+    try:
+        sid = str(uuid.uuid4())
+        tenant_id = data.get("tenant_id",1)
+        lang = data.get("language","en")
+        with conn.cursor() as cur:
+            ctx = json.dumps({"language":lang,"work_date":data.get("work_date",datetime.now().strftime("%Y-%m-%d"))})
+            cur.execute("INSERT INTO voice_sessions (id,tenant_id,user_id,session_type,state,dialog_step,context) VALUES (%s,%s,%s,'work_report','active','client',%s)",
+                (sid,tenant_id,data.get("user_id"),ctx))
+            conn.commit()
+        return {"session_id":sid,"step":"client","prompt":get_prompt("client",lang)}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.post("/voice/session/input")
+async def voice_session_input(data: dict):
+    sid = data.get("session_id")
+    text = data.get("text","").strip()
+    if not sid: raise HTTPException(400,"session_id required")
+    conn = get_db_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM voice_sessions WHERE id=%s AND state='active' FOR UPDATE",(sid,))
+            sess = cur.fetchone()
+            if not sess: raise HTTPException(404,"Session not found or expired")
+            # Tenant isolation check
+            req_tenant = data.get("tenant_id", 1)
+            if sess["tenant_id"] != req_tenant:
+                raise HTTPException(403, "Tenant mismatch")
+            ctx = json.loads(sess['context']) if sess['context'] else {}
+            original_ctx = json.loads(sess['context']) if sess['context'] else {}
+            step = sess['dialog_step']
+            lang = ctx.get("language","en")
+            tenant_id = sess['tenant_id']
+            next_step = step
+            reply = ""
+            error = None
+
+            # === STEP: CLIENT ===
+            if step == "client":
+                cur.execute("SELECT id,display_name FROM clients WHERE tenant_id=%s AND deleted_at IS NULL AND (display_name ILIKE %s OR client_code ILIKE %s) LIMIT 5",
+                    (tenant_id,f"%{text}%",f"%{text}%"))
+                matches = cur.fetchall()
+                if len(matches) == 1:
+                    ctx["client_id"] = matches[0]['id']; ctx["client_name"] = matches[0]['display_name']
+                    next_step = "workers"; reply = f"{matches[0]['display_name']}. {get_prompt('workers',lang)}"
+                elif len(matches) > 1:
+                    names = ", ".join([m['display_name'] for m in matches])
+                    reply = f"Found: {names}. Which one?" if lang=="en" else f"Nalezeni: {names}. Který?" if lang=="cs" else f"Znalezieni: {names}. Który?"
+                else:
+                    reply = "Client not found. Try again." if lang=="en" else "Klient nenalezen. Zkus znovu." if lang=="cs" else "Klient nie znaleziony. Spróbuj ponownie."
+
+            # === STEP: WORKERS ===
+            elif step == "workers":
+                names = [n.strip() for n in text.replace(" and ",",").replace(" a ",",").replace(" i ",",").split(",") if n.strip()]
+                workers = []; not_found = []
+                for name in names:
+                    cur.execute("SELECT id,display_name FROM users WHERE tenant_id=%s AND display_name ILIKE %s AND deleted_at IS NULL LIMIT 1",(tenant_id,f"%{name}%"))
+                    u = cur.fetchone()
+                    if u:
+                        rate = resolve_rate(conn,tenant_id,"worker_rate",rule_key=str(u['id']),job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
+                        workers.append({"name":u['display_name'],"user_id":u['id'],"hours":0,"rate":rate,"total":0})
+                    else:
+                        not_found.append(name)
+                if workers and not not_found:
+                    ctx["workers"] = workers; next_step = "total_hours"
+                    reply = f"{len(workers)} workers. {get_prompt('total_hours',lang)}"
+                elif workers and not_found:
+                    ctx["workers"] = workers
+                    nf = ", ".join(not_found)
+                    reply = f"Not found in system: {nf}. Found: {len(workers)}. Add more or say 'continue'." if lang=="en" else f"Nenalezeni: {nf}. Nalezeno: {len(workers)}. Přidej další nebo řekni 'pokračuj'."
+                elif "continu" in text.lower() or "pokrac" in text.lower() or "dalej" in text.lower():
+                    if ctx.get("workers"):
+                        next_step = "total_hours"; reply = get_prompt("total_hours",lang)
+                    else:
+                        reply = "No workers added. Try again." if lang=="en" else "Žádní pracovníci. Zkus znovu."
+                else:
+                    reply = "No workers found in system. Use exact names." if lang=="en" else "Žádní pracovníci nenalezeni. Použij přesná jména." if lang=="cs" else "Nie znaleziono pracowników. Użyj dokładnych imion."
+
+            # === STEP: TOTAL HOURS ===
+            elif step == "total_hours":
+                try:
+                    hrs = float(text.replace(",",".").replace("hours","").replace("hodin","").replace("godzin","").strip())
+                    ctx["total_hours"] = hrs
+                    # Distribute equally if multiple workers
+                    wc = len(ctx.get("workers",[]))
+                    if wc > 0:
+                        per = round(hrs / wc, 2)
+                        for w in ctx["workers"]: w["hours"] = per; w["total"] = round(per * w["rate"],2)
+                    next_step = "entries"; reply = f"{hrs}h. {get_prompt('entries',lang)}"
+                except: reply = "Invalid number." if lang=="en" else "Neplatné číslo." if lang=="cs" else "Nieprawidłowa liczba."
+
+            # === STEP: ENTRIES (work breakdown) ===
+            elif step == "entries":
+                import re
+                entries = []
+                parts = re.findall(r'(\w[\w\s]*?)\s+([\d.,]+)', text)
+                for ptype, phrs in parts:
+                    h = float(phrs.replace(",","."))
+                    rate = resolve_rate(conn,tenant_id,"task_rate",rule_key=ptype.strip().lower(),job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
+                    entries.append({"type":ptype.strip(),"hours":h,"rate":rate,"total":round(h*rate,2)})
+                if not entries and text.lower() not in ("no","ne","nie","skip"):
+                    entries.append({"type":"general","hours":ctx.get("total_hours",0),"rate":resolve_rate(conn,tenant_id,"task_rate",job_id=ctx.get("job_id"),client_id=ctx.get("client_id")),"total":0})
+                    entries[0]["total"] = round(entries[0]["hours"]*entries[0]["rate"],2)
+                ctx["entries"] = entries
+                # Validate hours
+                entry_sum = sum(e["hours"] for e in entries)
+                total = ctx.get("total_hours",0)
+                if abs(entry_sum - total) > 0.01 and entries:
+                    next_step = "validate_hours"
+                    reply = f"Entries sum={entry_sum}h but total={total}h. " + get_prompt("validate_hours",lang)
+                else:
+                    next_step = "materials"; reply = get_prompt("materials",lang)
+
+            # === STEP: VALIDATE HOURS ===
+            elif step == "validate_hours":
+                if "total" in text.lower() or "celkem" in text.lower() or "suma" in text.lower():
+                    ctx["total_hours"] = sum(e["hours"] for e in ctx.get("entries",[]))
+                next_step = "materials"; reply = get_prompt("materials",lang)
+
+            # === STEP: MATERIALS ===
+            elif step == "materials":
+                if text.lower() in ("no","ne","nie","none","zadny","żaden","skip"):
+                    ctx["materials"] = []
+                else:
+                    import re
+                    mats = []
+                    parts = re.findall(r'(\w[\w\s]*?)\s+([\d.,]+)\s*[x×]?\s*£?([\d.,]+)?', text)
+                    for mname, mqty, mprice in parts:
+                        q = float(mqty.replace(",","."))
+                        p = float(mprice.replace(",",".")) if mprice else 0
+                        mats.append({"name":mname.strip(),"qty":q,"price":p,"total":round(q*p,2)})
+                    if not mats and text.lower() not in ("no","ne","nie","none","skip"):
+                        mats.append({"name":text,"qty":1,"price":0,"total":0})
+                    ctx["materials"] = mats
+                next_step = "waste"; reply = get_prompt("waste",lang)
+
+            # === STEP: WASTE ===
+            elif step == "waste":
+                if text.lower() in ("no","ne","nie","none","zadny","żaden","0","skip"):
+                    ctx["waste"] = {"qty":0,"rate":0,"total":0}
+                else:
+                    try:
+                        qty = float(text.replace(",",".").split()[0])
+                        rate = resolve_rate(conn,tenant_id,"waste_rate",job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
+                        ctx["waste"] = {"qty":qty,"rate":rate,"total":round(qty*rate,2)}
+                    except: ctx["waste"] = {"qty":0,"rate":0,"total":0}
+                next_step = "notes"; reply = get_prompt("notes",lang)
+
+            # === STEP: NOTES ===
+            elif step == "notes":
+                if text.lower() not in ("no","ne","nie","skip",""):
+                    ctx["notes"] = text
+                # Calculate grand total
+                gt = sum(e.get("total",0) for e in ctx.get("entries",[]))
+                gt += ctx.get("waste",{}).get("total",0)
+                gt += sum(m.get("total",0) for m in ctx.get("materials",[]))
+                ctx["grand_total"] = round(gt,2)
+                next_step = "summary"
+                reply = generate_summary(ctx,lang) + "\n\n" + get_prompt("summary",lang)
+
+            # === STEP: SUMMARY (edit or confirm) ===
+            elif step == "summary":
+                low = text.lower()
+                if low in ("confirm","potvrdit","potwierdź","yes","ano","tak"):
+                    next_step = "confirm"
+                elif low.startswith("edit") or low.startswith("oprav") or low.startswith("popraw"):
+                    # Go back to the mentioned step
+                    for s in ["client","workers","total_hours","entries","materials","waste","notes"]:
+                        if s in low or (s=="total_hours" and ("hour" in low or "hodin" in low or "godzin" in low)):
+                            next_step = s; reply = get_prompt(s,lang); break
+                    else:
+                        reply = "What to edit? (client/workers/hours/entries/materials/waste/notes)"
+                else:
+                    reply = "Say 'confirm' to save or 'edit [field]'." if lang=="en" else "Řekni 'potvrdit' nebo 'oprav [pole]'."
+
+            # === STEP: CONFIRM → save to DB ===
+            if next_step == "confirm" and step != "confirm":
+                # VALIDATION: block save without workers or entries
+                if not ctx.get("workers"):
+                    next_step = "workers"; reply = "Cannot save without workers. " + get_prompt("workers",lang)
+                elif not ctx.get("entries"):
+                    next_step = "entries"; reply = "Cannot save without work entries. " + get_prompt("entries",lang)
+                elif abs(sum(e["hours"] for e in ctx.get("entries",[])) - ctx.get("total_hours",0)) > 0.01:
+                    next_step = "validate_hours"; reply = "Hours mismatch. " + get_prompt("validate_hours",lang)
+                else:
+                  try:
+                    cur.execute("""INSERT INTO work_reports (tenant_id,client_id,job_id,work_date,total_hours,total_price,notes,created_by,input_type,status)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'voice','confirmed') RETURNING id""",
+                        (tenant_id,ctx.get("client_id"),ctx.get("job_id"),ctx.get("work_date",datetime.now().strftime("%Y-%m-%d")),
+                         ctx.get("total_hours",0),ctx.get("grand_total",0),ctx.get("notes"),sess.get("user_id")))
+                    rid = cur.fetchone()['id']
+                    for w in ctx.get("workers",[]):
+                        cur.execute("INSERT INTO work_report_workers (work_report_id,user_id,worker_name,hours,hourly_rate,total_price) VALUES (%s,%s,%s,%s,%s,%s)",
+                            (rid,w.get("user_id"),w["name"],w["hours"],w["rate"],w["total"]))
+                    for e in ctx.get("entries",[]):
+                        cur.execute("INSERT INTO work_report_entries (work_report_id,type,hours,unit_rate,total_price) VALUES (%s,%s,%s,%s,%s)",
+                            (rid,e["type"],e["hours"],e["rate"],e["total"]))
+                    for m in ctx.get("materials",[]):
+                        cur.execute("INSERT INTO work_report_materials (work_report_id,material_name,quantity,unit_price,total_price) VALUES (%s,%s,%s,%s,%s)",
+                            (rid,m["name"],m["qty"],m["price"],m["total"]))
+                    waste = ctx.get("waste",{})
+                    if waste.get("qty",0) > 0:
+                        cur.execute("INSERT INTO work_report_waste (work_report_id,quantity,unit,unit_price,total_price) VALUES (%s,%s,'bulkbag',%s,%s)",
+                            (rid,waste["qty"],waste["rate"],waste["total"]))
+                    log_activity(conn,"work_report",str(rid),"create",f"Work report £{ctx.get('grand_total',0):.2f} for {ctx.get('client_name','?')}")
+                    cur.execute("UPDATE voice_sessions SET state='completed',context=%s,updated_at=now() WHERE id=%s",(json.dumps(ctx),sid))
+                    conn.commit()
+                    whatsapp = generate_whatsapp(ctx)
+                    reply = get_prompt("confirm",lang)
+                    return {"session_id":sid,"step":"done","prompt":reply,"work_report_id":rid,"whatsapp_message":whatsapp,"summary":generate_summary(ctx,lang)}
+                except Exception as e:
+                    conn.rollback(); raise HTTPException(500,f"Save error: {e}")
+
+            # === AUDIT: structured voice step log ===
+            audit_details = json.dumps({
+                "step": step, "next_step": next_step,
+                "input_length": len(text),
+                "input_preview": text[:50].replace("\n", " "),
+                "has_numbers": any(c.isdigit() for c in text) or any(x in text.lower() for x in ["half","quarter","one","two","three"])
+            })
+            log_activity(conn, "voice_session", sid, "voice_input", audit_details, tenant_id=tenant_id, user_id=sess.get("user_id"))
+
+            # === VALIDATE TRANSITION ===
+            if not validate_transition(step, next_step) and next_step != step:
+                next_step = step
+                ctx = dict(original_ctx)
+                reply = "Invalid step transition. " + get_prompt(step, lang)
+
+            # === UPDATE SESSION ===
+            cur.execute("UPDATE voice_sessions SET dialog_step=%s,context=%s,updated_at=now() WHERE id=%s",(next_step,json.dumps(ctx),sid))
+            conn.commit()
+        return {"session_id":sid,"step":next_step,"prompt":reply,"context":ctx}
+    except HTTPException: conn.rollback(); raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.post("/voice/session/resume")
+async def voice_session_resume(data: dict):
+    sid = data.get("session_id")
+    tenant_id = data.get("tenant_id", 1)
+    user_id = data.get("user_id")
+    if not sid: raise HTTPException(400, "session_id required")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM voice_sessions WHERE id=%s AND tenant_id=%s", (sid, tenant_id))
+            sess = cur.fetchone()
+            if not sess: raise HTTPException(404, "Session not found")
+            if user_id and sess.get("user_id") and sess["user_id"] != user_id:
+                raise HTTPException(403, "Access denied — session belongs to another user")
+            if sess["state"] == "completed":
+                return {"session_id": sid, "step": "done", "prompt": "Session already completed."}
+            ctx = json.loads(sess["context"]) if sess["context"] else {}
+            lang = ctx.get("language", "en")
+            step = sess["dialog_step"]
+            cur.execute("UPDATE voice_sessions SET state='active', expires_at=now()+interval '1 hour', updated_at=now() WHERE id=%s AND state != 'completed'", (sid,))
+            if cur.rowcount == 0:
+                return {"session_id": sid, "step": "done", "prompt": "Session already completed or locked."}
+            log_activity(conn, "voice_session", sid, "resume", f"Session resumed at step={step}", tenant_id=tenant_id, user_id=user_id)
+            conn.commit()
+        return {"session_id": sid, "step": step, "prompt": get_prompt(step, lang), "context": ctx}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+# ========== WORK REPORT CRUD ==========
+@app.get("/work-reports")
+async def list_work_reports(tenant_id: int=1, client_id: Optional[int]=None, status: Optional[str]=None):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = "SELECT wr.*,c.display_name as client_name FROM work_reports wr LEFT JOIN clients c ON wr.client_id=c.id WHERE wr.tenant_id=%s"
+            params = [tenant_id]
+            if client_id: sql += " AND wr.client_id=%s"; params.append(client_id)
+            if status: sql += " AND wr.status=%s"; params.append(status)
+            sql += " ORDER BY wr.work_date DESC"
+            cur.execute(sql,params); return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.get("/work-reports/{report_id}")
+async def get_work_report(report_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT wr.*,c.display_name as client_name FROM work_reports wr LEFT JOIN clients c ON wr.client_id=c.id WHERE wr.id=%s",(report_id,))
+            rpt = cur.fetchone()
+            if not rpt: raise HTTPException(404)
+            cur.execute("SELECT * FROM work_report_workers WHERE work_report_id=%s",(report_id,))
+            workers = cur.fetchall()
+            cur.execute("SELECT * FROM work_report_entries WHERE work_report_id=%s",(report_id,))
+            entries = cur.fetchall()
+            cur.execute("SELECT * FROM work_report_materials WHERE work_report_id=%s",(report_id,))
+            materials = cur.fetchall()
+            cur.execute("SELECT * FROM work_report_waste WHERE work_report_id=%s",(report_id,))
+            waste = cur.fetchall()
+            return {"report":dict(rpt),"workers":[dict(r) for r in workers],"entries":[dict(r) for r in entries],"materials":[dict(r) for r in materials],"waste":[dict(r) for r in waste]}
+    finally: release_conn(conn)
+
+@app.get("/pricing-rules")
+async def list_pricing_rules(tenant_id: int=1):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM pricing_rules WHERE tenant_id=%s ORDER BY scope,rule_type",(tenant_id,))
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.post("/pricing-rules")
+async def create_pricing_rule(data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO pricing_rules (tenant_id,scope,scope_id,rule_type,rule_key,rate) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                (data.get("tenant_id",1),data.get("scope","system"),data.get("scope_id"),data.get("rule_type"),data.get("rule_key"),data.get("rate",0)))
+            pid = cur.fetchone()['id']; conn.commit()
+        return {"id":pid,"status":"created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+# ========== SYSTEM ==========
 @app.get("/")
 async def root():
     return {"app":"Secretary DesignLeaf","version":"1.1a","ai_configured":bool(OPENAI_API_KEY),"docs":"/docs"}
