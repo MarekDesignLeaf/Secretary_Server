@@ -234,7 +234,8 @@ PRAVIDLA:
 - Pro kalendar: list_calendar_events, add/modify/delete_calendar_event.
 - Pro kontakty: search_contacts, call_contact.
 - Kdyz se Marek zepta 'co mam delat' nebo 'jake mam ukoly', pouzij list_tasks.
-- Kdyz rekne 'hotovo' nebo 'splneno' u ukolu, pouzij complete_task."""
+- Kdyz rekne 'hotovo' nebo 'splneno' u ukolu, pouzij complete_task.
+- Kdyz rekne 'work report', 'zapsat praci', 'zadat hodiny', 'report prace', 'nahlasit praci', pouzij start_work_report."""
 
         tools = [
             {"type":"function","function":{"name":"add_calendar_event","description":"Prida schuzku do kalendare","parameters":{"type":"object","properties":{"title":{"type":"string"},"start_time":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"duration":{"type":"integer","description":"minuty"}},"required":["title","start_time"]}}},
@@ -253,6 +254,7 @@ PRAVIDLA:
             {"type":"function","function":{"name":"update_job","description":"Zmeni stav zakazky","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev zakazky"},"status":{"type":"string","enum":["nova","v_reseni","ceka_na_klienta","ceka_na_material","naplanovano","v_realizaci","dokonceno","vyfakturovano","uzavreno","pozastaveno","zruseno"]}},"required":["title"]}}},
             {"type":"function","function":{"name":"list_tasks","description":"Vypise ukoly podle filtru","parameters":{"type":"object","properties":{"status":{"type":"string"},"client_name":{"type":"string"},"only_active":{"type":"boolean"}}}}},
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
         ]
 
         messages = [{"role":"system","content":system_prompt}]
@@ -344,6 +346,12 @@ PRAVIDLA:
                     return {"reply_cs":f"Lead {code} od {n} zaevidován.","action_type":"REFRESH"}
                 except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
+
+            if action == "START_WORK_REPORT":
+                lang_map = {"cs-CZ":"cs","en-GB":"en","pl-PL":"pl"}
+                lang = lang_map.get(msg.internal_language,"en")
+                return {"reply_cs":"Spouštím work report dialog." if lang=="cs" else "Starting work report." if lang=="en" else "Uruchamiam raport pracy.",
+                        "action_type":"START_WORK_REPORT","action_data":{}}
 
             if action == "ADD_NOTE":
                 etype = args.get("entity_type","client")
