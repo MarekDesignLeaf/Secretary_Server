@@ -978,6 +978,16 @@ async def get_settings():
     except Exception as e: return {"company_name":"DesignLeaf","version":"1.1a","error":str(e)}
     finally: release_conn(conn)
 
+
+@app.get("/debug/db-schema")
+async def db_schema():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_schema,table_name,column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema IN ('crm','public') ORDER BY 1,2,ordinal_position")
+            return {"columns": [dict(r) for r in cur.fetchall()]}
+    finally: release_conn(conn)
+
 @app.get("/health")
 async def health():
     try:
