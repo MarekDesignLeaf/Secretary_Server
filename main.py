@@ -1145,6 +1145,50 @@ async def test_voice():
         try: release_conn(conn)
         except: pass
 
+# ========== WORK REPORTS ==========
+@app.get("/work-reports")
+async def get_work_reports(tenant_id: int = 1):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT wr.id,wr.client_id,c.display_name as client_name,wr.work_date::text,
+                wr.total_hours,wr.total_price,wr.currency,wr.notes,wr.status,wr.input_type,wr.created_at::text
+                FROM work_reports wr LEFT JOIN clients c ON wr.client_id=c.id
+                WHERE wr.tenant_id=%s ORDER BY wr.work_date DESC LIMIT 50""",(tenant_id,))
+            reports = [dict(r) for r in cur.fetchall()]
+            for rpt in reports:
+                rid = rpt['id']
+                cur.execute("SELECT worker_name,hours,hourly_rate,total_price FROM work_report_workers WHERE work_report_id=%s",(rid,))
+                rpt['workers'] = [dict(w) for w in cur.fetchall()]
+                cur.execute("SELECT type,hours,unit_rate,total_price FROM work_report_entries WHERE work_report_id=%s",(rid,))
+                rpt['entries'] = [dict(e) for e in cur.fetchall()]
+                cur.execute("SELECT quantity,unit_price,total_price FROM work_report_waste WHERE work_report_id=%s",(rid,))
+                rpt['waste'] = [dict(w) for w in cur.fetchall()]
+                cur.execute("SELECT material_name,quantity,unit_price,total_price FROM work_report_materials WHERE work_report_id=%s",(rid,))
+                rpt['materials'] = [dict(m) for m in cur.fetchall()]
+            return reports
+    finally: release_conn(conn)
+
+@app.get("/work-reports/{report_id}")
+async def get_work_report(report_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT wr.*,c.display_name as client_name FROM work_reports wr
+                LEFT JOIN clients c ON wr.client_id=c.id WHERE wr.id=%s""",(report_id,))
+            rpt = cur.fetchone()
+            if not rpt: raise HTTPException(404)
+            rpt = dict(rpt)
+            cur.execute("SELECT * FROM work_report_workers WHERE work_report_id=%s",(report_id,))
+            rpt['workers'] = [dict(w) for w in cur.fetchall()]
+            cur.execute("SELECT * FROM work_report_entries WHERE work_report_id=%s",(report_id,))
+            rpt['entries'] = [dict(e) for e in cur.fetchall()]
+            cur.execute("SELECT * FROM work_report_waste WHERE work_report_id=%s",(report_id,))
+            rpt['waste'] = [dict(w) for w in cur.fetchall()]
+            cur.execute("SELECT * FROM work_report_materials WHERE work_report_id=%s",(report_id,))
+            rpt['materials'] = [dict(m) for m in cur.fetchall()]
+            return rpt
+    finally: release_conn(conn)
 @app.get("/health")
 async def health():
     try:
