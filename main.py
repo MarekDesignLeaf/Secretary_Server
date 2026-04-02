@@ -993,6 +993,32 @@ async def test_ai():
         return {"status":"ok","response":r.choices[0].message.content}
     except Exception as e: return {"status":"error","message":str(e)}
 
+@app.get("/debug/schema-audit")
+async def schema_audit():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT table_schema, table_name FROM information_schema.tables 
+                WHERE table_schema IN ('crm','public') AND table_type='BASE TABLE' ORDER BY 1,2""")
+            tables = cur.fetchall()
+            cur.execute("""SELECT table_schema, table_name, column_name, data_type, 
+                is_nullable, column_default FROM information_schema.columns 
+                WHERE table_schema IN ('crm','public') ORDER BY table_schema, table_name, ordinal_position""")
+            columns = cur.fetchall()
+            cur.execute("""SELECT tc.table_schema, tc.table_name, kcu.column_name,
+                ccu.table_name AS ref_table, ccu.column_name AS ref_column
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+                JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name
+                WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema IN ('crm','public')""")
+            fks = cur.fetchall()
+            cur.execute("""SELECT schemaname, tablename, indexname FROM pg_indexes 
+                WHERE schemaname IN ('crm','public') ORDER BY 1,2,3""")
+            indexes = cur.fetchall()
+            return {"tables":[dict(t) for t in tables], "columns":[dict(c) for c in columns],
+                    "foreign_keys":[dict(f) for f in fks], "indexes":[dict(i) for i in indexes]}
+    finally: release_conn(conn)
+
 # ========== PRICING ENGINE ==========
 def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_id=None):
     """Priority: job → client → system default"""
