@@ -1360,7 +1360,15 @@ async def voice_session_input(data: dict):
             # === STEP: TOTAL HOURS ===
             elif step == "total_hours":
                 try:
-                    hrs = float(text.replace(",",".").replace("hours","").replace("hodin","").replace("godzin","").strip())
+                    _num_words = {"nula":0,"jedna":1,"jeden":1,"jedno":1,"dva":2,"dve":2,"tri":3,"tři":3,"ctyri":4,"čtyři":4,"pet":5,"pět":5,"sest":6,"šest":6,"sedm":7,"osm":8,"devet":9,"devět":9,"deset":10,"jedenact":11,"dvanact":12,
+                        "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10,"eleven":11,"twelve":12,
+                        "jeden a půl":1.5,"jedna a půl":1.5,"dva a půl":2.5,"dvě a půl":2.5,"tři a půl":3.5,"čtyři a půl":4.5,"pět a půl":5.5,"šest a půl":6.5,"sedm a půl":7.5,"osm a půl":8.5,
+                        "půl":0.5,"half":0.5}
+                    _clean = text.lower().replace("hours","").replace("hodin","").replace("hodiny","").replace("hodinu","").replace("godzin","").strip()
+                    if _clean in _num_words:
+                        hrs = _num_words[_clean]
+                    else:
+                        hrs = float(_clean.replace(",","."))
                     ctx["total_hours"] = hrs
                     # Distribute equally if multiple workers
                     wc = len(ctx.get("workers",[]))
