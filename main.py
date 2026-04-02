@@ -1272,7 +1272,9 @@ async def voice_session_input(data: dict):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM voice_sessions WHERE id=%s AND state='active' FOR UPDATE",(sid,))
             sess = cur.fetchone()
-            if not sess: raise HTTPException(404,"Session not found or expired")
+            if not sess:
+                conn.rollback(); release_conn(conn)
+                return {"step":"error","prompt":"Session not found or expired","error":"no_session"}
             # Tenant isolation check
             req_tenant = data.get("tenant_id", 1)
             if sess["tenant_id"] != req_tenant:
