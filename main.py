@@ -1408,7 +1408,7 @@ async def voice_session_input(data: dict):
 
             # === STEP: MATERIALS ===
             elif step == "materials":
-                if text.lower() in ("no","ne","nie","none","zadny","żaden","skip"):
+                if any(text.lower().startswith(x) for x in ("no","ne","nie","none","zadny","żaden","skip","přeskoč","preskoc","dalsi","další","zadny","žádný")):
                     ctx["materials"] = []
                 else:
                     import re
@@ -1425,7 +1425,7 @@ async def voice_session_input(data: dict):
 
             # === STEP: WASTE ===
             elif step == "waste":
-                if text.lower() in ("no","ne","nie","none","zadny","żaden","0","skip"):
+                if any(text.lower().startswith(x) for x in ("no","ne","nie","none","zadny","żaden","0","skip","přeskoč","preskoc","dalsi","další")):
                     ctx["waste"] = {"qty":0,"rate":0,"total":0}
                 else:
                     try:
@@ -1437,7 +1437,7 @@ async def voice_session_input(data: dict):
 
             # === STEP: NOTES ===
             elif step == "notes":
-                if not any(text.lower().startswith(x) for x in ("no","ne","nie","skip")) and text.strip() != "":
+                if not any(text.lower().startswith(x) for x in ("no","ne","nie","skip","přeskoč","preskoc","dalsi","další")) and text.strip() != "":
                     ctx["notes"] = text
                 # Calculate grand total
                 gt = sum(e.get("total",0) for e in ctx.get("entries",[]))
@@ -1450,27 +1450,32 @@ async def voice_session_input(data: dict):
             # === STEP: SUMMARY (edit or confirm) ===
             elif step == "summary":
                 low = text.lower()
-                if low in ("confirm","potvrdit","potwierdź","yes","ano","tak"):
+                # POTVRDIT
+                if any(x in low for x in ["confirm","potvrdit","potwierdź","yes","ano","tak","uložit","ulozit","save"]):
                     next_step = "confirm"
-                elif low.startswith("edit") or low.startswith("oprav") or low.startswith("popraw") or low.startswith("zmen") or low.startswith("změ"):
-                    # Go back to the mentioned step - match Czech/English/Polish words
-                    _step_map = {
-                        "client":"client","klient":"client","klienta":"client",
-                        "workers":"workers","worker":"workers","pracovnik":"workers","pracovník":"workers","pracovniky":"workers","pracovníky":"workers","kdo":"workers",
-                        "hours":"total_hours","hodin":"total_hours","hodiny":"total_hours","celkem":"total_hours","total":"total_hours","godzin":"total_hours",
-                        "entries":"entries","entry":"entries","polozk":"entries","položk":"entries","rozpad":"entries","typ":"entries","prace":"entries","práce":"entries",
-                        "waste":"waste","odpad":"waste","odpady":"waste","pytle":"waste","pytl":"waste",
-                        "material":"materials","materiál":"materials","materi":"materials",
-                        "notes":"notes","note":"notes","poznam":"notes","poznám":"notes","poznámk":"notes"
-                    }
+                # ZRUSIT / SMAZAT
+                elif any(x in low for x in ["zrušit","zrusit","smazat","cancel","delete","storno","konec","stop"]):
+                    cur.execute("UPDATE voice_sessions SET state='cancelled',updated_at=now() WHERE id=%s",(sid,))
+                    conn.commit()
+                    reply = "Report zrušen." if lang=="cs" else "Report cancelled." if lang=="en" else "Raport anulowany."
+                    return {"session_id":sid,"step":"done","prompt":reply}
+                # OPRAVIT
+                elif any(low.startswith(x) for x in ["edit","oprav","popraw","zmen","změ","uprav"]):
+                    _step_map = {"client":"client","klient":"client","klienta":"client",
+                        "worker":"workers","pracovn":"workers","kdo":"workers",
+                        "hour":"total_hours","hodin":"total_hours","celkem":"total_hours","total":"total_hours","godzin":"total_hours",
+                        "entr":"entries","polozk":"entries","položk":"entries","rozpad":"entries","práce":"entries","prace":"entries","typ":"entries",
+                        "waste":"waste","odpad":"waste","pytl":"waste",
+                        "mater":"materials","materiál":"materials",
+                        "note":"notes","pozn":"notes","poznám":"notes"}
                     _found = False
                     for _kw, _target in _step_map.items():
                         if _kw in low:
                             next_step = _target; reply = get_prompt(_target,lang); _found = True; break
                     if not _found:
-                        reply = "Co opravit? (klient/pracovniky/hodiny/polozky/odpad/material/poznamku)" if lang=="cs" else "What to edit? (client/workers/hours/entries/waste/materials/notes)"
+                        reply = "Co opravit? (klient/pracovniky/hodiny/polozky/odpad/material/poznamku)" if lang=="cs" else "What to edit?"
                 else:
-                    reply = "Say 'confirm' to save or 'edit [field]'." if lang=="en" else "Řekni 'potvrdit' nebo 'oprav [pole]'."
+                    reply = "Řekni 'potvrdit', 'oprav [co]', nebo 'zrušit'." if lang=="cs" else "Say 'confirm', 'edit [field]', or 'cancel'."
 
             # === STEP: CONFIRM → save to DB ===
             if next_step == "confirm" and step != "confirm":
@@ -1480,7 +1485,7 @@ async def voice_session_input(data: dict):
                 elif not ctx.get("entries"):
                     next_step = "entries"; reply = "Cannot save without work entries. " + get_prompt("entries",lang)
                 elif abs(sum(e["hours"] for e in ctx.get("entries",[])) - ctx.get("total_hours",0)) > 0.01:
-                    next_step = "validate_hours"; reply = "Hours mismatch. " + get_prompt("validate_hours",lang)
+                    ctx["total_hours"] = sum(e["hours"] for e in ctx.get("entries",[])); next_step = "confirm"
                 else:
                   try:
                     cur.execute("""INSERT INTO work_reports (tenant_id,client_id,job_id,work_date,total_hours,total_price,notes,created_by,input_type,status)
