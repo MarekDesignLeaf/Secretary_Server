@@ -1398,13 +1398,13 @@ async def voice_session_input(data: dict):
                     next_step = "validate_hours"
                     reply = f"Entries sum={entry_sum}h but total={total}h. " + get_prompt("validate_hours",lang)
                 else:
-                    next_step = "notes"; reply = get_prompt("notes",lang)
+                    next_step = "waste"; reply = get_prompt("waste",lang)
 
             # === STEP: VALIDATE HOURS ===
             elif step == "validate_hours":
                 if "total" in text.lower() or "celkem" in text.lower() or "suma" in text.lower():
                     ctx["total_hours"] = sum(e["hours"] for e in ctx.get("entries",[]))
-                next_step = "notes"; reply = get_prompt("notes",lang)
+                next_step = "waste"; reply = get_prompt("waste",lang)
 
             # === STEP: MATERIALS ===
             elif step == "materials":
@@ -1421,7 +1421,7 @@ async def voice_session_input(data: dict):
                     if not mats and text.lower() not in ("no","ne","nie","none","skip"):
                         mats.append({"name":text,"qty":1,"price":0,"total":0})
                     ctx["materials"] = mats
-                next_step = "notes"; reply = get_prompt("notes",lang)
+                next_step = "waste"; reply = get_prompt("waste",lang)
 
             # === STEP: WASTE ===
             elif step == "waste":
