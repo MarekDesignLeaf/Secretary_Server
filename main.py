@@ -1227,7 +1227,7 @@ DIALOG_PROMPTS = {
     "client": {"en":"Which client did you work for?","cs":"U kterého klienta jsi pracoval?","pl":"U którego klienta pracowałeś?"},
     "workers": {"en":"Who worked? (names)","cs":"Kdo pracoval? (jména)","pl":"Kto pracował? (imiona)"},
     "total_hours": {"en":"How many hours total?","cs":"Kolik hodin celkem?","pl":"Ile godzin łącznie?"},
-    "entries": {"en":"How many hours for each type of work? (e.g. pruning 4, maintenance 2)","cs":"Kolik hodin na každý typ práce? (např. prořez 4, údržba 2)","pl":"Ile godzin na każdy rodzaj pracy?"},
+    "entries": {"en":"What type of work? (e.g. pruning, maintenance) or 'done'","cs":"Jaký typ práce? (např. prořez, údržba, sekání) nebo 'hotovo'","pl":"Jaki rodzaj pracy? lub 'gotowe'"},
     "validate_hours": {"en":"Hours don't match total. Fix entries or total.","cs":"Hodiny nesedí s celkem. Oprav položky nebo celkem.","pl":"Godziny się nie zgadzają. Popraw pozycje lub sumę."},
     "materials": {"en":"Any materials used? (name, quantity, price) or 'no'","cs":"Použili jste materiál? (název, množství, cena) nebo 'ne'","pl":"Czy użyto materiałów? (nazwa, ilość, cena) lub 'nie'"},
     "waste": {"en":"How many bulk bags of waste? (number or 'none')","cs":"Kolik pytlů odpadu? (číslo nebo 'žádný')","pl":"Ile worków odpadów? (liczba lub 'żaden')"},
