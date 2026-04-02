@@ -473,6 +473,10 @@ PRAVIDLA:
 
         # No tool call — plain text reply
         reply = ai_msg.content or "Rozumím."
+        # Fallback: if reply mentions work report but GPT didn't call tool, force it
+        wr_kw = ["work report","výkaz","vykaz","nahlášení práce","nahlaseni prace","zapsat práci","zapsat praci","raport pracy","zahajuji proces"]
+        if any(kw in (reply + " " + msg.text).lower() for kw in wr_kw):
+            return {"reply_cs":reply,"action_type":"START_WORK_REPORT","action_data":{}}
         return {"reply_cs":reply,"is_question":"?" in reply}
     except Exception as e:
         import traceback; traceback.print_exc()
