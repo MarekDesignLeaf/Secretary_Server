@@ -1117,6 +1117,34 @@ async def seed_admin():
         conn.rollback()
         return {"status":"error","message":str(e)}
     finally: release_conn(conn)
+@app.get("/debug/test-voice")
+async def test_voice():
+    """Test voice session input to see actual error"""
+    conn = get_db_conn()
+    try:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            # Create session
+            sid = str(uuid.uuid4())
+            ctx = json.dumps({"language":"cs","work_date":"2026-04-02"})
+            cur.execute("INSERT INTO voice_sessions (id,tenant_id,session_type,state,dialog_step,context) VALUES (%s,1,'work_report','active','client',%s)",(sid,ctx))
+            conn.commit()
+            # Now try to read it back like voice_session_input does
+            cur.execute("SELECT * FROM voice_sessions WHERE id=%s AND state='active' FOR UPDATE",(sid,))
+            sess = cur.fetchone()
+            if not sess: return {"error":"no session found"}
+            raw = sess['context']
+            return {"raw_type":str(type(raw)),"raw_value":str(raw)[:200],"sess_keys":list(dict(sess).keys()),"tenant_id":sess['tenant_id'],"step":sess['dialog_step']}
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try: conn.rollback()
+        except: pass
+        return {"error":str(e),"type":type(e).__name__,"traceback":tb[-500:]}
+    finally:
+        try: release_conn(conn)
+        except: pass
+
 @app.get("/health")
 async def health():
     try:
