@@ -1208,15 +1208,15 @@ def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_
     return defaults.get(rule_type, 0.0)
 
 # ========== DIALOG STATE MACHINE ==========
-DIALOG_STEPS = ["client","workers","total_hours","entries","validate_hours","materials","waste","notes","summary","confirm"]
+DIALOG_STEPS = ["client","workers","total_hours","entries","validate_hours","waste","materials","notes","summary","confirm"]
 VALID_TRANSITIONS = {
     "client": ["client","workers"],
     "workers": ["workers","total_hours"],
     "total_hours": ["total_hours","entries"],
-    "entries": ["entries","validate_hours","materials"],
-    "validate_hours": ["validate_hours","materials","entries"],
-    "materials": ["materials","waste"],
-    "waste": ["waste","notes"],
+    "entries": ["entries","validate_hours","waste"],
+    "validate_hours": ["validate_hours","waste","entries"],
+    "materials": ["materials","notes"],
+    "waste": ["waste","materials"],
     "notes": ["notes","summary"],
     "summary": ["summary","confirm","client","workers","total_hours","entries","materials","waste","notes"],
     "confirm": ["confirm"],
@@ -1390,13 +1390,13 @@ async def voice_session_input(data: dict):
                     next_step = "validate_hours"
                     reply = f"Entries sum={entry_sum}h but total={total}h. " + get_prompt("validate_hours",lang)
                 else:
-                    next_step = "materials"; reply = get_prompt("materials",lang)
+                    next_step = "notes"; reply = get_prompt("notes",lang)
 
             # === STEP: VALIDATE HOURS ===
             elif step == "validate_hours":
                 if "total" in text.lower() or "celkem" in text.lower() or "suma" in text.lower():
                     ctx["total_hours"] = sum(e["hours"] for e in ctx.get("entries",[]))
-                next_step = "materials"; reply = get_prompt("materials",lang)
+                next_step = "notes"; reply = get_prompt("notes",lang)
 
             # === STEP: MATERIALS ===
             elif step == "materials":
@@ -1413,7 +1413,7 @@ async def voice_session_input(data: dict):
                     if not mats and text.lower() not in ("no","ne","nie","none","skip"):
                         mats.append({"name":text,"qty":1,"price":0,"total":0})
                     ctx["materials"] = mats
-                next_step = "waste"; reply = get_prompt("waste",lang)
+                next_step = "notes"; reply = get_prompt("notes",lang)
 
             # === STEP: WASTE ===
             elif step == "waste":
@@ -1425,11 +1425,11 @@ async def voice_session_input(data: dict):
                         rate = resolve_rate(conn,tenant_id,"waste_rate",job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
                         ctx["waste"] = {"qty":qty,"rate":rate,"total":round(qty*rate,2)}
                     except: ctx["waste"] = {"qty":0,"rate":0,"total":0}
-                next_step = "notes"; reply = get_prompt("notes",lang)
+                next_step = "materials"; reply = get_prompt("materials",lang)
 
             # === STEP: NOTES ===
             elif step == "notes":
-                if text.lower() not in ("no","ne","nie","skip",""):
+                if not any(text.lower().startswith(x) for x in ("no","ne","nie","skip")) and text.strip() != "":
                     ctx["notes"] = text
                 # Calculate grand total
                 gt = sum(e.get("total",0) for e in ctx.get("entries",[]))
