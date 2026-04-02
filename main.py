@@ -1273,8 +1273,9 @@ async def voice_session_input(data: dict):
             req_tenant = data.get("tenant_id", 1)
             if sess["tenant_id"] != req_tenant:
                 raise HTTPException(403, "Tenant mismatch")
-            ctx = json.loads(sess['context']) if sess['context'] else {}
-            original_ctx = json.loads(sess['context']) if sess['context'] else {}
+            raw_ctx = sess['context']
+            ctx = raw_ctx if isinstance(raw_ctx, dict) else (json.loads(raw_ctx) if raw_ctx else {})
+            original_ctx = dict(ctx)
             step = sess['dialog_step']
             lang = ctx.get("language","en")
             tenant_id = sess['tenant_id']
@@ -1497,7 +1498,8 @@ async def voice_session_resume(data: dict):
                 raise HTTPException(403, "Access denied — session belongs to another user")
             if sess["state"] == "completed":
                 return {"session_id": sid, "step": "done", "prompt": "Session already completed."}
-            ctx = json.loads(sess["context"]) if sess["context"] else {}
+            raw_ctx2 = sess["context"]
+            ctx = raw_ctx2 if isinstance(raw_ctx2, dict) else (json.loads(raw_ctx2) if raw_ctx2 else {})
             lang = ctx.get("language", "en")
             step = sess["dialog_step"]
             cur.execute("UPDATE voice_sessions SET state='active', expires_at=now()+interval '1 hour', updated_at=now() WHERE id=%s AND state != 'completed'", (sid,))
