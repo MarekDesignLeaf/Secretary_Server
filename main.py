@@ -1295,7 +1295,6 @@ async def voice_session_input(data: dict):
     text = data.get("text","").strip()
     if not sid: raise HTTPException(400,"session_id required")
     conn = get_db_conn()
-    conn.autocommit = False
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM voice_sessions WHERE id=%s AND state='active' FOR UPDATE",(sid,))
