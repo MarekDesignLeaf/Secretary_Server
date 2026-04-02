@@ -1,4 +1,4 @@
-import os, json, uuid, csv, io
+﻿import os, json, uuid, csv, io
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
@@ -1487,9 +1487,12 @@ async def voice_session_input(data: dict):
     except HTTPException: conn.rollback(); raise
     except Exception as e:
         import traceback; traceback.print_exc()
-        conn.rollback()
-        return {"step":"error","prompt":f"Server error: {type(e).__name__}: {str(e)}","error":str(e)}
-    finally: release_conn(conn)
+        try: conn.rollback()
+        except: pass
+        return {"step":"error","prompt":f"Voice error: {type(e).__name__}: {e}","error":str(e)}
+    finally:
+        try: release_conn(conn)
+        except: pass
 
 @app.post("/voice/session/resume")
 async def voice_session_resume(data: dict):
