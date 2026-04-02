@@ -11,7 +11,7 @@ import uvicorn
 from openai import OpenAI
 from datetime import datetime
 
-app = FastAPI(title="Secretary CRM - DesignLeaf")
+app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
 
 # === AUTO-CREATE TABLES ===
 EXTRA_TABLES_SQL = """
