@@ -1485,7 +1485,10 @@ async def voice_session_input(data: dict):
             conn.commit()
         return {"session_id":sid,"step":next_step,"prompt":reply,"context":ctx}
     except HTTPException: conn.rollback(); raise
-    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        conn.rollback()
+        return {"step":"error","prompt":f"Server error: {type(e).__name__}: {str(e)}","error":str(e)}
     finally: release_conn(conn)
 
 @app.post("/voice/session/resume")
