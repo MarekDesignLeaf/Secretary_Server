@@ -1452,13 +1452,23 @@ async def voice_session_input(data: dict):
                 low = text.lower()
                 if low in ("confirm","potvrdit","potwierdź","yes","ano","tak"):
                     next_step = "confirm"
-                elif low.startswith("edit") or low.startswith("oprav") or low.startswith("popraw"):
-                    # Go back to the mentioned step
-                    for s in ["client","workers","total_hours","entries","materials","waste","notes"]:
-                        if s in low or (s=="total_hours" and ("hour" in low or "hodin" in low or "godzin" in low)):
-                            next_step = s; reply = get_prompt(s,lang); break
-                    else:
-                        reply = "What to edit? (client/workers/hours/entries/materials/waste/notes)"
+                elif low.startswith("edit") or low.startswith("oprav") or low.startswith("popraw") or low.startswith("zmen") or low.startswith("změ"):
+                    # Go back to the mentioned step - match Czech/English/Polish words
+                    _step_map = {
+                        "client":"client","klient":"client","klienta":"client",
+                        "workers":"workers","worker":"workers","pracovnik":"workers","pracovník":"workers","pracovniky":"workers","pracovníky":"workers","kdo":"workers",
+                        "hours":"total_hours","hodin":"total_hours","hodiny":"total_hours","celkem":"total_hours","total":"total_hours","godzin":"total_hours",
+                        "entries":"entries","entry":"entries","polozk":"entries","položk":"entries","rozpad":"entries","typ":"entries","prace":"entries","práce":"entries",
+                        "waste":"waste","odpad":"waste","odpady":"waste","pytle":"waste","pytl":"waste",
+                        "material":"materials","materiál":"materials","materi":"materials",
+                        "notes":"notes","note":"notes","poznam":"notes","poznám":"notes","poznámk":"notes"
+                    }
+                    _found = False
+                    for _kw, _target in _step_map.items():
+                        if _kw in low:
+                            next_step = _target; reply = get_prompt(_target,lang); _found = True; break
+                    if not _found:
+                        reply = "Co opravit? (klient/pracovniky/hodiny/polozky/odpad/material/poznamku)" if lang=="cs" else "What to edit? (client/workers/hours/entries/waste/materials/notes)"
                 else:
                     reply = "Say 'confirm' to save or 'edit [field]'." if lang=="en" else "Řekni 'potvrdit' nebo 'oprav [pole]'."
 
