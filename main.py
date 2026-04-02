@@ -148,6 +148,7 @@ def init_pool():
         print(f"DB pool OK: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}")
         conn = db_pool.getconn()
         with conn.cursor() as cur:
+            cur.execute("SET search_path TO crm, public")
             cur.execute(EXTRA_TABLES_SQL)
             conn.commit()
         db_pool.putconn(conn)
@@ -477,7 +478,7 @@ async def get_clients():
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,client_code,display_name,email_primary,phone_primary,status,is_commercial FROM clients WHERE deleted_at IS NULL ORDER BY display_name")
+            cur.execute("SELECT * FROM clients WHERE deleted_at IS NULL ORDER BY display_name")
             return cur.fetchall()
     finally: release_conn(conn)
 
@@ -487,7 +488,7 @@ async def search_clients(q: str = Query(..., min_length=1)):
     try:
         with conn.cursor() as cur:
             s = f"%{q}%"
-            cur.execute("SELECT id,client_code,display_name,email_primary,phone_primary,status,is_commercial FROM clients WHERE deleted_at IS NULL AND (display_name ILIKE %s OR email_primary ILIKE %s OR phone_primary ILIKE %s OR client_code ILIKE %s) ORDER BY display_name LIMIT 20",(s,s,s,s))
+            cur.execute("SELECT * FROM clients WHERE deleted_at IS NULL AND (display_name ILIKE %s OR email_primary ILIKE %s OR phone_primary ILIKE %s OR client_code ILIKE %s) ORDER BY display_name LIMIT 20",(s,s,s,s))
             return cur.fetchall()
     finally: release_conn(conn)
 
@@ -496,14 +497,14 @@ async def get_client_detail(client_id: int):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,client_code,display_name,email_primary,phone_primary,status,is_commercial FROM clients WHERE id=%s AND deleted_at IS NULL",(client_id,))
+            cur.execute("SELECT * FROM clients WHERE id=%s AND deleted_at IS NULL",(client_id,))
             cl = cur.fetchone()
             if not cl: raise HTTPException(404,"Klient nenalezen")
-            cur.execute("SELECT id,property_code,property_name,address_line1,city,postcode,status FROM properties WHERE client_id=%s AND deleted_at IS NULL",(client_id,))
+            cur.execute("SELECT * FROM properties WHERE client_id=%s AND deleted_at IS NULL",(client_id,))
             props = cur.fetchall()
-            cur.execute("SELECT id,job_number,job_title,job_status,start_date_planned::text FROM jobs WHERE client_id=%s AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 10",(client_id,))
+            cur.execute("SELECT j.*,j.start_date_planned::text as start_date_planned FROM jobs j WHERE j.client_id=%s AND j.deleted_at IS NULL ORDER BY j.created_at DESC LIMIT 10",(client_id,))
             jobs = cur.fetchall()
-            cur.execute("SELECT id,subject,message_summary,sent_at::text,direction FROM communications WHERE client_id=%s ORDER BY created_at DESC LIMIT 10",(client_id,))
+            cur.execute("SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes,created_at::text FROM communications WHERE client_id=%s ORDER BY created_at DESC LIMIT 10",(client_id,))
             comms = cur.fetchall()
             cur.execute("SELECT * FROM tasks WHERE client_id=%s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 10",(client_id,))
             tasks = cur.fetchall()
@@ -533,7 +534,7 @@ async def update_client(client_id: int, data: dict):
     conn = get_db_conn()
     try:
         sets = []; vals = []
-        for k in ["display_name","email_primary","phone_primary","status","billing_address_line1","billing_city","billing_postcode"]:
+        for k in ["display_name","first_name","last_name","title","client_type","company_name","company_registration_no","vat_no","email_primary","email_secondary","phone_primary","phone_secondary","website","preferred_contact_method","billing_address_line1","billing_city","billing_postcode","billing_country","status","is_commercial"]:
             if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
         if not sets: raise HTTPException(400,"Zadna data")
         sets.append("updated_at=now()"); vals.append(client_id)
@@ -577,11 +578,11 @@ async def get_jobs(client_id: Optional[int] = None, status: Optional[str] = None
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT id,job_number,job_title,job_status,client_id,start_date_planned::text FROM jobs WHERE deleted_at IS NULL"
+            sql = "SELECT j.id,j.job_number,j.job_title,j.job_status,j.client_id,j.property_id,j.quote_id,j.start_date_planned::text,j.created_at::text,j.updated_at::text,c.display_name as client_name FROM jobs j LEFT JOIN clients c ON j.client_id=c.id WHERE j.deleted_at IS NULL"
             params = []
-            if client_id: sql += " AND client_id=%s"; params.append(client_id)
-            if status: sql += " AND job_status=%s"; params.append(status)
-            sql += " ORDER BY created_at DESC"
+            if client_id: sql += " AND j.client_id=%s"; params.append(client_id)
+            if status: sql += " AND j.job_status=%s"; params.append(status)
+            sql += " ORDER BY j.created_at DESC"
             cur.execute(sql,params); return cur.fetchall()
     finally: release_conn(conn)
 
@@ -707,7 +708,7 @@ async def get_leads():
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,lead_code,lead_source,status,received_at::text FROM leads ORDER BY received_at DESC")
+            cur.execute("SELECT id,lead_code,lead_source,contact_name,contact_email,contact_phone,description,notes,status,client_id,job_id,received_at::text,updated_at::text FROM leads ORDER BY received_at DESC")
             return cur.fetchall()
     finally: release_conn(conn)
 
@@ -811,7 +812,7 @@ async def get_invoices():
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,invoice_number,client_id,grand_total,status,due_date::text FROM invoices ORDER BY created_at DESC")
+            cur.execute("SELECT i.id,i.invoice_number,i.client_id,c.display_name as client_name,i.grand_total,i.status,i.due_date::text,i.created_at::text FROM invoices i LEFT JOIN clients c ON i.client_id=c.id ORDER BY i.created_at DESC")
             return cur.fetchall()
     finally: release_conn(conn)
 
@@ -836,7 +837,7 @@ async def get_communications(client_id: Optional[int]=None, job_id: Optional[int
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes FROM communications WHERE 1=1"
+            sql = "SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes,created_at::text FROM communications WHERE 1=1"
             params = []
             if client_id: sql += " AND client_id=%s"; params.append(client_id)
             if job_id: sql += " AND job_id=%s"; params.append(job_id)
