@@ -1227,7 +1227,7 @@ DIALOG_PROMPTS = {
     "client": {"en":"Which client did you work for?","cs":"U kterého klienta jsi pracoval?","pl":"U którego klienta pracowałeś?"},
     "workers": {"en":"Who worked? (names)","cs":"Kdo pracoval? (jména)","pl":"Kto pracował? (imiona)"},
     "total_hours": {"en":"How many hours total?","cs":"Kolik hodin celkem?","pl":"Ile godzin łącznie?"},
-    "entries": {"en":"What type of work? (e.g. pruning, maintenance) or 'done'","cs":"Jaký typ práce? (např. prořez, údržba, sekání) nebo 'hotovo'","pl":"Jaki rodzaj pracy? lub 'gotowe'"},
+    "entries": {"en":"How many hours pruning?","cs":"Kolik hodin prořez?","pl":"Ile godzin przycinanie?"},
     "validate_hours": {"en":"Hours don't match total. Fix entries or total.","cs":"Hodiny nesedí s celkem. Oprav položky nebo celkem.","pl":"Godziny się nie zgadzają. Popraw pozycje lub sumę."},
     "materials": {"en":"Any materials used? (name, quantity, price) or 'no'","cs":"Použili jste materiál? (název, množství, cena) nebo 'ne'","pl":"Czy użyto materiałów? (nazwa, ilość, cena) lub 'nie'"},
     "waste": {"en":"How many bulk bags of waste? (number or 'none')","cs":"Kolik pytlů odpadu? (číslo nebo 'žádný')","pl":"Ile worków odpadów? (liczba lub 'żaden')"},
@@ -1375,35 +1375,79 @@ async def voice_session_input(data: dict):
                     if wc > 0:
                         per = round(hrs / wc, 2)
                         for w in ctx["workers"]: w["hours"] = per; w["total"] = round(per * w["rate"],2)
-                    next_step = "entries"; reply = f"{hrs}h. {get_prompt('entries',lang)}"
+                    ctx["_entry_sub"] = "pruning"; ctx["entries"] = []; next_step = "entries"; reply = f"{hrs}h. " + get_prompt("entries",lang)
                 except: reply = "Invalid number." if lang=="en" else "Neplatné číslo." if lang=="cs" else "Nieprawidłowa liczba."
 
-            # === STEP: ENTRIES (work breakdown) ===
+            # === STEP: ENTRIES (pruning -> maintenance -> additional if needed) ===
             elif step == "entries":
-                import re
-                entries = []
-                parts = re.findall(r'(\w[\w\s]*?)\s+([\d.,]+)', text)
-                for ptype, phrs in parts:
-                    h = float(phrs.replace(",","."))
-                    rate = resolve_rate(conn,tenant_id,"task_rate",rule_key=ptype.strip().lower(),job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
-                    entries.append({"type":ptype.strip(),"hours":h,"rate":rate,"total":round(h*rate,2)})
-                if not entries and text.lower() not in ("no","ne","nie","skip"):
-                    entries.append({"type":"general","hours":ctx.get("total_hours",0),"rate":resolve_rate(conn,tenant_id,"task_rate",job_id=ctx.get("job_id"),client_id=ctx.get("client_id")),"total":0})
-                    entries[0]["total"] = round(entries[0]["hours"]*entries[0]["rate"],2)
-                ctx["entries"] = entries
-                # Validate hours
-                entry_sum = sum(e["hours"] for e in entries)
-                total = ctx.get("total_hours",0)
-                if abs(entry_sum - total) > 0.01 and entries:
-                    next_step = "validate_hours"
-                    reply = f"Entries sum={entry_sum}h but total={total}h. " + get_prompt("validate_hours",lang)
-                else:
-                    next_step = "waste"; reply = get_prompt("waste",lang)
+                _nw = {"nula":0,"jedna":1,"jeden":1,"dva":2,"dve":2,"dvě":2,"tri":3,"tři":3,"ctyri":4,"čtyři":4,"pet":5,"pět":5,"sest":6,"šest":6,"sedm":7,"osm":8,"devet":9,"devět":9,"deset":10,"půl":0.5,"half":0.5,
+                    "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10}
+                sub = ctx.get("_entry_sub","pruning")
+                low = text.lower().strip()
+                def _parse_hours(t):
+                    t2 = t.lower().replace("hodin","").replace("hodiny","").replace("hodinu","").replace("hours","").replace("h","").replace(",",".").strip()
+                    if t2 in _nw: return _nw[t2]
+                    return float(t2)
+                if not ctx.get("entries"): ctx["entries"] = []
+
+                if sub == "pruning":
+                    try:
+                        h = _parse_hours(low)
+                        rate = resolve_rate(conn,tenant_id,"task_rate",rule_key="pruning",job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
+                        if h > 0: ctx["entries"].append({"type":"pruning","hours":h,"rate":rate,"total":round(h*rate,2)})
+                        ctx["_entry_sub"] = "maintenance"
+                        reply = "Kolik hodin údržba?" if lang=="cs" else "How many hours maintenance?" if lang=="en" else "Ile godzin konserwacja?"
+                    except:
+                        reply = "Neplatné číslo. Kolik hodin prořez?" if lang=="cs" else "Invalid number. Hours pruning?"
+
+                elif sub == "maintenance":
+                    try:
+                        h = _parse_hours(low)
+                        rate = resolve_rate(conn,tenant_id,"task_rate",rule_key="maintenance",job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
+                        if h > 0: ctx["entries"].append({"type":"maintenance","hours":h,"rate":rate,"total":round(h*rate,2)})
+                        sofar = sum(e["hours"] for e in ctx["entries"])
+                        total = ctx.get("total_hours",0)
+                        remaining = round(total - sofar, 2)
+                        if remaining <= 0.01:
+                            ctx.pop("_entry_sub",None)
+                            next_step = "waste"; reply = get_prompt("waste",lang)
+                        else:
+                            ctx["_entry_sub"] = "additional_type"
+                            reply = f"Zbývá {remaining}h. Jaký další typ práce?" if lang=="cs" else f"{remaining}h left. What other type of work?"
+                    except:
+                        reply = "Neplatné číslo. Kolik hodin údržba?" if lang=="cs" else "Invalid number. Hours maintenance?"
+
+                elif sub == "additional_type":
+                    ctx["_entry_type_name"] = text.strip()
+                    ctx["_entry_sub"] = "additional_hours"
+                    reply = f"{text.strip()} — kolik hodin?" if lang=="cs" else f"{text.strip()} — how many hours?"
+
+                elif sub == "additional_hours":
+                    try:
+                        h = _parse_hours(low)
+                        etype = ctx.pop("_entry_type_name","other")
+                        rate = resolve_rate(conn,tenant_id,"task_rate",rule_key=etype.lower(),job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
+                        if h > 0: ctx["entries"].append({"type":etype,"hours":h,"rate":rate,"total":round(h*rate,2)})
+                        sofar = sum(e["hours"] for e in ctx["entries"])
+                        total = ctx.get("total_hours",0)
+                        remaining = round(total - sofar, 2)
+                        if abs(remaining) <= 0.01:
+                            ctx.pop("_entry_sub",None)
+                            next_step = "waste"; reply = get_prompt("waste",lang)
+                        elif remaining > 0:
+                            ctx["_entry_sub"] = "additional_type"
+                            reply = f"Zbývá {remaining}h. Jaký další typ práce?" if lang=="cs" else f"{remaining}h left. What other type?"
+                        else:
+                            # Presazeno - reset
+                            ctx["entries"] = []
+                            ctx["_entry_sub"] = "pruning"
+                            reply = "Součet přesahuje celkem. Začínám znovu. Kolik hodin prořez?" if lang=="cs" else "Sum exceeds total. Starting over. Hours pruning?"
+                    except:
+                        reply = "Neplatné číslo. Kolik hodin?" if lang=="cs" else "Invalid number. How many hours?"
 
             # === STEP: VALIDATE HOURS ===
             elif step == "validate_hours":
-                if "total" in text.lower() or "celkem" in text.lower() or "suma" in text.lower():
-                    ctx["total_hours"] = sum(e["hours"] for e in ctx.get("entries",[]))
+                ctx["total_hours"] = sum(e["hours"] for e in ctx.get("entries",[]))
                 next_step = "waste"; reply = get_prompt("waste",lang)
 
             # === STEP: MATERIALS ===
@@ -1421,7 +1465,7 @@ async def voice_session_input(data: dict):
                     if not mats and text.lower() not in ("no","ne","nie","none","skip"):
                         mats.append({"name":text,"qty":1,"price":0,"total":0})
                     ctx["materials"] = mats
-                next_step = "waste"; reply = get_prompt("waste",lang)
+                next_step = "notes"; reply = get_prompt("notes",lang)
 
             # === STEP: WASTE ===
             elif step == "waste":
