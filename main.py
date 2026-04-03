@@ -1337,6 +1337,78 @@ WORKSPACE_DEFAULTS = {
     "team":     {"max_users":5,  "max_clients":2000, "max_jobs":500,  "max_voice":3000},
     "business": {"max_users":30, "max_clients":10000,"max_jobs":2000, "max_voice":10000},
 }
+LANGUAGE_PRESETS = {
+    "single_single": {
+        "label": "One internal + One customer language",
+        "internal_language_mode": "single", "customer_language_mode": "single",
+        "languages": [
+            {"code":"en","scope":"internal","is_default":True},
+            {"code":"en","scope":"customer","is_default":True},
+            {"code":"en","scope":"voice_input","is_default":True},
+            {"code":"en","scope":"voice_output","is_default":True}
+        ]
+    },
+    "multi_single": {
+        "label": "Multiple internal + One customer language",
+        "internal_language_mode": "multi", "customer_language_mode": "single",
+        "languages": [
+            {"code":"cs","scope":"internal","is_default":True},
+            {"code":"en","scope":"internal","is_default":False},
+            {"code":"en","scope":"customer","is_default":True},
+            {"code":"cs","scope":"voice_input","is_default":True},
+            {"code":"en","scope":"voice_input","is_default":False},
+            {"code":"en","scope":"voice_output","is_default":True}
+        ]
+    },
+    "single_multi": {
+        "label": "One internal + Multiple customer languages",
+        "internal_language_mode": "single", "customer_language_mode": "multi",
+        "languages": [
+            {"code":"en","scope":"internal","is_default":True},
+            {"code":"en","scope":"customer","is_default":True},
+            {"code":"cs","scope":"customer","is_default":False},
+            {"code":"pl","scope":"customer","is_default":False},
+            {"code":"en","scope":"voice_input","is_default":True},
+            {"code":"en","scope":"voice_output","is_default":True},
+            {"code":"cs","scope":"voice_output","is_default":False}
+        ]
+    },
+    "multi_multi": {
+        "label": "Multiple internal + Multiple customer languages",
+        "internal_language_mode": "multi", "customer_language_mode": "multi",
+        "languages": [
+            {"code":"cs","scope":"internal","is_default":True},
+            {"code":"en","scope":"internal","is_default":False},
+            {"code":"pl","scope":"internal","is_default":False},
+            {"code":"en","scope":"customer","is_default":True},
+            {"code":"cs","scope":"customer","is_default":False},
+            {"code":"pl","scope":"customer","is_default":False},
+            {"code":"cs","scope":"voice_input","is_default":True},
+            {"code":"en","scope":"voice_input","is_default":False},
+            {"code":"pl","scope":"voice_input","is_default":False},
+            {"code":"en","scope":"voice_output","is_default":True},
+            {"code":"cs","scope":"voice_output","is_default":False}
+        ]
+    }
+}
+
+@app.get("/onboarding/presets")
+async def get_onboarding_presets():
+    return {
+        "workspace_modes": {k: {"label": k.capitalize(), "defaults": v} for k,v in WORKSPACE_DEFAULTS.items()},
+        "language_presets": LANGUAGE_PRESETS,
+        "legal_types": list(VALID_LEGAL_TYPES),
+        "available_languages": [
+            {"code":"en","name":"English"},
+            {"code":"cs","name":"Čeština"},
+            {"code":"pl","name":"Polski"},
+            {"code":"de","name":"Deutsch"},
+            {"code":"fr","name":"Français"},
+            {"code":"es","name":"Español"},
+            {"code":"sk","name":"Slovenčina"},
+            {"code":"ro","name":"Română"}
+        ]
+    }
 
 @app.get("/onboarding/industry-groups")
 async def get_industry_groups():
