@@ -1325,6 +1325,205 @@ async def get_work_report(report_id: int):
             rpt['materials'] = [dict(m) for m in cur.fetchall()]
             return rpt
     finally: release_conn(conn)
+
+# ========== ONBOARDING ==========
+
+VALID_LEGAL_TYPES = {"sole_trader","ltd","partnership","other"}
+VALID_LANGUAGE_MODES = {"single","multi"}
+VALID_WORKSPACE_MODES = {"solo","team","business"}
+VALID_LANGUAGE_SCOPES = {"internal","customer","voice_input","voice_output"}
+WORKSPACE_DEFAULTS = {
+    "solo":     {"max_users":1,  "max_clients":500,  "max_jobs":100,  "max_voice":600},
+    "team":     {"max_users":5,  "max_clients":2000, "max_jobs":500,  "max_voice":3000},
+    "business": {"max_users":30, "max_clients":10000,"max_jobs":2000, "max_voice":10000},
+}
+
+@app.get("/onboarding/industry-groups")
+async def get_industry_groups():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,code,name,sort_order FROM industry_groups ORDER BY sort_order")
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.get("/onboarding/industry-subtypes/{group_id}")
+async def get_industry_subtypes(group_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,code,name,sort_order FROM industry_subtypes WHERE industry_group_id=%s ORDER BY sort_order",(group_id,))
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.get("/onboarding/status/{tenant_id}")
+async def get_onboarding_status(tenant_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,name,slug,status,legal_type,country_code,timezone,currency FROM tenants WHERE id=%s",(tenant_id,))
+            tenant = cur.fetchone()
+            if not tenant: raise HTTPException(404,"Tenant not found")
+            cur.execute("SELECT * FROM tenant_settings WHERE tenant_id=%s",(tenant_id,))
+            settings = cur.fetchone()
+            cur.execute("SELECT * FROM tenant_operating_profile WHERE tenant_id=%s",(tenant_id,))
+            profile = cur.fetchone()
+            cur.execute("SELECT language_code,language_scope,is_default FROM tenant_languages WHERE tenant_id=%s ORDER BY language_scope,sort_order",(tenant_id,))
+            languages = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT tip.*, ig.code as group_code, ig.name as group_name, ist.code as subtype_code, ist.name as subtype_name FROM tenant_industry_profile tip LEFT JOIN industry_groups ig ON tip.industry_group_id=ig.id LEFT JOIN industry_subtypes ist ON tip.industry_subtype_id=ist.id WHERE tip.tenant_id=%s",(tenant_id,))
+            industry = cur.fetchone()
+            cur.execute("SELECT * FROM subscription_limits WHERE tenant_id=%s",(tenant_id,))
+            limits = cur.fetchone()
+            return {
+                "tenant": dict(tenant),
+                "settings": dict(settings) if settings else None,
+                "operating_profile": dict(profile) if profile else None,
+                "languages": languages,
+                "industry": dict(industry) if industry else None,
+                "subscription_limits": dict(limits) if limits else None,
+                "is_complete": all([settings, profile, languages, industry, limits])
+            }
+    finally: release_conn(conn)
+
+@app.post("/onboarding/company-setup")
+async def company_setup(data: dict):
+    # --- VALIDATION ---
+    errors = []
+    company_name = data.get("company_name","").strip()
+    if not company_name: errors.append("company_name is required")
+    legal_type = data.get("legal_type","sole_trader")
+    if legal_type not in VALID_LEGAL_TYPES: errors.append(f"legal_type must be one of {VALID_LEGAL_TYPES}")
+    workspace_mode = data.get("workspace_mode","solo")
+    if workspace_mode not in VALID_WORKSPACE_MODES: errors.append(f"workspace_mode must be one of {VALID_WORKSPACE_MODES}")
+    internal_language_mode = data.get("internal_language_mode","single")
+    if internal_language_mode not in VALID_LANGUAGE_MODES: errors.append(f"internal_language_mode must be one of {VALID_LANGUAGE_MODES}")
+    customer_language_mode = data.get("customer_language_mode","single")
+    if customer_language_mode not in VALID_LANGUAGE_MODES: errors.append(f"customer_language_mode must be one of {VALID_LANGUAGE_MODES}")
+    default_internal_lang = data.get("default_internal_language_code","en")
+    default_customer_lang = data.get("default_customer_language_code","en")
+    industry_group_id = data.get("industry_group_id")
+    industry_subtype_id = data.get("industry_subtype_id")
+    max_active_users = data.get("max_active_users", WORKSPACE_DEFAULTS.get(workspace_mode,{}).get("max_users",1))
+    tenant_id = data.get("tenant_id", 1)
+    languages = data.get("languages", [])
+    # Validate language entries
+    for lang_entry in languages:
+        scope = lang_entry.get("scope","")
+        if scope not in VALID_LANGUAGE_SCOPES:
+            errors.append(f"Invalid language_scope: {scope}")
+    if errors: raise HTTPException(422, {"errors": errors})
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # 1. UPDATE TENANT (idempotent — update existing)
+            cur.execute("""UPDATE tenants SET
+                name=%s, legal_type=%s, company_registration_no=%s, vat_no=%s,
+                phone=%s, email=%s, website=%s, country_code=%s, timezone=%s, currency=%s,
+                updated_at=now()
+                WHERE id=%s""",
+                (company_name, legal_type, data.get("company_registration_no"),
+                 data.get("vat_no"), data.get("phone"), data.get("email"),
+                 data.get("website"), data.get("country_code","GB"),
+                 data.get("timezone","Europe/London"), data.get("currency","GBP"),
+                 tenant_id))
+
+            # 2. TENANT SETTINGS (upsert — one per tenant)
+            cur.execute("SELECT id FROM tenant_settings WHERE tenant_id=%s",(tenant_id,))
+            if cur.fetchone():
+                cur.execute("""UPDATE tenant_settings SET
+                    date_format=%s, time_format=%s, voice_enabled=%s, updated_at=now()
+                    WHERE tenant_id=%s""",
+                    (data.get("date_format","DD/MM/YYYY"), data.get("time_format","24h"),
+                     data.get("voice_enabled",True), tenant_id))
+            else:
+                cur.execute("""INSERT INTO tenant_settings (tenant_id, date_format, time_format, voice_enabled)
+                    VALUES (%s,%s,%s,%s)""",
+                    (tenant_id, data.get("date_format","DD/MM/YYYY"), data.get("time_format","24h"),
+                     data.get("voice_enabled",True)))
+
+            # 3. TENANT OPERATING PROFILE (upsert — one per tenant)
+            cur.execute("SELECT id FROM tenant_operating_profile WHERE tenant_id=%s",(tenant_id,))
+            if cur.fetchone():
+                cur.execute("""UPDATE tenant_operating_profile SET
+                    internal_language_mode=%s, customer_language_mode=%s,
+                    default_internal_language_code=%s, default_customer_language_code=%s,
+                    voice_input_strategy=%s, voice_output_strategy=%s,
+                    workspace_mode=%s, max_active_users=%s,
+                    industry_group_id=%s, industry_subtype_id=%s, updated_at=now()
+                    WHERE tenant_id=%s""",
+                    (internal_language_mode, customer_language_mode,
+                     default_internal_lang, default_customer_lang,
+                     data.get("voice_input_strategy","auto_detect"),
+                     data.get("voice_output_strategy","customer_default"),
+                     workspace_mode, max_active_users,
+                     industry_group_id, industry_subtype_id, tenant_id))
+            else:
+                cur.execute("""INSERT INTO tenant_operating_profile
+                    (tenant_id, internal_language_mode, customer_language_mode,
+                     default_internal_language_code, default_customer_language_code,
+                     voice_input_strategy, voice_output_strategy,
+                     workspace_mode, max_active_users, industry_group_id, industry_subtype_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (tenant_id, internal_language_mode, customer_language_mode,
+                     default_internal_lang, default_customer_lang,
+                     data.get("voice_input_strategy","auto_detect"),
+                     data.get("voice_output_strategy","customer_default"),
+                     workspace_mode, max_active_users,
+                     industry_group_id, industry_subtype_id))
+
+            # 4. TENANT LANGUAGES (replace — delete old, insert new)
+            if languages:
+                cur.execute("DELETE FROM tenant_languages WHERE tenant_id=%s",(tenant_id,))
+                for i, lang_entry in enumerate(languages):
+                    cur.execute("""INSERT INTO tenant_languages
+                        (tenant_id, language_code, language_scope, is_default, sort_order)
+                        VALUES (%s,%s,%s,%s,%s)
+                        ON CONFLICT (tenant_id, language_code, language_scope) DO NOTHING""",
+                        (tenant_id, lang_entry.get("code","en"), lang_entry.get("scope","internal"),
+                         lang_entry.get("is_default",False), i+1))
+
+            # 5. TENANT INDUSTRY PROFILE (upsert primary)
+            if industry_group_id:
+                cur.execute("SELECT id FROM tenant_industry_profile WHERE tenant_id=%s AND is_primary=true",(tenant_id,))
+                if cur.fetchone():
+                    cur.execute("""UPDATE tenant_industry_profile SET
+                        industry_group_id=%s, industry_subtype_id=%s, updated_at=now()
+                        WHERE tenant_id=%s AND is_primary=true""",
+                        (industry_group_id, industry_subtype_id, tenant_id))
+                else:
+                    cur.execute("""INSERT INTO tenant_industry_profile
+                        (tenant_id, industry_group_id, industry_subtype_id, is_primary)
+                        VALUES (%s,%s,%s,true)""",
+                        (tenant_id, industry_group_id, industry_subtype_id))
+
+            # 6. SUBSCRIPTION LIMITS (upsert based on workspace_mode)
+            ws = WORKSPACE_DEFAULTS.get(workspace_mode, WORKSPACE_DEFAULTS["solo"])
+            cur.execute("SELECT id FROM subscription_limits WHERE tenant_id=%s",(tenant_id,))
+            if cur.fetchone():
+                cur.execute("""UPDATE subscription_limits SET
+                    max_users=%s, max_clients=%s, max_jobs_per_month=%s, max_voice_minutes=%s, updated_at=now()
+                    WHERE tenant_id=%s""",
+                    (max_active_users, ws["max_clients"], ws["max_jobs"], ws["max_voice"], tenant_id))
+            else:
+                cur.execute("""INSERT INTO subscription_limits
+                    (tenant_id, max_users, max_clients, max_jobs_per_month, max_voice_minutes)
+                    VALUES (%s,%s,%s,%s,%s)""",
+                    (tenant_id, max_active_users, ws["max_clients"], ws["max_jobs"], ws["max_voice"]))
+
+            # 7. AUDIT LOG
+            log_activity(conn, "tenant", str(tenant_id), "onboarding_setup",
+                f"Company setup: {company_name}, {workspace_mode}, {legal_type}",
+                tenant_id=tenant_id)
+
+            conn.commit()
+        return {"status":"ok","tenant_id":tenant_id,"company_name":company_name,"workspace_mode":workspace_mode}
+    except HTTPException: raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
 @app.get("/health")
 async def health():
     try:
