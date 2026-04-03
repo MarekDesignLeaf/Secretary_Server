@@ -1,17 +1,24 @@
-﻿import os, json, uuid, csv, io
+﻿import os, json, uuid, csv, io, hashlib
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
 from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
 import uvicorn
 from openai import OpenAI
-from datetime import datetime
+from datetime import datetime, timedelta
+import jwt as pyjwt
 
 app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
+
+# === JWT CONFIG ===
+JWT_SECRET = os.getenv("JWT_SECRET", "secretary-designleaf-jwt-secret-change-in-production")
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
+JWT_REFRESH_EXPIRE_DAYS = 30
 
 # === AUTO-CREATE TABLES ===
 EXTRA_TABLES_SQL = """
@@ -153,6 +160,17 @@ def init_pool():
             conn.commit()
         db_pool.putconn(conn)
         print("Extra tables ready")
+        # Seed missing roles
+        try:
+            conn2 = db_pool.getconn()
+            with conn2.cursor() as cur:
+                cur.execute("SET search_path TO crm, public")
+                for rname, rdesc in [("admin","Full access"),("manager","Manage clients, jobs, planning"),("worker","Own tasks, attendance, photos"),("assistant","Wide access, append-only"),("viewer","Read-only access")]:
+                    cur.execute("INSERT INTO roles (role_name, description) VALUES (%s,%s) ON CONFLICT (role_name) DO NOTHING",(rname,rdesc))
+                conn2.commit()
+            db_pool.putconn(conn2)
+            print("Roles seeded")
+        except Exception as e: print(f"Role seed: {e}")
     except Exception as e: print(f"DB pool FAIL: {e}")
 
 def get_db_conn():
@@ -1427,6 +1445,155 @@ async def get_work_report(report_id: int):
             cur.execute("SELECT * FROM work_report_materials WHERE work_report_id=%s",(report_id,))
             rpt['materials'] = [dict(m) for m in cur.fetchall()]
             return rpt
+    finally: release_conn(conn)
+
+# ========== AUTH: JWT ==========
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(password: str, hashed: str) -> bool:
+    return hash_password(password) == hashed
+
+def create_token(user_id: int, tenant_id: int, role: str, token_type: str = "access") -> str:
+    if token_type == "access":
+        exp = datetime.utcnow() + timedelta(minutes=JWT_ACCESS_EXPIRE_MINUTES)
+    else:
+        exp = datetime.utcnow() + timedelta(days=JWT_REFRESH_EXPIRE_DAYS)
+    payload = {"user_id": user_id, "tenant_id": tenant_id, "role": role, "type": token_type, "exp": exp, "iat": datetime.utcnow()}
+    return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def decode_token(token: str) -> dict:
+    try:
+        return pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+
+async def get_current_user(authorization: Optional[str] = Header(None)) -> Optional[dict]:
+    """Optional auth dependency. Returns user dict or None if no token."""
+    if not authorization: return None
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+    try:
+        payload = decode_token(token)
+        if payload.get("type") != "access": raise HTTPException(401, "Not an access token")
+        return payload
+    except HTTPException: return None
+
+async def require_auth(authorization: str = Header(...)) -> dict:
+    """Required auth dependency. Raises 401 if no valid token."""
+    if not authorization: raise HTTPException(401, "Authorization header required")
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+    payload = decode_token(token)
+    if payload.get("type") != "access": raise HTTPException(401, "Not an access token")
+    return payload
+
+def require_role(*roles):
+    """Factory for role-based access. Usage: Depends(require_role('admin','manager'))"""
+    async def checker(user: dict = Depends(require_auth)):
+        if user.get("role") not in roles:
+            raise HTTPException(403, f"Role '{user.get('role')}' not authorized. Required: {roles}")
+        return user
+    return checker
+
+@app.post("/auth/login")
+async def auth_login(data: dict):
+    email = data.get("email","").strip().lower()
+    password = data.get("password","").strip()
+    if not email or not password: raise HTTPException(400, "Email and password required")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT u.id, u.tenant_id, u.display_name, u.email, u.password_hash, u.status, u.is_owner, u.is_assistant,
+                r.role_name FROM users u LEFT JOIN roles r ON u.role_id=r.id
+                WHERE LOWER(u.email)=%s AND u.deleted_at IS NULL""", (email,))
+            user = cur.fetchone()
+            if not user: raise HTTPException(401, "Invalid credentials")
+            if user["status"] and user["status"] not in ("active","setup"):
+                raise HTTPException(403, f"Account is {user['status']}")
+            if not user["password_hash"] or not verify_password(password, user["password_hash"]):
+                raise HTTPException(401, "Invalid credentials")
+            role = user["role_name"] or "viewer"
+            access = create_token(user["id"], user["tenant_id"], role, "access")
+            refresh = create_token(user["id"], user["tenant_id"], role, "refresh")
+            log_activity(conn, "user", str(user["id"]), "login", f"{user['display_name']} logged in", tenant_id=user["tenant_id"], user_id=user["id"])
+            conn.commit()
+        return {
+            "access_token": access, "refresh_token": refresh, "token_type": "bearer",
+            "user": {"id": user["id"], "display_name": user["display_name"], "email": user["email"],
+                     "role": role, "tenant_id": user["tenant_id"], "is_owner": user["is_owner"]}
+        }
+    finally: release_conn(conn)
+
+@app.post("/auth/refresh")
+async def auth_refresh(data: dict):
+    token = data.get("refresh_token","")
+    if not token: raise HTTPException(400, "refresh_token required")
+    payload = decode_token(token)
+    if payload.get("type") != "refresh": raise HTTPException(401, "Not a refresh token")
+    access = create_token(payload["user_id"], payload["tenant_id"], payload["role"], "access")
+    return {"access_token": access, "token_type": "bearer"}
+
+@app.get("/auth/me")
+async def auth_me(user: dict = Depends(require_auth)):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT u.id, u.tenant_id, u.display_name, u.email, u.phone, u.status, u.is_owner, u.is_assistant,
+                u.preferred_language_code, r.role_name FROM users u LEFT JOIN roles r ON u.role_id=r.id WHERE u.id=%s""", (user["user_id"],))
+            u = cur.fetchone()
+            if not u: raise HTTPException(404, "User not found")
+        return dict(u)
+    finally: release_conn(conn)
+
+@app.post("/auth/register")
+async def auth_register(data: dict, admin: dict = Depends(require_role("admin"))):
+    """Admin-only: register new user."""
+    email = data.get("email","").strip().lower()
+    password = data.get("password","").strip()
+    display_name = data.get("display_name","").strip()
+    if not email or not password or not display_name:
+        raise HTTPException(400, "email, password, display_name required")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE LOWER(email)=%s AND deleted_at IS NULL", (email,))
+            if cur.fetchone(): raise HTTPException(409, "Email already registered")
+            role_name = data.get("role","worker")
+            cur.execute("SELECT id FROM roles WHERE role_name=%s", (role_name,))
+            role_row = cur.fetchone()
+            role_id = role_row["id"] if role_row else None
+            cur.execute("""INSERT INTO users (tenant_id, role_id, first_name, last_name, display_name, email, phone, password_hash, status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active') RETURNING id""",
+                (admin["tenant_id"], role_id, data.get("first_name",""), data.get("last_name",""),
+                 display_name, email, data.get("phone",""), hash_password(password)))
+            uid = cur.fetchone()["id"]
+            log_activity(conn, "user", str(uid), "register", f"User {display_name} registered by admin", tenant_id=admin["tenant_id"], user_id=admin["user_id"])
+            conn.commit()
+        return {"id": uid, "email": email, "display_name": display_name, "role": role_name}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.put("/auth/change-password")
+async def auth_change_password(data: dict, user: dict = Depends(require_auth)):
+    old_pw = data.get("old_password","")
+    new_pw = data.get("new_password","")
+    if not old_pw or not new_pw: raise HTTPException(400, "old_password and new_password required")
+    if len(new_pw) < 6: raise HTTPException(400, "Password must be at least 6 characters")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT password_hash FROM users WHERE id=%s", (user["user_id"],))
+            u = cur.fetchone()
+            if not u or not verify_password(old_pw, u["password_hash"]):
+                raise HTTPException(401, "Old password incorrect")
+            cur.execute("UPDATE users SET password_hash=%s, updated_at=now() WHERE id=%s", (hash_password(new_pw), user["user_id"]))
+            conn.commit()
+        return {"status": "password_changed"}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
 # ========== ONBOARDING ==========
