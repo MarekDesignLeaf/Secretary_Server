@@ -740,12 +740,19 @@ async def create_job(data: dict):
 async def update_job(job_id: int, data: dict):
     conn = get_db_conn()
     try:
-        sets = []; vals = []
-        for k in ["job_title","job_status","start_date_planned"]:
-            if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
-        if not sets: raise HTTPException(400)
-        sets.append("updated_at=now()"); vals.append(job_id)
         with conn.cursor() as cur:
+            # Validate state transition if status is being changed
+            if "job_status" in data:
+                cur.execute("SELECT job_status FROM jobs WHERE id=%s AND deleted_at IS NULL",(job_id,))
+                row = cur.fetchone()
+                if not row: raise HTTPException(404,"Job not found")
+                err = validate_transition(row["job_status"], data["job_status"], JOB_TRANSITIONS, "Job")
+                if err: raise HTTPException(422, err)
+            sets = []; vals = []
+            for k in ["job_title","job_status","start_date_planned"]:
+                if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
+            if not sets: raise HTTPException(400)
+            sets.append("updated_at=now()"); vals.append(job_id)
             cur.execute(f"UPDATE jobs SET {','.join(sets)} WHERE id=%s AND deleted_at IS NULL",vals)
             log_activity(conn,"job",job_id,"update",f"Zakazka upravena: {list(data.keys())}")
             conn.commit()
@@ -865,12 +872,18 @@ async def get_lead_detail(lead_id: int):
 async def update_lead(lead_id: int, data: dict):
     conn = get_db_conn()
     try:
-        sets = []; vals = []
-        for k in ["status","lead_source","contact_name","contact_email","contact_phone","description","notes"]:
-            if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
-        if not sets: raise HTTPException(400)
-        sets.append("updated_at=now()"); vals.append(lead_id)
         with conn.cursor() as cur:
+            if "status" in data:
+                cur.execute("SELECT status FROM leads WHERE id=%s",(lead_id,))
+                row = cur.fetchone()
+                if not row: raise HTTPException(404,"Lead not found")
+                err = validate_transition(row["status"], data["status"], LEAD_TRANSITIONS, "Lead")
+                if err: raise HTTPException(422, err)
+            sets = []; vals = []
+            for k in ["status","lead_source","contact_name","contact_email","contact_phone","description","notes"]:
+                if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
+            if not sets: raise HTTPException(400)
+            sets.append("updated_at=now()"); vals.append(lead_id)
             cur.execute(f"UPDATE leads SET {','.join(sets)} WHERE id=%s",vals)
             log_activity(conn,"lead",lead_id,"update",f"Lead upraven: {list(data.keys())}")
             conn.commit()
@@ -1322,6 +1335,12 @@ async def update_invoice(invoice_id: int, data: dict):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            if "status" in data:
+                cur.execute("SELECT status FROM invoices WHERE id=%s",(invoice_id,))
+                row = cur.fetchone()
+                if not row: raise HTTPException(404,"Invoice not found")
+                err = validate_transition(row["status"], data["status"], INVOICE_TRANSITIONS, "Invoice")
+                if err: raise HTTPException(422, err)
             fields = []
             vals = []
             for k in ["status","grand_total","due_date","notes"]:
@@ -1416,6 +1435,50 @@ VALID_LEGAL_TYPES = {"sole_trader","ltd","partnership","other"}
 VALID_LANGUAGE_MODES = {"single","multi"}
 VALID_WORKSPACE_MODES = {"solo","team","business"}
 VALID_LANGUAGE_SCOPES = {"internal","customer","voice_input","voice_output"}
+
+# ========== STATE TRANSITION RULES (Blueprint v2 Section 4) ==========
+JOB_TRANSITIONS = {
+    "nova":              ["v_reseni","pozastaveno","zruseno"],
+    "v_reseni":          ["ceka_na_klienta","ceka_na_material","naplanovano","pozastaveno","zruseno"],
+    "ceka_na_klienta":   ["v_reseni","naplanovano","pozastaveno","zruseno"],
+    "ceka_na_material":  ["naplanovano","v_reseni","pozastaveno","zruseno"],
+    "naplanovano":       ["v_realizaci","pozastaveno","zruseno"],
+    "v_realizaci":       ["dokonceno","pozastaveno","zruseno"],
+    "dokonceno":         ["vyfakturovano","pozastaveno"],
+    "vyfakturovano":     ["uzavreno"],
+    "pozastaveno":       ["nova","v_reseni","naplanovano","v_realizaci","zruseno"],
+    "uzavreno":          [],
+    "zruseno":           [],
+}
+LEAD_TRANSITIONS = {
+    "new":                    ["kvalifikovany","zamitnuto"],
+    "kvalifikovany":          ["nabidka_odeslana","zamitnuto"],
+    "nabidka_odeslana":       ["schvaleno","zamitnuto"],
+    "schvaleno":              ["preveden_na_klienta","preveden_na_zakazku"],
+    "zamitnuto":              ["new"],
+    "preveden_na_klienta":    [],
+    "preveden_na_zakazku":    [],
+}
+INVOICE_TRANSITIONS = {
+    "draft":                ["odeslana","stornována"],
+    "odeslana":             ["castecne_uhrazena","uhrazena","po_splatnosti","stornována"],
+    "castecne_uhrazena":    ["uhrazena","po_splatnosti","stornována"],
+    "uhrazena":             [],
+    "po_splatnosti":        ["castecne_uhrazena","uhrazena","stornována"],
+    "stornována":           [],
+}
+# Normalize aliases
+INVOICE_TRANSITIONS["částečně_uhrazená"] = INVOICE_TRANSITIONS["castecne_uhrazena"]
+INVOICE_TRANSITIONS["odeslaná"] = INVOICE_TRANSITIONS["odeslana"]
+
+def validate_transition(current_status, new_status, rules, entity_name="entity"):
+    """Validate state transition. Returns None if OK, error string if invalid."""
+    if current_status == new_status: return None
+    allowed = rules.get(current_status)
+    if allowed is None: return None  # unknown current state — allow (backward compat)
+    if new_status not in allowed:
+        return f"{entity_name}: transition '{current_status}' → '{new_status}' not allowed. Allowed: {allowed}"
+    return None
 WORKSPACE_DEFAULTS = {
     "solo":     {"max_users":1,  "max_clients":500,  "max_jobs":100,  "max_voice":600},
     "team":     {"max_users":5,  "max_clients":2000, "max_jobs":500,  "max_voice":3000},
