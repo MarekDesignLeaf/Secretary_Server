@@ -1103,6 +1103,55 @@ async def test_voice():
         try: release_conn(conn)
         except: pass
 
+# ========== INVOICE UPDATE ==========
+@app.put("/crm/invoices/{invoice_id}")
+async def update_invoice(invoice_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            fields = []
+            vals = []
+            for k in ["status","grand_total","due_date","notes"]:
+                if k in data:
+                    fields.append(f"{k}=%s"); vals.append(data[k])
+            if not fields: raise HTTPException(400,"No fields to update")
+            vals.append(invoice_id)
+            cur.execute(f"UPDATE invoices SET {','.join(fields)},updated_at=now() WHERE id=%s",vals)
+            conn.commit()
+        return {"id":invoice_id,"status":"updated"}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+# ========== JOB NOTES ==========
+@app.post("/crm/jobs/{job_id}/notes")
+async def add_job_note(job_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO job_notes (job_id,note,created_by,tenant_id) VALUES (%s,%s,%s,1) RETURNING id",
+                (job_id, data.get("note",""), data.get("created_by","system")))
+            nid = cur.fetchone()['id']; conn.commit()
+        return {"id":nid,"status":"created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+# ========== MANUAL WORK REPORT ==========
+@app.post("/work-reports")
+async def create_work_report(data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO work_reports (tenant_id,client_id,work_date,total_hours,total_price,notes,input_type,status,created_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (data.get("tenant_id",1),data.get("client_id"),data.get("work_date"),
+                 data.get("total_hours",0),data.get("total_price",0),data.get("notes"),
+                 data.get("input_type","manual"),data.get("status","draft"),data.get("created_by")))
+            rid = cur.fetchone()['id']; conn.commit()
+        return {"id":rid,"status":"created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
 # ========== WORK REPORTS ==========
 @app.get("/work-reports")
 async def get_work_reports(tenant_id: int = 1):
