@@ -222,22 +222,34 @@ async def process_message(msg: MessageRequest):
                     if r: entity_ctx = f"Marek se diva na klienta: {r['display_name']}"
             finally: release_conn(conn)
 
-        system_prompt = f"""Jsi inteligentni sekretarka firmy DesignLeaf (zahradnicke sluzby, Oxfordshire UK).
-CAS: {now}. KONTEXT: {entity_ctx or 'Zadny.'}
-KALENDAR: {msg.calendar_context or 'Neni.'}
-PRAVIDLA:
-- Odpovez cesky, strucne, lidsky. Pamatuj historii.
-- NIKDY nerci 'provadim...' — vzdy odpovez lidsky co jsi udelala.
-- Pro vytvoreni ukolu pouzij create_task. Pro zmenu stavu update_task. Pro dokonceni complete_task.
-- Pro seznam ukolu pouzij list_tasks.
-- Pro zakazky: create_job pro novou, update_job pro zmenu stavu.
-- Pro poznamky: add_note s entity_type 'client' nebo 'job'.
-- Pro leady: create_lead.
-- Pro kalendar: list_calendar_events, add/modify/delete_calendar_event.
-- Pro kontakty: search_contacts, call_contact.
-- Kdyz se Marek zepta 'co mam delat' nebo 'jake mam ukoly', pouzij list_tasks.
-- Kdyz rekne 'hotovo' nebo 'splneno' u ukolu, pouzij complete_task.
-- Kdyz rekne 'work report', 'zapsat praci', 'zadat hodiny', 'report prace', 'nahlasit praci', pouzij start_work_report."""
+        # Language from request
+        lang = (msg.internal_language or "cs").split("-")[0].lower()
+        if lang == "cs":
+            lang_instruction = "JAZYK: Odpovídej VÝHRADNĚ česky. Celá tvoje odpověď musí být v češtině. Nikdy nepřepínej do jiného jazyka. Uživatel může psát česky, anglicky nebo polsky — ty VŽDY odpovídáš POUZE česky."
+        elif lang == "en":
+            lang_instruction = "LANGUAGE: You MUST respond EXCLUSIVELY in English. Your entire response must be in English. Never switch to another language. The user may write in Czech, English or Polish — you ALWAYS respond ONLY in English."
+        elif lang == "pl":
+            lang_instruction = "JĘZYK: Odpowiadaj WYŁĄCZNIE po polsku. Cała twoja odpowiedź musi być po polsku. Nigdy nie przełączaj się na inny język. Użytkownik może pisać po czesku, angielsku lub polsku — ty ZAWSZE odpowiadasz TYLKO po polsku."
+        else:
+            lang_instruction = "LANGUAGE: Respond in English only."
+
+        system_prompt = f"""You are an intelligent secretary of DesignLeaf company (landscaping services, Oxfordshire UK).
+{lang_instruction}
+TIME: {now}. CONTEXT: {entity_ctx or 'None.'}
+CALENDAR: {msg.calendar_context or 'None.'}
+RULES:
+- Be concise, human, friendly. Remember conversation history.
+- NEVER say 'executing...' or 'performing...' — always respond naturally describing what you did.
+- To create a task use create_task. To change status use update_task. To complete use complete_task.
+- To list tasks use list_tasks.
+- For jobs: create_job for new, update_job for status change.
+- For notes: add_note with entity_type 'client' or 'job'.
+- For leads: create_lead.
+- For calendar: list_calendar_events, add/modify/delete_calendar_event.
+- For contacts: search_contacts, call_contact.
+- When user asks 'what do I have to do' or 'my tasks', use list_tasks.
+- When user says 'done' or 'completed' for a task, use complete_task.
+- When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report."""
 
         tools = [
             {"type":"function","function":{"name":"add_calendar_event","description":"Prida schuzku do kalendare","parameters":{"type":"object","properties":{"title":{"type":"string"},"start_time":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"duration":{"type":"integer","description":"minuty"}},"required":["title","start_time"]}}},
