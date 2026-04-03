@@ -176,6 +176,62 @@ def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1,
              tenant_id,
              str(user_id) if user_id else None))
 
+# ========== TENANT CONFIG LOADER ==========
+_tenant_config_cache = {}
+
+def get_tenant_config(conn, tenant_id):
+    """Load tenant configuration from DB. Cached per request cycle."""
+    if tenant_id in _tenant_config_cache:
+        return _tenant_config_cache[tenant_id]
+    config = {"tenant_id": tenant_id, "found": False}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tenant_operating_profile WHERE tenant_id=%s", (tenant_id,))
+            profile = cur.fetchone()
+            if profile:
+                config["found"] = True
+                config["internal_language_mode"] = profile["internal_language_mode"]
+                config["customer_language_mode"] = profile["customer_language_mode"]
+                config["default_internal_lang"] = profile["default_internal_language_code"]
+                config["default_customer_lang"] = profile["default_customer_language_code"]
+                config["voice_input_strategy"] = profile["voice_input_strategy"]
+                config["voice_output_strategy"] = profile["voice_output_strategy"]
+                config["workspace_mode"] = profile["workspace_mode"]
+                config["max_active_users"] = profile["max_active_users"]
+            cur.execute("SELECT language_code, language_scope, is_default FROM tenant_languages WHERE tenant_id=%s AND is_active=true ORDER BY language_scope, sort_order", (tenant_id,))
+            langs = [dict(r) for r in cur.fetchall()]
+            config["languages"] = langs
+            config["internal_langs"] = [l["language_code"] for l in langs if l["language_scope"]=="internal"]
+            config["customer_langs"] = [l["language_code"] for l in langs if l["language_scope"]=="customer"]
+            config["voice_input_langs"] = [l["language_code"] for l in langs if l["language_scope"]=="voice_input"]
+            config["voice_output_langs"] = [l["language_code"] for l in langs if l["language_scope"]=="voice_output"]
+            cur.execute("SELECT * FROM subscription_limits WHERE tenant_id=%s", (tenant_id,))
+            limits = cur.fetchone()
+            config["limits"] = dict(limits) if limits else None
+            cur.execute("SELECT * FROM tenant_settings WHERE tenant_id=%s", (tenant_id,))
+            settings = cur.fetchone()
+            config["settings"] = dict(settings) if settings else None
+    except Exception: pass
+    _tenant_config_cache[tenant_id] = config
+    return config
+
+def resolve_response_language(config, request_lang=None):
+    """Determine which language the AI should respond in."""
+    if request_lang:
+        code = request_lang.split("-")[0].lower()
+        if code in ("cs","en","pl","de","fr","es","sk","ro"): return code
+    if config.get("found"):
+        return config.get("default_internal_lang", "en")
+    return "en"
+
+def resolve_voice_language(config, request_lang=None):
+    """Determine voice session language from config."""
+    if request_lang and request_lang != "en":
+        return request_lang.split("-")[0].lower()
+    if config.get("found"):
+        return config.get("default_internal_lang", "en")
+    return "en"
+
 @app.on_event("startup")
 async def startup():
     init_pool()
@@ -222,8 +278,9 @@ async def process_message(msg: MessageRequest):
                     if r: entity_ctx = f"Marek se diva na klienta: {r['display_name']}"
             finally: release_conn(conn)
 
-        # Language from request
-        lang = (msg.internal_language or "cs").split("-")[0].lower()
+        # Language from tenant config + request override
+        tenant_config = get_tenant_config(conn if 'conn' in dir() else get_db_conn(), 1)
+        lang = resolve_response_language(tenant_config, msg.internal_language)
         if lang == "cs":
             lang_instruction = "JAZYK: Odpovídej VÝHRADNĚ česky. Celá tvoje odpověď musí být v češtině. Nikdy nepřepínej do jiného jazyka. Uživatel může psát česky, anglicky nebo polsky — ty VŽDY odpovídáš POUZE česky."
         elif lang == "en":
@@ -1419,6 +1476,30 @@ async def get_industry_groups():
             return [dict(r) for r in cur.fetchall()]
     finally: release_conn(conn)
 
+@app.get("/tenant/config/{tenant_id}")
+async def get_tenant_config_endpoint(tenant_id: int):
+    conn = get_db_conn()
+    try:
+        config = get_tenant_config(conn, tenant_id)
+        if not config.get("found"):
+            raise HTTPException(404, "Tenant config not found. Run onboarding first.")
+        # Soft limit warnings
+        warnings = []
+        limits = config.get("limits")
+        if limits:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) as c FROM clients WHERE tenant_id=%s AND deleted_at IS NULL",(tenant_id,))
+                client_count = cur.fetchone()["c"]
+                cur.execute("SELECT COUNT(*) as c FROM users WHERE tenant_id=%s AND deleted_at IS NULL",(tenant_id,))
+                user_count = cur.fetchone()["c"]
+            if limits.get("max_clients") and client_count >= limits["max_clients"] * 0.9:
+                warnings.append(f"Approaching client limit: {client_count}/{limits['max_clients']}")
+            if limits.get("max_users") and user_count >= limits["max_users"]:
+                warnings.append(f"User limit reached: {user_count}/{limits['max_users']}")
+        config["warnings"] = warnings
+        return config
+    finally: release_conn(conn)
+
 @app.get("/onboarding/industry-subtypes/{group_id}")
 async def get_industry_subtypes(group_id: int):
     conn = get_db_conn()
@@ -1730,7 +1811,8 @@ async def voice_session_start(data: dict):
     try:
         sid = str(uuid.uuid4())
         tenant_id = data.get("tenant_id",1)
-        lang = data.get("language","en")
+        tenant_config = get_tenant_config(conn, tenant_id)
+        lang = resolve_voice_language(tenant_config, data.get("language"))
         with conn.cursor() as cur:
             ctx = json.dumps({"language":lang,"work_date":data.get("work_date",datetime.now().strftime("%Y-%m-%d"))})
             cur.execute("INSERT INTO voice_sessions (id,tenant_id,user_id,session_type,state,dialog_step,context) VALUES (%s,%s,%s,'work_report','active','client',%s)",
