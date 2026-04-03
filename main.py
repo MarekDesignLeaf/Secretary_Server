@@ -1620,39 +1620,6 @@ async def voice_session_resume(data: dict):
     except Exception as e: raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
-# ========== WORK REPORT CRUD ==========
-@app.get("/work-reports")
-async def list_work_reports(tenant_id: int=1, client_id: Optional[int]=None, status: Optional[str]=None):
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            sql = "SELECT wr.*,c.display_name as client_name FROM work_reports wr LEFT JOIN clients c ON wr.client_id=c.id WHERE wr.tenant_id=%s"
-            params = [tenant_id]
-            if client_id: sql += " AND wr.client_id=%s"; params.append(client_id)
-            if status: sql += " AND wr.status=%s"; params.append(status)
-            sql += " ORDER BY wr.work_date DESC"
-            cur.execute(sql,params); return [dict(r) for r in cur.fetchall()]
-    finally: release_conn(conn)
-
-@app.get("/work-reports/{report_id}")
-async def get_work_report(report_id: int):
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT wr.*,c.display_name as client_name FROM work_reports wr LEFT JOIN clients c ON wr.client_id=c.id WHERE wr.id=%s",(report_id,))
-            rpt = cur.fetchone()
-            if not rpt: raise HTTPException(404)
-            cur.execute("SELECT * FROM work_report_workers WHERE work_report_id=%s",(report_id,))
-            workers = cur.fetchall()
-            cur.execute("SELECT * FROM work_report_entries WHERE work_report_id=%s",(report_id,))
-            entries = cur.fetchall()
-            cur.execute("SELECT * FROM work_report_materials WHERE work_report_id=%s",(report_id,))
-            materials = cur.fetchall()
-            cur.execute("SELECT * FROM work_report_waste WHERE work_report_id=%s",(report_id,))
-            waste = cur.fetchall()
-            return {"report":dict(rpt),"workers":[dict(r) for r in workers],"entries":[dict(r) for r in entries],"materials":[dict(r) for r in materials],"waste":[dict(r) for r in waste]}
-    finally: release_conn(conn)
-
 @app.get("/pricing-rules")
 async def list_pricing_rules(tenant_id: int=1):
     conn = get_db_conn()
