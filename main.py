@@ -1103,7 +1103,124 @@ async def test_voice():
         try: release_conn(conn)
         except: pass
 
-# ========== INVOICE UPDATE ==========
+# ========== QUOTES (Nabídky) ==========
+@app.on_event("startup")
+async def ensure_quote_items():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS quote_items (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                quote_id bigint NOT NULL REFERENCES quotes(id),
+                description text NOT NULL,
+                quantity numeric(10,2) NOT NULL DEFAULT 1,
+                unit_price numeric(12,2) NOT NULL DEFAULT 0,
+                total numeric(12,2) NOT NULL DEFAULT 0,
+                sort_order int NOT NULL DEFAULT 0
+            )""")
+            conn.commit()
+    except: conn.rollback()
+    finally: release_conn(conn)
+
+@app.get("/crm/quotes")
+async def list_quotes(tenant_id: int=1, client_id: Optional[int]=None, status: Optional[str]=None):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = "SELECT q.*,c.display_name as client_name FROM quotes q LEFT JOIN clients c ON q.client_id=c.id WHERE 1=1"
+            params = []
+            if client_id: sql += " AND q.client_id=%s"; params.append(client_id)
+            if status: sql += " AND q.status=%s"; params.append(status)
+            sql += " ORDER BY q.created_at DESC"
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+@app.get("/crm/quotes/{quote_id}")
+async def get_quote(quote_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT q.*,c.display_name as client_name FROM quotes q LEFT JOIN clients c ON q.client_id=c.id WHERE q.id=%s",(quote_id,))
+            q = cur.fetchone()
+            if not q: raise HTTPException(404,"Quote not found")
+            q = dict(q)
+            cur.execute("SELECT * FROM quote_items WHERE quote_id=%s ORDER BY sort_order",(quote_id,))
+            q['items'] = [dict(r) for r in cur.fetchall()]
+            return q
+    finally: release_conn(conn)
+
+@app.post("/crm/quotes")
+async def create_quote(data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(CAST(SUBSTRING(quote_number FROM 5) AS INT)),0)+1 FROM quotes")
+            num = cur.fetchone()[0]; qn = f"QTE-{num:06d}"
+            cur.execute("INSERT INTO quotes (quote_number,client_id,property_id,quote_title,status,grand_total) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                (qn,data["client_id"],data.get("property_id",0),data.get("quote_title","Nabidka"),data.get("status","draft"),data.get("grand_total",0)))
+            qid = cur.fetchone()['id']; conn.commit()
+        return {"id":qid,"quote_number":qn,"status":"created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.put("/crm/quotes/{quote_id}")
+async def update_quote(quote_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            fields,vals = [],[]
+            for k in ["quote_title","status","grand_total"]:
+                if k in data: fields.append(f"{k}=%s"); vals.append(data[k])
+            if fields: vals.append(quote_id); cur.execute(f"UPDATE quotes SET {','.join(fields)},updated_at=now() WHERE id=%s",vals); conn.commit()
+        return {"id":quote_id,"status":"updated"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.post("/crm/quotes/{quote_id}/items")
+async def add_quote_item(quote_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            qty=data.get("quantity",1); price=data.get("unit_price",0); total=round(float(qty)*float(price),2)
+            cur.execute("INSERT INTO quote_items (quote_id,description,quantity,unit_price,total,sort_order) VALUES (%s,%s,%s,%s,%s,(SELECT COALESCE(MAX(sort_order),0)+1 FROM quote_items WHERE quote_id=%s)) RETURNING id",
+                (quote_id,data.get("description",""),qty,price,total,quote_id))
+            iid = cur.fetchone()['id']
+            cur.execute("UPDATE quotes SET grand_total=(SELECT COALESCE(SUM(total),0) FROM quote_items WHERE quote_id=%s),updated_at=now() WHERE id=%s",(quote_id,quote_id)); conn.commit()
+        return {"id":iid,"status":"created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.delete("/crm/quotes/{quote_id}/items/{item_id}")
+async def delete_quote_item(quote_id: int, item_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM quote_items WHERE id=%s AND quote_id=%s",(item_id,quote_id))
+            cur.execute("UPDATE quotes SET grand_total=(SELECT COALESCE(SUM(total),0) FROM quote_items WHERE quote_id=%s),updated_at=now() WHERE id=%s",(quote_id,quote_id)); conn.commit()
+        return {"status":"deleted"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.post("/crm/quotes/{quote_id}/approve")
+async def approve_quote(quote_id: int, data: dict = {}):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE quotes SET status='schvaleno',updated_at=now() WHERE id=%s RETURNING client_id,property_id,quote_title",(quote_id,))
+            q = cur.fetchone()
+            if not q: raise HTTPException(404)
+            result = {"quote_id":quote_id,"status":"schvaleno"}
+            if data.get("create_job",False):
+                cur.execute("SELECT COALESCE(MAX(CAST(SUBSTRING(job_number FROM 5) AS INT)),0)+1 FROM jobs")
+                jnum = cur.fetchone()[0]; jn = f"JOB-{jnum:06d}"
+                cur.execute("INSERT INTO jobs (job_number,client_id,property_id,job_title,job_status,quote_id) VALUES (%s,%s,%s,%s,'nova',%s) RETURNING id",
+                    (jn,q['client_id'],q['property_id'],q['quote_title'],quote_id))
+                result["job_id"]=cur.fetchone()['id']; result["job_number"]=jn
+            conn.commit()
+        return result
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
 @app.put("/crm/invoices/{invoice_id}")
 async def update_invoice(invoice_id: int, data: dict):
     conn = get_db_conn()
