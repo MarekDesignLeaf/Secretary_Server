@@ -232,6 +232,33 @@ def resolve_voice_language(config, request_lang=None):
         return config.get("default_internal_lang", "en")
     return "en"
 
+# ========== TENANT GUARD ==========
+def verify_tenant(conn, tenant_id):
+    """Verify tenant exists and is active. Raises HTTPException if not."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status FROM tenants WHERE id=%s", (tenant_id,))
+        tenant = cur.fetchone()
+        if not tenant:
+            raise HTTPException(404, f"Tenant {tenant_id} not found")
+        if tenant.get("status") and tenant["status"] not in ("active", "trial", "setup"):
+            raise HTTPException(403, f"Tenant {tenant_id} is {tenant['status']}")
+    return True
+
+def verify_tenant_ownership(conn, tenant_id, table, record_id):
+    """Verify a record belongs to the given tenant."""
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT tenant_id FROM {table} WHERE id=%s", (record_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"Record {record_id} not found in {table}")
+        if row["tenant_id"] != tenant_id:
+            raise HTTPException(403, f"Access denied: record belongs to different tenant")
+    return True
+
+def audit_config_change(conn, tenant_id, action, detail):
+    """Log configuration change to activity_timeline."""
+    log_activity(conn, "tenant_config", str(tenant_id), action, detail, tenant_id=tenant_id)
+
 @app.on_event("startup")
 async def startup():
     init_pool()
@@ -1480,6 +1507,7 @@ async def get_industry_groups():
 async def get_tenant_config_endpoint(tenant_id: int):
     conn = get_db_conn()
     try:
+        verify_tenant(conn, tenant_id)
         config = get_tenant_config(conn, tenant_id)
         if not config.get("found"):
             raise HTTPException(404, "Tenant config not found. Run onboarding first.")
@@ -1513,6 +1541,7 @@ async def get_industry_subtypes(group_id: int):
 async def get_onboarding_status(tenant_id: int):
     conn = get_db_conn()
     try:
+        verify_tenant(conn, tenant_id)
         with conn.cursor() as cur:
             cur.execute("SELECT id,name,slug,status,legal_type,country_code,timezone,currency FROM tenants WHERE id=%s",(tenant_id,))
             tenant = cur.fetchone()
@@ -1568,6 +1597,7 @@ async def company_setup(data: dict):
 
     conn = get_db_conn()
     try:
+        verify_tenant(conn, tenant_id)
         with conn.cursor() as cur:
             # 1. UPDATE TENANT (idempotent — update existing)
             cur.execute("""UPDATE tenants SET
@@ -1665,9 +1695,10 @@ async def company_setup(data: dict):
                     (tenant_id, max_active_users, ws["max_clients"], ws["max_jobs"], ws["max_voice"]))
 
             # 7. AUDIT LOG
-            log_activity(conn, "tenant", str(tenant_id), "onboarding_setup",
-                f"Company setup: {company_name}, {workspace_mode}, {legal_type}",
-                tenant_id=tenant_id)
+            audit_config_change(conn, tenant_id, "onboarding_setup",
+                f"Company: {company_name}, mode: {workspace_mode}, legal: {legal_type}, "
+                f"int_lang: {internal_language_mode}/{default_internal_lang}, "
+                f"cust_lang: {customer_language_mode}/{default_customer_lang}")
 
             conn.commit()
         return {"status":"ok","tenant_id":tenant_id,"company_name":company_name,"workspace_mode":workspace_mode}
