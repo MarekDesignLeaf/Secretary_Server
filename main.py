@@ -746,7 +746,7 @@ async def update_job(job_id: int, data: dict):
                 cur.execute("SELECT job_status FROM jobs WHERE id=%s AND deleted_at IS NULL",(job_id,))
                 row = cur.fetchone()
                 if not row: raise HTTPException(404,"Job not found")
-                err = validate_transition(row["job_status"], data["job_status"], JOB_TRANSITIONS, "Job")
+                err = validate_state_transition(row["job_status"], data["job_status"], JOB_TRANSITIONS, "Job")
                 if err: raise HTTPException(422, err)
             sets = []; vals = []
             for k in ["job_title","job_status","start_date_planned"]:
@@ -877,7 +877,7 @@ async def update_lead(lead_id: int, data: dict):
                 cur.execute("SELECT status FROM leads WHERE id=%s",(lead_id,))
                 row = cur.fetchone()
                 if not row: raise HTTPException(404,"Lead not found")
-                err = validate_transition(row["status"], data["status"], LEAD_TRANSITIONS, "Lead")
+                err = validate_state_transition(row["status"], data["status"], LEAD_TRANSITIONS, "Lead")
                 if err: raise HTTPException(422, err)
             sets = []; vals = []
             for k in ["status","lead_source","contact_name","contact_email","contact_phone","description","notes"]:
@@ -1339,7 +1339,7 @@ async def update_invoice(invoice_id: int, data: dict):
                 cur.execute("SELECT status FROM invoices WHERE id=%s",(invoice_id,))
                 row = cur.fetchone()
                 if not row: raise HTTPException(404,"Invoice not found")
-                err = validate_transition(row["status"], data["status"], INVOICE_TRANSITIONS, "Invoice")
+                err = validate_state_transition(row["status"], data["status"], INVOICE_TRANSITIONS, "Invoice")
                 if err: raise HTTPException(422, err)
             fields = []
             vals = []
@@ -1471,7 +1471,7 @@ INVOICE_TRANSITIONS = {
 INVOICE_TRANSITIONS["částečně_uhrazená"] = INVOICE_TRANSITIONS["castecne_uhrazena"]
 INVOICE_TRANSITIONS["odeslaná"] = INVOICE_TRANSITIONS["odeslana"]
 
-def validate_transition(current_status, new_status, rules, entity_name="entity"):
+def validate_state_transition(current_status, new_status, rules, entity_name="entity"):
     """Validate state transition. Returns None if OK, error string if invalid."""
     if current_status == new_status: return None
     allowed = rules.get(current_status)
