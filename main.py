@@ -1174,6 +1174,72 @@ async def update_client_rate(client_id: int, data: dict, request: Request):
     except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
+
+# === TENANT DEFAULT RATES ===
+@app.get("/tenant/default-rates/{tenant_id}")
+async def get_default_rates(tenant_id: int, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT rate_type, rate, currency, description FROM tenant_default_rates WHERE tenant_id=%s ORDER BY id", (tid,))
+            rows = cur.fetchall()
+            return {r["rate_type"]: {"rate": float(r["rate"]), "currency": r["currency"], "description": r["description"]} for r in rows}
+    finally: release_conn(conn)
+
+@app.put("/tenant/default-rates/{tenant_id}")
+async def update_default_rates(tenant_id: int, data: dict, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            for rate_type, value in data.items():
+                rate_val = value if isinstance(value, (int, float)) else value.get("rate", 0)
+                cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, updated_at)
+                    VALUES (%s, %s, %s, now()) ON CONFLICT (tenant_id, rate_type)
+                    DO UPDATE SET rate=%s, updated_at=now()""", (tid, rate_type, rate_val, rate_val))
+            log_activity(conn, "tenant", tid, "update_rates", f"Updated {len(data)} default rates")
+            conn.commit()
+            cur.execute("SELECT rate_type, rate, currency FROM tenant_default_rates WHERE tenant_id=%s", (tid,))
+            return {r["rate_type"]: float(r["rate"]) for r in cur.fetchall()}
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+def get_effective_rate(conn, tid, user_id=None, client_id=None, rate_type="hourly_rate"):
+    """Get rate with fallback: user > client > tenant default."""
+    with conn.cursor() as cur:
+        if user_id:
+            cur.execute(f"SELECT {rate_type} FROM users WHERE id=%s AND tenant_id=%s", (user_id, tid))
+            r = cur.fetchone()
+            if r and float(r[rate_type] or 0) > 0: return float(r[rate_type])
+        if client_id and rate_type == "hourly_rate":
+            cur.execute("SELECT default_hourly_rate FROM clients WHERE id=%s AND tenant_id=%s", (client_id, tid))
+            r = cur.fetchone()
+            if r and float(r["default_hourly_rate"] or 0) > 0: return float(r["default_hourly_rate"])
+        cur.execute("SELECT rate FROM tenant_default_rates WHERE tenant_id=%s AND rate_type=%s", (tid, rate_type))
+        r = cur.fetchone()
+        return float(r["rate"]) if r else 0
+
+# === BATCH INVOICE FROM WORK REPORTS ===
+@app.post("/crm/invoices/batch-from-work-reports")
+async def batch_invoice_from_work_reports(data: dict, request: Request):
+    """Create invoices from multiple work reports. Returns list of created invoices."""
+    tid = get_request_tenant_id(request)
+    wr_ids = data.get("work_report_ids", [])
+    if not wr_ids: raise HTTPException(400, "work_report_ids required")
+    results = []
+    errors = []
+    for wr_id in wr_ids:
+        try:
+            from starlette.requests import Request as SR
+            inv = await create_invoice_from_work_report({"work_report_id": wr_id, "due_date": data.get("due_date")}, request)
+            results.append(inv)
+        except HTTPException as e:
+            errors.append({"work_report_id": wr_id, "error": e.detail})
+        except Exception as e:
+            errors.append({"work_report_id": wr_id, "error": str(e)})
+    return {"created": results, "errors": errors, "total_created": len(results), "total_errors": len(errors)}
+
 @app.get("/crm/communications")
 async def get_communications(request: Request, client_id: Optional[int]=None, job_id: Optional[int]=None):
     tid = get_request_tenant_id(request)
