@@ -17,9 +17,10 @@ app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
 # === JWT CONFIG ===
 JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
-    import secrets
-    JWT_SECRET = secrets.token_hex(32)
-    print("WARNING: JWT_SECRET not set in environment. Using random secret (tokens will invalidate on restart).")
+    print("FATAL: JWT_SECRET is not set. Refusing to start.")
+    print("Set JWT_SECRET environment variable in Railway dashboard or .env file.")
+    import sys; sys.exit(1)
+print("JWT auth initialized — using environment secret")
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
