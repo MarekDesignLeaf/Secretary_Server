@@ -1060,7 +1060,120 @@ async def create_invoice(data: dict):
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
-# ========== REST API: COMMUNICATIONS ==========
+@app.post("/crm/invoices/from-work-report")
+async def create_invoice_from_work_report(data: dict, request: Request):
+    """Create an invoice from a work report. Calculates profit using worker costs."""
+    tid = get_request_tenant_id(request)
+    wr_id = data.get("work_report_id")
+    if not wr_id: raise HTTPException(400, "work_report_id required")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Get work report
+            cur.execute("SELECT * FROM work_reports WHERE id=%s AND tenant_id=%s", (wr_id, tid))
+            wr = cur.fetchone()
+            if not wr: raise HTTPException(404, "Work report not found")
+            # Check not already invoiced
+            cur.execute("SELECT id FROM invoices WHERE work_report_id=%s AND tenant_id=%s", (wr_id, tid))
+            if cur.fetchone(): raise HTTPException(409, "Work report already invoiced")
+            # Get entries
+            cur.execute("SELECT * FROM work_report_entries WHERE work_report_id=%s", (wr_id,))
+            entries = cur.fetchall()
+            # Get workers with costs
+            cur.execute("SELECT w.*, u.hourly_cost FROM work_report_workers w LEFT JOIN users u ON LOWER(u.display_name)=LOWER(w.worker_name) AND u.tenant_id=%s WHERE w.work_report_id=%s", (tid, wr_id))
+            workers = cur.fetchall()
+            # Get client default rate
+            cur.execute("SELECT default_hourly_rate FROM clients WHERE id=%s AND tenant_id=%s", (wr["client_id"], tid))
+            cl = cur.fetchone()
+            client_rate = float(cl["default_hourly_rate"] or 0) if cl else 0
+            # Create invoice
+            code = f"INV-{uuid.uuid4().hex[:6].upper()}"
+            due_date = data.get("due_date")
+            if not due_date:
+                import datetime as dt
+                due_date = (dt.date.today() + dt.timedelta(days=30)).isoformat()
+            grand_total = float(wr["total_price"] or 0)
+            cur.execute("""INSERT INTO invoices (invoice_number,client_id,grand_total,status,due_date,work_report_id,tenant_id,job_id,created_by,notes)
+                VALUES (%s,%s,%s,'draft',%s,%s,%s,%s,%s,%s) RETURNING id,invoice_number""",
+                (code, wr["client_id"], grand_total, due_date, wr_id, tid, wr.get("job_id"), wr.get("created_by"),
+                 f"Generated from work report #{wr_id} on {wr['work_date']}"))
+            inv = dict(cur.fetchone())
+            # Create invoice items from entries
+            total_cost = 0
+            for i, e in enumerate(entries):
+                hrs = float(e.get("hours",0) or 0)
+                rate = float(e.get("unit_rate",0) or 0)
+                if rate == 0 and client_rate > 0: rate = client_rate
+                item_total = float(e.get("total_price",0) or hrs * rate)
+                cur.execute("""INSERT INTO invoice_items (invoice_id,description,quantity,unit_price,total,sort_order,tenant_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (inv["id"], f"{e.get('type','work')} — {hrs}h", hrs, rate, item_total, i+1, tid))
+            # Calculate profit from workers
+            for w in workers:
+                cost_per_h = float(w.get("hourly_cost",0) or 0)
+                hrs = float(w.get("hours",0) or 0)
+                total_cost += cost_per_h * hrs
+            profit = grand_total - total_cost
+            inv["grand_total"] = grand_total
+            inv["total_cost"] = total_cost
+            inv["profit"] = profit
+            inv["profit_margin"] = round((profit / grand_total * 100), 1) if grand_total > 0 else 0
+            inv["status"] = "draft"
+            inv["work_report_id"] = wr_id
+            log_activity(conn, "invoice", inv["id"], "create", f"Faktura {code} z výkazu #{wr_id}, zisk {profit:.0f} GBP ({inv['profit_margin']}%)")
+            conn.commit()
+        return inv
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+# === USER RATES ===
+@app.get("/crm/users/{user_id}/rates")
+async def get_user_rates(user_id: int, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,display_name,hourly_rate,hourly_cost FROM users WHERE id=%s AND tenant_id=%s", (user_id, tid))
+            u = cur.fetchone()
+            if not u: raise HTTPException(404, "User not found")
+            return dict(u)
+    finally: release_conn(conn)
+
+@app.put("/crm/users/{user_id}/rates")
+async def update_user_rates(user_id: int, data: dict, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET hourly_rate=%s, hourly_cost=%s, updated_at=now() WHERE id=%s AND tenant_id=%s RETURNING id,display_name,hourly_rate,hourly_cost",
+                (data.get("hourly_rate",0), data.get("hourly_cost",0), user_id, tid))
+            u = cur.fetchone()
+            if not u: raise HTTPException(404, "User not found")
+            log_activity(conn, "user", user_id, "update_rates", f"Rate: {u['hourly_rate']}, Cost: {u['hourly_cost']}")
+            conn.commit()
+        return dict(u)
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+# === CLIENT RATE ===
+@app.put("/crm/clients/{client_id}/rate")
+async def update_client_rate(client_id: int, data: dict, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE clients SET default_hourly_rate=%s, updated_at=now() WHERE id=%s AND tenant_id=%s RETURNING id,display_name,default_hourly_rate",
+                (data.get("default_hourly_rate",0), client_id, tid))
+            c = cur.fetchone()
+            if not c: raise HTTPException(404, "Client not found")
+            log_activity(conn, "client", client_id, "update_rate", f"Default rate: {c['default_hourly_rate']} GBP/h")
+            conn.commit()
+        return dict(c)
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
 @app.get("/crm/communications")
 async def get_communications(request: Request, client_id: Optional[int]=None, job_id: Optional[int]=None):
     tid = get_request_tenant_id(request)
