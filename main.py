@@ -1020,7 +1020,7 @@ async def get_photos(entity_type: Optional[str]=None, entity_id: Optional[str]=N
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT id,entity_type,entity_id,filename,description,created_by,created_at::text FROM photos WHERE 1=1"
+            sql = "SELECT id,entity_type,entity_id,filename,description,thumbnail_base64,created_by,created_at::text FROM photos WHERE 1=1"
             params = []
             if entity_type: sql += " AND entity_type=%s"; params.append(entity_type)
             if entity_id: sql += " AND entity_id=%s"; params.append(entity_id)
@@ -1033,10 +1033,10 @@ async def add_photo(data: dict):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO photos (entity_type,entity_id,filename,description,file_path,created_by)
-                VALUES (%s,%s,%s,%s,%s,%s) RETURNING id,filename,created_at::text""",
+            cur.execute("""INSERT INTO photos (entity_type,entity_id,filename,description,file_path,thumbnail_base64,created_by,tenant_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,1) RETURNING id,filename,created_at::text""",
                 (data.get("entity_type","job"),data.get("entity_id","0"),data.get("filename","photo.jpg"),
-                 data.get("description"),data.get("file_path"),data.get("created_by","Marek")))
+                 data.get("description"),data.get("file_path"),data.get("thumbnail_base64"),data.get("created_by","Marek")))
             photo = dict(cur.fetchone())
             log_activity(conn,data.get("entity_type","job"),str(data.get("entity_id","0")),"photo",f"Foto: {data.get('filename','')}")
             conn.commit()
@@ -1383,6 +1383,132 @@ async def add_job_note(job_id: int, data: dict):
                 (job_id, data.get("note",""), data.get("created_by","system")))
             nid = cur.fetchone()['id']; conn.commit()
         return {"id":nid,"status":"created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+# ========== INVOICE ITEMS ==========
+@app.get("/crm/invoices/{invoice_id}/items")
+async def get_invoice_items(invoice_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM invoice_items WHERE invoice_id=%s ORDER BY sort_order,id",(invoice_id,))
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.post("/crm/invoices/{invoice_id}/items")
+async def add_invoice_item(invoice_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        qty = float(data.get("quantity",1))
+        price = float(data.get("unit_price",0))
+        total = qty * price
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO invoice_items (tenant_id,invoice_id,description,quantity,unit_price,total,sort_order)
+                VALUES (1,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (invoice_id, data.get("description","Item"), qty, price, total, data.get("sort_order",0)))
+            iid = cur.fetchone()["id"]
+            # Recalculate invoice grand_total
+            cur.execute("SELECT COALESCE(SUM(total),0) as s FROM invoice_items WHERE invoice_id=%s",(invoice_id,))
+            new_total = cur.fetchone()["s"]
+            cur.execute("UPDATE invoices SET grand_total=%s,updated_at=now() WHERE id=%s",(new_total,invoice_id))
+            log_activity(conn,"invoice",str(invoice_id),"item_added",f"Item: {data.get('description','')} £{total:.2f}")
+            conn.commit()
+        return {"id":iid,"total":float(total),"invoice_grand_total":float(new_total)}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.delete("/crm/invoices/{invoice_id}/items/{item_id}")
+async def delete_invoice_item(invoice_id: int, item_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM invoice_items WHERE id=%s AND invoice_id=%s",(item_id,invoice_id))
+            cur.execute("SELECT COALESCE(SUM(total),0) as s FROM invoice_items WHERE invoice_id=%s",(invoice_id,))
+            new_total = cur.fetchone()["s"]
+            cur.execute("UPDATE invoices SET grand_total=%s,updated_at=now() WHERE id=%s",(new_total,invoice_id))
+            log_activity(conn,"invoice",str(invoice_id),"item_deleted",f"Item {item_id} removed")
+            conn.commit()
+        return {"status":"deleted","invoice_grand_total":float(new_total)}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+# ========== PAYMENTS ==========
+@app.get("/crm/invoices/{invoice_id}/payments")
+async def get_payments(invoice_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM payments WHERE invoice_id=%s ORDER BY payment_date DESC",(invoice_id,))
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.post("/crm/invoices/{invoice_id}/payments")
+async def add_payment(invoice_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        amount = float(data.get("amount",0))
+        if amount <= 0: raise HTTPException(400,"Amount must be > 0")
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO payments (tenant_id,invoice_id,amount,payment_date,payment_method,reference,notes,created_by)
+                VALUES (1,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (invoice_id, amount, data.get("payment_date",datetime.now().strftime("%Y-%m-%d")),
+                 data.get("payment_method","bank_transfer"), data.get("reference"), data.get("notes"), data.get("created_by")))
+            pid = cur.fetchone()["id"]
+            # Check total paid vs grand_total
+            cur.execute("SELECT COALESCE(SUM(amount),0) as paid FROM payments WHERE invoice_id=%s",(invoice_id,))
+            total_paid = cur.fetchone()["paid"]
+            cur.execute("SELECT grand_total,status FROM invoices WHERE id=%s",(invoice_id,))
+            inv = cur.fetchone()
+            if inv:
+                gt = float(inv["grand_total"] or 0)
+                if float(total_paid) >= gt and gt > 0:
+                    cur.execute("UPDATE invoices SET status='uhrazena',updated_at=now() WHERE id=%s",(invoice_id,))
+                elif float(total_paid) > 0:
+                    cur.execute("UPDATE invoices SET status='castecne_uhrazena',updated_at=now() WHERE id=%s",(invoice_id,))
+            log_activity(conn,"invoice",str(invoice_id),"payment",f"Payment £{amount:.2f} ({data.get('payment_method','bank_transfer')})")
+            conn.commit()
+        return {"id":pid,"amount":amount,"total_paid":float(total_paid)}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+# ========== NOTIFICATIONS ==========
+@app.get("/crm/notifications")
+async def get_notifications(user_id: Optional[int]=None, unread_only: bool=False):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = "SELECT * FROM notifications WHERE tenant_id=1"
+            params = []
+            if user_id: sql += " AND user_id=%s"; params.append(user_id)
+            if unread_only: sql += " AND is_read=false"
+            sql += " ORDER BY created_at DESC LIMIT 50"
+            cur.execute(sql, params); return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.post("/crm/notifications")
+async def create_notification(data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO notifications (tenant_id,user_id,title,body,notification_type,entity_type,entity_id)
+                VALUES (1,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (data.get("user_id"), data.get("title","Notifikace"), data.get("body"),
+                 data.get("notification_type","info"), data.get("entity_type"), data.get("entity_id")))
+            nid = cur.fetchone()["id"]; conn.commit()
+        return {"id":nid,"status":"created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
+@app.put("/crm/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: int):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE notifications SET is_read=true,read_at=now() WHERE id=%s",(notification_id,))
+            conn.commit()
+        return {"status":"read"}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
