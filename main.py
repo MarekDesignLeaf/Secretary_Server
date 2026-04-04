@@ -416,7 +416,8 @@ RULES:
 - For contacts: search_contacts, call_contact.
 - When user asks 'what do I have to do' or 'my tasks', use list_tasks.
 - When user says 'done' or 'completed' for a task, use complete_task.
-- When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report."""
+- When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report.
+- When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather."""
 
         tools = [
             {"type":"function","function":{"name":"add_calendar_event","description":"Prida schuzku do kalendare","parameters":{"type":"object","properties":{"title":{"type":"string"},"start_time":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"duration":{"type":"integer","description":"minuty"}},"required":["title","start_time"]}}},
@@ -436,6 +437,7 @@ RULES:
             {"type":"function","function":{"name":"list_tasks","description":"Vypise ukoly podle filtru","parameters":{"type":"object","properties":{"status":{"type":"string"},"client_name":{"type":"string"},"only_active":{"type":"boolean"}}}}},
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
             {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
+            {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: Didcot, Oxfordshire"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
         ]
 
         messages = [{"role":"system","content":system_prompt}]
@@ -539,6 +541,72 @@ RULES:
                 lang = lang_map.get(msg.internal_language,"en")
                 return {"reply_cs":"Spouštím work report dialog." if lang=="cs" else "Starting work report." if lang=="en" else "Uruchamiam raport pracy.",
                         "action_type":"START_WORK_REPORT","action_data":{}}
+
+            if action == "GET_WEATHER":
+                try:
+                    import urllib.request, urllib.parse
+                    loc = args.get("location","Didcot")
+                    days = min(args.get("days",3), 7)
+                    # Geocode location
+                    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(loc)}&count=1&language=en"
+                    with urllib.request.urlopen(geo_url, timeout=5) as r:
+                        geo = json.loads(r.read())
+                    if not geo.get("results"):
+                        return {"reply_cs": f"Lokalitu '{loc}' jsem nenašel. Zkus jiný název města."}
+                    place = geo["results"][0]
+                    lat, lon, name = place["latitude"], place["longitude"], place.get("name", loc)
+                    # Fetch weather
+                    wx_url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+                        f"&hourly=temperature_2m,precipitation_probability,weathercode,windspeed_10m"
+                        f"&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,windspeed_10m_max"
+                        f"&timezone=Europe/London&forecast_days={days}")
+                    with urllib.request.urlopen(wx_url, timeout=8) as r:
+                        wx = json.loads(r.read())
+                    # Format daily summary
+                    wmo = {0:"☀️ Jasno",1:"🌤 Polojasno",2:"⛅ Oblačno",3:"☁️ Zataženo",45:"🌫 Mlha",48:"🌫 Námraza",
+                           51:"🌧 Mrholení",53:"🌧 Mrholení",55:"🌧 Mrholení",56:"🌧 Mrz. mrholení",57:"🌧 Mrz. mrholení",
+                           61:"🌧 Déšť",63:"🌧 Střed. déšť",65:"🌧 Silný déšť",66:"🌧 Mrz. déšť",67:"🌧 Mrz. déšť",
+                           71:"🌨 Sněžení",73:"🌨 Sněžení",75:"🌨 Silný sníh",77:"🌨 Krupky",
+                           80:"🌦 Přeháňky",81:"🌦 Přeháňky",82:"🌦 Silné přeháňky",
+                           85:"🌨 Sněh. přeháňky",86:"🌨 Sněh. přeháňky",
+                           95:"⛈ Bouřka",96:"⛈ Bouřka s kroupami",99:"⛈ Silná bouřka"}
+                    daily = wx.get("daily",{})
+                    lines = [f"📍 Počasí — {name} ({days} dní):"]
+                    for i, d in enumerate(daily.get("time",[])):
+                        code = daily["weathercode"][i] if daily.get("weathercode") else 0
+                        tmax = daily.get("temperature_2m_max",[None])[i]
+                        tmin = daily.get("temperature_2m_min",[None])[i]
+                        rain = daily.get("precipitation_sum",[None])[i]
+                        rain_prob = daily.get("precipitation_probability_max",[None])[i]
+                        wind = daily.get("windspeed_10m_max",[None])[i]
+                        desc = wmo.get(code, f"Kód {code}")
+                        line = f"\n{d}: {desc}, {tmin:.0f}–{tmax:.0f}°C"
+                        if rain and rain > 0: line += f", déšť {rain:.1f}mm"
+                        if rain_prob: line += f" ({rain_prob}%)"
+                        if wind: line += f", vítr {wind:.0f} km/h"
+                        lines.append(line)
+                    # Add hourly for today
+                    hourly = wx.get("hourly",{})
+                    h_times = hourly.get("time",[])
+                    h_temps = hourly.get("temperature_2m",[])
+                    h_rain = hourly.get("precipitation_probability",[])
+                    h_codes = hourly.get("weathercode",[])
+                    if h_times:
+                        lines.append("\n⏰ Hodinová předpověď dnes:")
+                        today_str = daily.get("time",[""])[0]
+                        for j, ht in enumerate(h_times[:24]):
+                            if today_str in ht:
+                                hour = ht.split("T")[1][:5]
+                                if hour in ["06:00","09:00","12:00","15:00","18:00","21:00"]:
+                                    t = h_temps[j] if j < len(h_temps) else "?"
+                                    rp = h_rain[j] if j < len(h_rain) else 0
+                                    cd = h_codes[j] if j < len(h_codes) else 0
+                                    emoji = wmo.get(cd,"")[:2]
+                                    lines.append(f"  {hour} {emoji} {t:.0f}°C, déšť {rp}%")
+                    reply = "\n".join(lines)
+                    return {"reply_cs": reply}
+                except Exception as e:
+                    return {"reply_cs": f"Nepodařilo se načíst počasí: {e}"}
 
             if action == "ADD_NOTE":
                 etype = args.get("entity_type","client")
