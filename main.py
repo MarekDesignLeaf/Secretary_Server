@@ -15,7 +15,11 @@ import jwt as pyjwt
 app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
 
 # === JWT CONFIG ===
-JWT_SECRET = os.getenv("JWT_SECRET", "secretary-designleaf-jwt-secret-change-in-production")
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    import secrets
+    JWT_SECRET = secrets.token_hex(32)
+    print("WARNING: JWT_SECRET not set in environment. Using random secret (tokens will invalidate on restart).")
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
@@ -49,6 +53,11 @@ async def auth_middleware(request: Request, call_next):
     except pyjwt.InvalidTokenError:
         return JSONResponse(status_code=401, content={"detail": "Invalid token"})
     return await call_next(request)
+
+def get_request_tenant_id(request: Request) -> int:
+    """Extract tenant_id from authenticated request. Falls back to 1."""
+    try: return request.state.user.get("tenant_id", 1)
+    except: return 1
 
 # === AUTO-CREATE TABLES ===
 EXTRA_TABLES_SQL = """
@@ -630,11 +639,12 @@ RULES:
 
 # ========== REST API: CLIENTS ==========
 @app.get("/crm/clients")
-async def get_clients():
+async def get_clients(request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM clients WHERE deleted_at IS NULL ORDER BY display_name")
+            cur.execute("SELECT * FROM clients WHERE deleted_at IS NULL AND tenant_id=%s ORDER BY display_name",(tid,))
             return cur.fetchall()
     finally: release_conn(conn)
 
@@ -744,12 +754,13 @@ async def add_client_note(client_id: int, data: dict):
 
 # ========== REST API: JOBS ==========
 @app.get("/crm/jobs")
-async def get_jobs(client_id: Optional[int] = None, status: Optional[str] = None):
+async def get_jobs(request: Request, client_id: Optional[int] = None, status: Optional[str] = None):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT j.id,j.job_number,j.job_title,j.job_status,j.client_id,j.property_id,j.quote_id,j.start_date_planned::text,j.created_at::text,j.updated_at::text,c.display_name as client_name FROM jobs j LEFT JOIN clients c ON j.client_id=c.id WHERE j.deleted_at IS NULL"
-            params = []
+            sql = "SELECT j.id,j.job_number,j.job_title,j.job_status,j.client_id,j.property_id,j.quote_id,j.start_date_planned::text,j.created_at::text,j.updated_at::text,c.display_name as client_name FROM jobs j LEFT JOIN clients c ON j.client_id=c.id WHERE j.deleted_at IS NULL AND j.tenant_id=%s"
+            params = [tid]
             if client_id: sql += " AND j.client_id=%s"; params.append(client_id)
             if status: sql += " AND j.job_status=%s"; params.append(status)
             sql += " ORDER BY j.created_at DESC"
@@ -813,11 +824,12 @@ async def update_job(job_id: int, data: dict):
 
 # ========== REST API: TASKS ==========
 @app.get("/crm/tasks")
-async def get_tasks(status: Optional[str]=None, client_id: Optional[int]=None, job_id: Optional[int]=None, completed: Optional[bool]=None):
+async def get_tasks(request: Request, status: Optional[str]=None, client_id: Optional[int]=None, job_id: Optional[int]=None, completed: Optional[bool]=None):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT * FROM tasks WHERE 1=1"; params = []
+            sql = "SELECT * FROM tasks WHERE tenant_id=%s"; params = [tid]
             if status: sql += " AND status=%s"; params.append(status)
             if client_id: sql += " AND client_id=%s"; params.append(client_id)
             if job_id: sql += " AND job_id=%s"; params.append(job_id)
@@ -881,11 +893,12 @@ async def delete_task(task_id: str):
 
 # ========== REST API: LEADS ==========
 @app.get("/crm/leads")
-async def get_leads():
+async def get_leads(request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,lead_code,lead_source,contact_name,contact_email,contact_phone,description,notes,status,client_id,job_id,received_at::text,updated_at::text FROM leads ORDER BY received_at DESC")
+            cur.execute("SELECT id,lead_code,lead_source,contact_name,contact_email,contact_phone,description,notes,status,client_id,job_id,received_at::text,updated_at::text FROM leads WHERE tenant_id=%s ORDER BY received_at DESC",(tid,))
             return cur.fetchall()
     finally: release_conn(conn)
 
@@ -991,11 +1004,12 @@ async def convert_lead_to_job(lead_id: int, data: dict):
 
 # ========== REST API: INVOICES ==========
 @app.get("/crm/invoices")
-async def get_invoices():
+async def get_invoices(request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT i.id,i.invoice_number,i.client_id,c.display_name as client_name,i.grand_total,i.status,i.due_date::text,i.created_at::text FROM invoices i LEFT JOIN clients c ON i.client_id=c.id ORDER BY i.created_at DESC")
+            cur.execute("SELECT i.id,i.invoice_number,i.client_id,c.display_name as client_name,i.grand_total,i.status,i.due_date::text,i.created_at::text FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.tenant_id=%s ORDER BY i.created_at DESC",(tid,))
             return cur.fetchall()
     finally: release_conn(conn)
 
@@ -1016,12 +1030,13 @@ async def create_invoice(data: dict):
 
 # ========== REST API: COMMUNICATIONS ==========
 @app.get("/crm/communications")
-async def get_communications(client_id: Optional[int]=None, job_id: Optional[int]=None):
+async def get_communications(request: Request, client_id: Optional[int]=None, job_id: Optional[int]=None):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes,created_at::text FROM communications WHERE 1=1"
-            params = []
+            sql = "SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes,created_at::text FROM communications WHERE tenant_id=%s"
+            params = [tid]
             if client_id: sql += " AND client_id=%s"; params.append(client_id)
             if job_id: sql += " AND job_id=%s"; params.append(job_id)
             sql += " ORDER BY created_at DESC LIMIT 50"
@@ -1048,12 +1063,13 @@ async def log_communication(data: dict):
 
 # ========== REST API: PHOTOS ==========
 @app.get("/crm/photos")
-async def get_photos(entity_type: Optional[str]=None, entity_id: Optional[str]=None):
+async def get_photos(request: Request, entity_type: Optional[str]=None, entity_id: Optional[str]=None):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT id,entity_type,entity_id,filename,description,thumbnail_base64,created_by,created_at::text FROM photos WHERE 1=1"
-            params = []
+            sql = "SELECT id,entity_type,entity_id,filename,description,thumbnail_base64,created_by,created_at::text FROM photos WHERE tenant_id=%s"
+            params = [tid]
             if entity_type: sql += " AND entity_type=%s"; params.append(entity_type)
             if entity_id: sql += " AND entity_id=%s"; params.append(entity_id)
             sql += " ORDER BY created_at DESC"
@@ -1413,7 +1429,8 @@ async def get_invoice_items(invoice_id: int):
     finally: release_conn(conn)
 
 @app.post("/crm/invoices/{invoice_id}/items")
-async def add_invoice_item(invoice_id: int, data: dict):
+async def add_invoice_item(invoice_id: int, data: dict, request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         qty = float(data.get("quantity",1))
@@ -1421,8 +1438,8 @@ async def add_invoice_item(invoice_id: int, data: dict):
         total = qty * price
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO invoice_items (tenant_id,invoice_id,description,quantity,unit_price,total,sort_order)
-                VALUES (1,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (invoice_id, data.get("description","Item"), qty, price, total, data.get("sort_order",0)))
+                VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (tid, invoice_id, data.get("description","Item"), qty, price, total, data.get("sort_order",0)))
             iid = cur.fetchone()["id"]
             # Recalculate invoice grand_total
             cur.execute("SELECT COALESCE(SUM(total),0) as s FROM invoice_items WHERE invoice_id=%s",(invoice_id,))
@@ -1460,15 +1477,16 @@ async def get_payments(invoice_id: int):
     finally: release_conn(conn)
 
 @app.post("/crm/invoices/{invoice_id}/payments")
-async def add_payment(invoice_id: int, data: dict):
+async def add_payment(invoice_id: int, data: dict, request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         amount = float(data.get("amount",0))
         if amount <= 0: raise HTTPException(400,"Amount must be > 0")
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO payments (tenant_id,invoice_id,amount,payment_date,payment_method,reference,notes,created_by)
-                VALUES (1,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (invoice_id, amount, data.get("payment_date",datetime.now().strftime("%Y-%m-%d")),
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (tid, invoice_id, amount, data.get("payment_date",datetime.now().strftime("%Y-%m-%d")),
                  data.get("payment_method","bank_transfer"), data.get("reference"), data.get("notes"), data.get("created_by")))
             pid = cur.fetchone()["id"]
             # Check total paid vs grand_total
@@ -1491,12 +1509,13 @@ async def add_payment(invoice_id: int, data: dict):
 
 # ========== NOTIFICATIONS ==========
 @app.get("/crm/notifications")
-async def get_notifications(user_id: Optional[int]=None, unread_only: bool=False):
+async def get_notifications(request: Request, user_id: Optional[int]=None, unread_only: bool=False):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT * FROM notifications WHERE tenant_id=1"
-            params = []
+            sql = "SELECT * FROM notifications WHERE tenant_id=%s"
+            params = [tid]
             if user_id: sql += " AND user_id=%s"; params.append(user_id)
             if unread_only: sql += " AND is_read=false"
             sql += " ORDER BY created_at DESC LIMIT 50"
