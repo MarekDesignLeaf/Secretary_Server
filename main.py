@@ -1407,12 +1407,13 @@ async def update_invoice(invoice_id: int, data: dict):
 
 # ========== JOB NOTES ==========
 @app.post("/crm/jobs/{job_id}/notes")
-async def add_job_note(job_id: int, data: dict):
+async def add_job_note(job_id: int, data: dict, request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO job_notes (job_id,note,created_by,tenant_id) VALUES (%s,%s,%s,1) RETURNING id",
-                (job_id, data.get("note",""), data.get("created_by","system")))
+            cur.execute("INSERT INTO job_notes (job_id,note,created_by,tenant_id) VALUES (%s,%s,%s,%s) RETURNING id",
+                (job_id, data.get("note",""), data.get("created_by","system"), tid))
             nid = cur.fetchone()['id']; conn.commit()
         return {"id":nid,"status":"created"}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
@@ -1523,13 +1524,14 @@ async def get_notifications(request: Request, user_id: Optional[int]=None, unrea
     finally: release_conn(conn)
 
 @app.post("/crm/notifications")
-async def create_notification(data: dict):
+async def create_notification(data: dict, request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO notifications (tenant_id,user_id,title,body,notification_type,entity_type,entity_id)
-                VALUES (1,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (data.get("user_id"), data.get("title","Notifikace"), data.get("body"),
+                VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (tid, data.get("user_id"), data.get("title","Notifikace"), data.get("body"),
                  data.get("notification_type","info"), data.get("entity_type"), data.get("entity_id")))
             nid = cur.fetchone()["id"]; conn.commit()
         return {"id":nid,"status":"created"}
