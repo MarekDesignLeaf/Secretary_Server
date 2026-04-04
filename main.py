@@ -60,6 +60,31 @@ def get_request_tenant_id(request: Request) -> int:
     try: return request.state.user.get("tenant_id", 1)
     except: return 1
 
+def check_subscription_limit(conn, tenant_id, resource_type):
+    """Check if tenant has reached subscription limit. Returns (ok, message)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM subscription_limits WHERE tenant_id=%s",(tenant_id,))
+            limits = cur.fetchone()
+            if not limits: return True, ""
+            if resource_type == "clients":
+                cur.execute("SELECT COUNT(*) as c FROM clients WHERE tenant_id=%s AND deleted_at IS NULL",(tenant_id,))
+                count = cur.fetchone()["c"]
+                max_val = limits.get("max_clients") or 999999
+                if count >= max_val: return False, f"Client limit reached: {count}/{max_val}"
+            elif resource_type == "users":
+                cur.execute("SELECT COUNT(*) as c FROM users WHERE tenant_id=%s AND deleted_at IS NULL",(tenant_id,))
+                count = cur.fetchone()["c"]
+                max_val = limits.get("max_users") or 999999
+                if count >= max_val: return False, f"User limit reached: {count}/{max_val}"
+            elif resource_type == "jobs":
+                cur.execute("SELECT COUNT(*) as c FROM jobs WHERE tenant_id=%s AND created_at >= date_trunc('month',now())",(tenant_id,))
+                count = cur.fetchone()["c"]
+                max_val = limits.get("max_jobs_per_month") or 999999
+                if count >= max_val: return False, f"Monthly job limit reached: {count}/{max_val}"
+    except: pass
+    return True, ""
+
 # === AUTO-CREATE TABLES ===
 EXTRA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -682,9 +707,12 @@ async def get_client_detail(client_id: int):
     finally: release_conn(conn)
 
 @app.post("/crm/clients")
-async def api_create_client(data: dict):
+async def api_create_client(data: dict, request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
+        ok, msg = check_subscription_limit(conn, tid, "clients")
+        if not ok: raise HTTPException(429, msg)
         code = f"CL-{uuid.uuid4().hex[:6].upper()}"
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO clients (client_code,client_type,title,first_name,last_name,display_name,
@@ -692,7 +720,7 @@ async def api_create_client(data: dict):
                 phone_primary,phone_secondary,website,preferred_contact_method,
                 billing_address_line1,billing_city,billing_postcode,billing_country,
                 status,is_commercial,tenant_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,1) RETURNING id""",
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s) RETURNING id""",
                 (code,data.get("type",data.get("client_type","domestic")),
                  data.get("title"),data.get("first_name"),data.get("last_name"),
                  data.get("name",data.get("display_name","")),
@@ -702,7 +730,7 @@ async def api_create_client(data: dict):
                  data.get("website"),data.get("preferred_contact_method","email"),
                  data.get("billing_address_line1"),data.get("billing_city"),
                  data.get("billing_postcode"),data.get("billing_country","GB"),
-                 data.get("is_commercial",False)))
+                 data.get("is_commercial",False),tid))
             cid = cur.fetchone()['id']
             log_activity(conn,"client",cid,"create",f"Klient {data.get('name',data.get('display_name',''))} vytvoren")
             conn.commit()
@@ -784,9 +812,12 @@ async def get_job_detail(job_id: int):
     finally: release_conn(conn)
 
 @app.post("/crm/jobs")
-async def create_job(data: dict):
+async def create_job(data: dict, request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
+        ok, msg = check_subscription_limit(conn, tid, "jobs")
+        if not ok: raise HTTPException(429, msg)
         code = f"JOB-{uuid.uuid4().hex[:6].upper()}"
         with conn.cursor() as cur:
             cur.execute("INSERT INTO jobs (job_number,client_id,property_id,job_title,job_status,start_date_planned) VALUES (%s,%s,%s,%s,'nova',%s) RETURNING id",
@@ -1721,6 +1752,8 @@ async def auth_register(data: dict, admin: dict = Depends(require_role("admin"))
         raise HTTPException(400, "email, password, display_name required")
     conn = get_db_conn()
     try:
+        ok, msg = check_subscription_limit(conn, admin["tenant_id"], "users")
+        if not ok: raise HTTPException(429, msg)
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM users WHERE LOWER(email)=%s AND deleted_at IS NULL", (email,))
             if cur.fetchone(): raise HTTPException(409, "Email already registered")
