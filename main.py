@@ -3,8 +3,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
 from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException, Query, Depends, Header
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
 import uvicorn
@@ -19,6 +19,36 @@ JWT_SECRET = os.getenv("JWT_SECRET", "secretary-designleaf-jwt-secret-change-in-
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
+
+# === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
+PROTECTED_PREFIXES = ["/crm/", "/process", "/voice/", "/work-reports"]
+PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    # Skip public paths
+    if path in PUBLIC_PATHS or path.startswith("/docs") or path.startswith("/openapi"):
+        return await call_next(request)
+    # Check if path requires auth
+    needs_auth = any(path.startswith(p) for p in PROTECTED_PREFIXES)
+    if not needs_auth:
+        return await call_next(request)
+    # Verify JWT
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header:
+        return JSONResponse(status_code=401, content={"detail": "Authorization header required"})
+    token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else auth_header
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            return JSONResponse(status_code=401, content={"detail": "Not an access token"})
+        request.state.user = payload
+    except pyjwt.ExpiredSignatureError:
+        return JSONResponse(status_code=401, content={"detail": "Token expired"})
+    except pyjwt.InvalidTokenError:
+        return JSONResponse(status_code=401, content={"detail": "Invalid token"})
+    return await call_next(request)
 
 # === AUTO-CREATE TABLES ===
 EXTRA_TABLES_SQL = """
@@ -533,6 +563,8 @@ RULES:
                         row = cur.fetchone()
                         if not row: return {"reply_cs":f"Zakázka '{title_q}' nenalezena."}
                         new_status = args.get("status",row['job_status'])
+                        err = validate_state_transition(row['job_status'], new_status, JOB_TRANSITIONS, "Job")
+                        if err: return {"reply_cs":f"Neplatný přechod: {err}"}
                         cur.execute("UPDATE jobs SET job_status=%s,updated_at=now() WHERE id=%s",(new_status,row['id']))
                         log_activity(conn,"job",row['id'],"status_change",f"Zakazka '{row['job_title']}': {row['job_status']} -> {new_status}")
                         conn.commit()
@@ -1184,24 +1216,8 @@ async def repair_schema():
 
 
 
-@app.post("/debug/seed-admin")
-async def seed_admin():
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO roles (role_name,description) VALUES ('admin','Full access') ON CONFLICT (role_name) DO NOTHING")
-            cur.execute("SELECT id FROM roles WHERE role_name='admin'")
-            rid = cur.fetchone()['id']
-            cur.execute("""INSERT INTO users (tenant_id,role_id,first_name,last_name,display_name,email,phone,status,password_hash)
-                VALUES (1,%s,'Marek','Sima','Marek Sima','marek@designleaf.co.uk','+44 7XXX','active','not_set')
-                ON CONFLICT (email) DO UPDATE SET display_name='Marek Sima',role_id=%s RETURNING id,display_name,email""",(rid,rid))
-            user = dict(cur.fetchone())
-            conn.commit()
-            return {"status":"ok","user":user}
-    except Exception as e:
-        conn.rollback()
-        return {"status":"error","message":str(e)}
-    finally: release_conn(conn)
+# /debug/seed-admin REMOVED — security risk (was public, no auth)
+
 @app.get("/debug/test-voice")
 async def test_voice():
     """Test voice session input to see actual error"""
