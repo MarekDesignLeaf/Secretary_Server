@@ -1616,8 +1616,9 @@ async def create_quote(data: dict):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(MAX(CAST(SUBSTRING(quote_number FROM 5) AS INT)),0)+1 FROM quotes")
-            num = cur.fetchone()[0]; qn = f"QTE-{num:06d}"
+            cur.execute("SELECT COALESCE(MAX(CAST(SUBSTRING(quote_number FROM 5) AS INT)),0)+1 as next_num FROM quotes")
+            num = cur.fetchone()['next_num']
+            qn = f"QTE-{num:06d}"
             cur.execute("INSERT INTO quotes (quote_number,client_id,quote_title,status,grand_total) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                 (qn,data["client_id"],data.get("quote_title","Nabidka"),data.get("status","draft"),data.get("grand_total",0)))
             qid = cur.fetchone()['id']; conn.commit()
