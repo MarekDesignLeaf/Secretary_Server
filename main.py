@@ -1331,7 +1331,7 @@ async def get_communications(request: Request, client_id: Optional[int]=None, jo
         with conn.cursor() as cur:
             sql = """SELECT c.id, c.client_id, c.job_id, c.comm_type, c.subject, c.message_summary,
                      c.sent_at::text, c.direction, c.notes, c.created_at::text,
-                     cl.name as client_name, j.job_title as job_title
+                     cl.display_name as client_name, j.job_title as job_title
                      FROM communications c
                      LEFT JOIN clients cl ON c.client_id = cl.id
                      LEFT JOIN jobs j ON c.job_id = j.id
