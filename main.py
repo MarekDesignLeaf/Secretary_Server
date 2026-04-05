@@ -1324,27 +1324,35 @@ async def batch_invoice_from_work_reports(data: dict, request: Request):
     return {"created": results, "errors": errors, "total_created": len(results), "total_errors": len(errors)}
 
 @app.get("/crm/communications")
-async def get_communications(request: Request, client_id: Optional[int]=None, job_id: Optional[int]=None):
+async def get_communications(request: Request, client_id: Optional[int]=None, job_id: Optional[int]=None, comm_type: Optional[str]=None):
     tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes,created_at::text FROM communications WHERE tenant_id=%s"
+            sql = """SELECT c.id, c.client_id, c.job_id, c.comm_type, c.subject, c.message_summary,
+                     c.sent_at::text, c.direction, c.notes, c.created_at::text,
+                     cl.name as client_name, j.job_title as job_title
+                     FROM communications c
+                     LEFT JOIN clients cl ON c.client_id = cl.id
+                     LEFT JOIN jobs j ON c.job_id = j.id
+                     WHERE c.tenant_id=%s"""
             params = [tid]
-            if client_id: sql += " AND client_id=%s"; params.append(client_id)
-            if job_id: sql += " AND job_id=%s"; params.append(job_id)
-            sql += " ORDER BY created_at DESC LIMIT 50"
+            if client_id: sql += " AND c.client_id=%s"; params.append(client_id)
+            if job_id: sql += " AND c.job_id=%s"; params.append(job_id)
+            if comm_type: sql += " AND c.comm_type=%s"; params.append(comm_type)
+            sql += " ORDER BY c.created_at DESC LIMIT 100"
             cur.execute(sql, params); return cur.fetchall()
     finally: release_conn(conn)
 
 @app.post("/crm/communications")
-async def log_communication(data: dict):
+async def log_communication(request: Request, data: dict):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO communications (client_id,job_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,now()) RETURNING id,comm_type,subject,direction""",
-                (data.get("client_id"),data.get("job_id"),data.get("comm_type","telefon"),
+            cur.execute("""INSERT INTO communications (tenant_id,client_id,job_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now()) RETURNING id,comm_type,subject,direction""",
+                (tid, data.get("client_id"),data.get("job_id"),data.get("comm_type","telefon"),
                  data.get("subject"),data.get("message",data.get("message_summary","")),
                  data.get("direction","outbound"),data.get("notes")))
             comm = dict(cur.fetchone())
