@@ -216,7 +216,7 @@ db_pool = None
 def init_pool():
     global db_pool
     try:
-        db_pool = pool.ThreadedConnectionPool(2, 10, **DB_CONFIG)
+        db_pool = pool.ThreadedConnectionPool(2, 20, **DB_CONFIG)
         print(f"DB pool OK: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}")
         conn = db_pool.getconn()
         with conn.cursor() as cur:
@@ -245,8 +245,22 @@ def get_db_conn():
     return conn
 
 def release_conn(conn):
-    if db_pool: db_pool.putconn(conn)
-    else: conn.close()
+    if db_pool:
+        try: db_pool.putconn(conn)
+        except: pass
+    else:
+        try: conn.close()
+        except: pass
+
+from contextlib import contextmanager
+@contextmanager
+def db_conn():
+    """Context manager that auto-releases connection back to pool."""
+    c = get_db_conn()
+    try:
+        yield c
+    finally:
+        release_conn(c)
 
 def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1, user_id=None, details=None):
     with conn.cursor() as cur:
