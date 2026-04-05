@@ -11,6 +11,8 @@ import uvicorn
 from openai import OpenAI
 from datetime import datetime, timedelta
 import jwt as pyjwt
+import json
+import urllib.request
 
 app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
 
@@ -213,6 +215,13 @@ END $$;
 # === CONFIG ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# === WHATSAPP CONFIG ===
+WA_PHONE_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+WA_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
+WA_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "designleaf_webhook_2026")
+WA_API_URL = f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
 
 def parse_database_config():
     database_url = os.getenv("DATABASE_URL", "")
@@ -2912,6 +2921,100 @@ async def create_pricing_rule(data: dict):
         return {"id":pid,"status":"created"}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
+
+# ========== WHATSAPP CLOUD API ==========
+
+def wa_send_message(to_phone: str, message: str):
+    """Send WhatsApp message via Cloud API"""
+    if not WA_TOKEN or not WA_PHONE_ID:
+        return {"error": "WhatsApp not configured"}
+    payload = json.dumps({
+        "messaging_product": "whatsapp",
+        "to": to_phone.replace("+","").replace(" ",""),
+        "type": "text",
+        "text": {"body": message}
+    }).encode("utf-8")
+    req = urllib.request.Request(WA_API_URL, data=payload, method="POST",
+        headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        return {"error": f"WhatsApp API {e.code}", "detail": body}
+    except Exception as e:
+        return {"error": str(e)}
+
+def wa_find_client_by_phone(conn, phone: str):
+    """Find CRM client by phone number"""
+    clean = phone.replace("+","").replace(" ","").replace("-","")
+    with conn.cursor() as cur:
+        cur.execute("SELECT id,display_name,phone_primary FROM clients WHERE REPLACE(REPLACE(REPLACE(phone_primary,'+',''),' ',''),'-','') = %s LIMIT 1", (clean,))
+        return cur.fetchone()
+
+@app.get("/whatsapp/webhook")
+async def wa_verify(request: Request):
+    """Meta webhook verification"""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    if mode == "subscribe" and token == WA_VERIFY_TOKEN:
+        return int(challenge)
+    raise HTTPException(403, "Verification failed")
+
+@app.post("/whatsapp/webhook")
+async def wa_incoming(request: Request):
+    """Receive incoming WhatsApp messages"""
+    body = await request.json()
+    try:
+        for entry in body.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                for msg in value.get("messages", []):
+                    sender = msg.get("from", "")
+                    msg_type = msg.get("type", "")
+                    text = msg.get("text", {}).get("body", "") if msg_type == "text" else f"[{msg_type}]"
+                    conn = get_db_conn()
+                    try:
+                        client = wa_find_client_by_phone(conn, sender)
+                        client_id = client["id"] if client else None
+                        client_name = client["display_name"] if client else None
+                        with conn.cursor() as cur:
+                            cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                                VALUES (1,%s,'whatsapp',%s,%s,'inbound',%s,now())""",
+                                (client_id, f"WA od {client_name or '+'+sender}", text[:500], f"Phone: +{sender}"))
+                        log_activity(conn,"communication",0,"whatsapp_in",f"WhatsApp od +{sender}: {text[:100]}")
+                        conn.commit()
+                    finally: release_conn(conn)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+    return {"status": "ok"}
+
+@app.post("/whatsapp/send")
+async def wa_send(request: Request, data: dict):
+    """Send WhatsApp message to client"""
+    to = data.get("to", "")
+    message = data.get("message", "")
+    client_id = data.get("client_id")
+    if not to or not message:
+        raise HTTPException(400, "to and message required")
+    result = wa_send_message(to, message)
+    if "error" in result:
+        raise HTTPException(502, result)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
+                (client_id, message[:500], f"To: {to}"))
+        log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to}: {message[:100]}")
+        conn.commit()
+    finally: release_conn(conn)
+    return {"status": "sent", "wa_response": result}
+
+@app.get("/whatsapp/status")
+async def wa_status():
+    return {"configured": bool(WA_TOKEN and WA_PHONE_ID), "phone_id": WA_PHONE_ID[:6]+"..." if WA_PHONE_ID else None}
 
 # ========== SYSTEM ==========
 @app.get("/")
