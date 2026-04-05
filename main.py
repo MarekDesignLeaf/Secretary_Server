@@ -1018,16 +1018,17 @@ async def get_leads(request: Request):
     finally: release_conn(conn)
 
 @app.post("/crm/leads")
-async def create_lead(data: dict):
+async def create_lead(request: Request, data: dict):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         code = f"LED-{uuid.uuid4().hex[:6].upper()}"
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO leads (lead_code,lead_source,status,contact_name,contact_email,contact_phone,description)
-                VALUES (%s,%s,'new',%s,%s,%s,%s) RETURNING id,lead_code,status,received_at::text""",
-                (code,data.get("source","jiny"),data.get("name",data.get("contact_name")),
-                 data.get("email",data.get("contact_email")),data.get("phone",data.get("contact_phone")),
-                 data.get("description")))
+            cur.execute("""INSERT INTO leads (tenant_id,lead_code,lead_source,status,contact_name,contact_email,contact_phone,description,notes)
+                VALUES (%s,%s,%s,'new',%s,%s,%s,%s,%s) RETURNING id,lead_code,status,received_at::text""",
+                (tid,code,data.get("lead_source",data.get("source","jiny")),data.get("contact_name",data.get("name")),
+                 data.get("contact_email",data.get("email")),data.get("contact_phone",data.get("phone")),
+                 data.get("description"),data.get("notes")))
             lead = dict(cur.fetchone())
             log_activity(conn,"lead",lead['id'],"create",f"Lead {code} vytvoren")
             conn.commit()
@@ -1617,8 +1618,8 @@ async def create_quote(data: dict):
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(MAX(CAST(SUBSTRING(quote_number FROM 5) AS INT)),0)+1 FROM quotes")
             num = cur.fetchone()[0]; qn = f"QTE-{num:06d}"
-            cur.execute("INSERT INTO quotes (quote_number,client_id,property_id,quote_title,status,grand_total) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-                (qn,data["client_id"],data.get("property_id",0),data.get("quote_title","Nabidka"),data.get("status","draft"),data.get("grand_total",0)))
+            cur.execute("INSERT INTO quotes (quote_number,client_id,quote_title,status,grand_total) VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                (qn,data["client_id"],data.get("quote_title","Nabidka"),data.get("status","draft"),data.get("grand_total",0)))
             qid = cur.fetchone()['id']; conn.commit()
         return {"id":qid,"quote_number":qn,"status":"created"}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
