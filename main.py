@@ -667,7 +667,7 @@ RULES:
                             (client["id"], message[:500], f"To: {phone}"))
                     log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']}: {message[:100]}")
                     conn.commit()
-                    return {"reply_cs": f"✅ WhatsApp zpráva odeslána klientovi {client['display_name']} na {phone}."}
+                    return {"reply_cs": f"✅ WhatsApp zpráva odeslána klientovi {client['display_name']} na {phone}.", "action_type":"WHATSAPP_SENT","action_data":{"client_name":client["display_name"],"phone":phone}}
                 except Exception as e:
                     return {"reply_cs": f"Chyba při odesílání WhatsApp: {e}"}
                 finally: release_conn(conn)
@@ -2954,20 +2954,33 @@ async def create_pricing_rule(data: dict):
 # ========== WHATSAPP CLOUD API ==========
 
 def wa_send_message(to_phone: str, message: str):
-    """Send WhatsApp message via Cloud API"""
+    """Send WhatsApp message via Cloud API. Auto-translates to English."""
     if not WA_TOKEN or not WA_PHONE_ID:
         return {"error": "WhatsApp not configured"}
+    # Auto-translate to English using GPT
+    translated = message
+    if ai_client:
+        try:
+            tr = ai_client.chat.completions.create(model="gpt-4o-mini", messages=[
+                {"role":"system","content":"Translate the following message to English. Return ONLY the translation, nothing else. If already in English, return as-is."},
+                {"role":"user","content":message}
+            ], max_tokens=500)
+            translated = tr.choices[0].message.content.strip()
+        except: translated = message
     payload = json.dumps({
         "messaging_product": "whatsapp",
         "to": to_phone.replace("+","").replace(" ",""),
         "type": "text",
-        "text": {"body": message}
+        "text": {"body": translated}
     }).encode("utf-8")
     req = urllib.request.Request(WA_API_URL, data=payload, method="POST",
         headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode())
+            result = json.loads(resp.read().decode())
+            result["translated_text"] = translated
+            result["original_text"] = message
+            return result
     except urllib.error.HTTPError as e:
         body = e.read().decode()
         return {"error": f"WhatsApp API {e.code}", "detail": body}
@@ -3050,14 +3063,15 @@ async def wa_send(request: Request, data: dict):
         raise HTTPException(502, result)
     conn = get_db_conn()
     try:
+        translated = result.get("translated_text", message)
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
                 VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
-                (client_id, message[:500], f"To: {to}"))
-        log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to}: {message[:100]}")
+                (client_id, translated[:500], f"To: {to} | Original: {message[:200]}"))
+        log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to}: {translated[:100]}")
         conn.commit()
     finally: release_conn(conn)
-    return {"status": "sent", "wa_response": result}
+    return {"status": "sent", "translated": translated, "original": message}
 
 @app.get("/whatsapp/status")
 async def wa_status():
