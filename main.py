@@ -259,7 +259,19 @@ def init_pool():
     except Exception as e: print(f"DB pool FAIL: {e}")
 
 def get_db_conn():
-    conn = db_pool.getconn() if db_pool else psycopg2.connect(**DB_CONFIG)
+    if not db_pool: raise HTTPException(500, "DB pool not initialized")
+    try:
+        conn = db_pool.getconn()
+    except pool.PoolError:
+        # Pool exhausted — force close idle connections and retry
+        print("WARN: Pool exhausted, resetting idle connections")
+        try:
+            for key in list(db_pool._used.keys()):
+                try: db_pool.putconn(db_pool._used[key])
+                except: pass
+            conn = db_pool.getconn()
+        except:
+            raise HTTPException(503, "Database pool exhausted. Try again.")
     conn.cursor_factory = RealDictCursor
     with conn.cursor() as cur: cur.execute("SET search_path TO crm, public")
     return conn
@@ -654,12 +666,15 @@ RULES:
                         cur.execute("SELECT id,display_name,phone_primary FROM clients WHERE display_name ILIKE %s AND deleted_at IS NULL LIMIT 1", (f"%{client_name}%",))
                         client = cur.fetchone()
                     if not client:
+                        release_conn(conn)
                         return {"reply_cs": f"Klienta '{client_name}' jsem nenašel v CRM."}
                     phone = client["phone_primary"]
                     if not phone:
+                        release_conn(conn)
                         return {"reply_cs": f"Klient {client['display_name']} nemá telefonní číslo."}
                     result = wa_send_message(phone, message)
                     if "error" in result:
+                        release_conn(conn)
                         return {"reply_cs": f"WhatsApp se nepodařilo odeslat: {result.get('error','')}"}
                     with conn.cursor() as cur:
                         cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
