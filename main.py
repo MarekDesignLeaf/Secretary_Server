@@ -999,10 +999,6 @@ async def sync_contacts(data: dict):
     except Exception as e:
         conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
-            conn.commit()
-        return {"created": created, "skipped": skipped, "errors": errors, "total": len(contacts)}
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: release_conn(conn)
 
 @app.post("/crm/clients/{client_id}/notes")
 async def add_client_note(client_id: int, data: dict):
