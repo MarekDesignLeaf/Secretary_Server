@@ -256,6 +256,26 @@ def init_pool():
             db_pool.putconn(conn2)
             print("Roles seeded")
         except Exception as e: print(f"Role seed: {e}")
+        # Seed default service rates
+        try:
+            conn3 = db_pool.getconn()
+            with conn3.cursor() as cur:
+                cur.execute("SET search_path TO crm, public")
+                for rt, rate, desc in [
+                    ("garden_maintenance", 27, "Garden maintenance: cleaning, weeding, planting, grass strimming"),
+                    ("hedge_trimming", 31, "Hedge trimming & pruning"),
+                    ("arborist_works", 34, "Arboristic works, tree surgeon"),
+                    ("hourly_rate", 27, "Default hourly rate"),
+                    ("hourly_cost", 15, "Internal hourly cost"),
+                    ("garden_waste_bulkbag", 55, "Garden waste bulk bag"),
+                    ("minimum_charge", 150, "Minimum charge per job"),
+                ]:
+                    cur.execute("""INSERT INTO default_rates (tenant_id, rate_type, rate, description)
+                        VALUES (1, %s, %s, %s) ON CONFLICT (tenant_id, rate_type) DO NOTHING""", (rt, rate, desc))
+                conn3.commit()
+            db_pool.putconn(conn3)
+            print("Service rates seeded")
+        except Exception as e: print(f"Rate seed: {e}")
     except Exception as e: print(f"DB pool FAIL: {e}")
 
 def get_db_conn():
