@@ -899,6 +899,40 @@ async def archive_client(client_id: int):
         return {"status":"archived"}
     finally: release_conn(conn)
 
+@app.post("/crm/clients/sync-contacts")
+async def sync_contacts(data: dict):
+    """Sync phone contacts to CRM. Creates new clients for unknown numbers, skips existing."""
+    contacts = data.get("contacts", [])
+    if not contacts: raise HTTPException(400, "No contacts")
+    conn = get_db_conn()
+    created = 0; skipped = 0; errors = []
+    try:
+        with conn.cursor() as cur:
+            for c in contacts:
+                name = c.get("name","").strip()
+                phone = c.get("phone","").strip()
+                email = c.get("email","")
+                if not name or not phone: continue
+                clean = phone.replace("+","").replace(" ","").replace("-","")
+                cur.execute("SELECT id FROM clients WHERE REPLACE(REPLACE(REPLACE(phone_primary,'+',''),' ',''),'-','') = %s AND deleted_at IS NULL LIMIT 1", (clean,))
+                if cur.fetchone():
+                    skipped += 1; continue
+                code = f"CL-PH-{clean[-6:]}"
+                try:
+                    cur.execute("""INSERT INTO clients (client_code,client_type,display_name,phone_primary,email_primary,source,status,tenant_id)
+                        VALUES (%s,'individual',%s,%s,%s,'phone_sync','active',1) ON CONFLICT DO NOTHING RETURNING id""",
+                        (code, name, phone, email if email else None))
+                    row = cur.fetchone()
+                    if row:
+                        created += 1
+                        log_activity(conn,"client",row["id"],"sync",f"Kontakt importovan z telefonu: {name}")
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+            conn.commit()
+        return {"created": created, "skipped": skipped, "errors": errors, "total": len(contacts)}
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
 @app.post("/crm/clients/{client_id}/notes")
 async def add_client_note(client_id: int, data: dict):
     conn = get_db_conn()
