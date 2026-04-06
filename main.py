@@ -936,13 +936,23 @@ async def archive_client(client_id: int):
 
 @app.post("/crm/clients/sync-contacts")
 async def sync_contacts(data: dict):
-    """Sync phone contacts to CRM. Creates new clients for unknown numbers, skips existing."""
+    """Sync phone contacts to CRM. Filters UK numbers if requested."""
+    filter_uk = data.get("filter_uk", False)
     contacts = data.get("contacts", [])
     if not contacts: raise HTTPException(400, "No contacts provided")
+
+    def is_uk_number(phone: str) -> bool:
+        # Standard UK mobile: 07xxx, or +447xxx
+        # Standard UK landline: 01xxx, 02xxx, or +441xxx, +442xxx
+        clean = phone.replace("+", "").replace(" ", "").replace("-", "")
+        # Remove leading '44' if present and starts with 447, 441, 442
+        if clean.startswith("44"):
+            clean = "0" + clean[2:]
+        return clean.startswith(("07", "01", "02"))
+
     conn = get_db_conn()
     created = 0; skipped = 0; errors = []
     try:
-        # Zpracováváme po dávkách, abychom předešli timeoutu a selhání celé transakce
         batch_size = 50
         for i in range(0, len(contacts), batch_size):
             batch = contacts[i:i+batch_size]
@@ -955,6 +965,11 @@ async def sync_contacts(data: dict):
                             phone = c.get("phone","").strip()
                             email = c.get("email","")
                             if not name or not phone: continue
+
+                            # Apply UK filter if requested
+                            if filter_uk and not is_uk_number(phone):
+                                skipped += 1; cur.execute("RELEASE SAVEPOINT contact_sync"); continue
+
                             clean = phone.replace("+","").replace(" ","").replace("-","")
                             cur.execute("SELECT id FROM clients WHERE REPLACE(REPLACE(REPLACE(phone_primary,'+',''),' ',''),'-','') = %s AND deleted_at IS NULL LIMIT 1", (clean,))
                             if cur.fetchone():
@@ -976,7 +991,7 @@ async def sync_contacts(data: dict):
                         except Exception as e:
                             cur.execute("ROLLBACK TO SAVEPOINT contact_sync")
                             errors.append(f"{c.get('name', 'Unknown')}: {str(e)}")
-                    conn.commit() # Commit po každé dávce
+                    conn.commit()
             except Exception as e:
                 conn.rollback()
                 errors.append(f"Batch error: {str(e)}")
