@@ -452,7 +452,8 @@ RULES:
 - When user asks 'what do I have to do' or 'my tasks', use list_tasks.
 - When user says 'done' or 'completed' for a task, use complete_task.
 - When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report.
-- When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather."""
+- When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather.
+- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Find client by name, get their phone, send message."""
 
         tools = [
             {"type":"function","function":{"name":"add_calendar_event","description":"Prida schuzku do kalendare","parameters":{"type":"object","properties":{"title":{"type":"string"},"start_time":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"duration":{"type":"integer","description":"minuty"}},"required":["title","start_time"]}}},
@@ -473,6 +474,7 @@ RULES:
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
             {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
             {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: Didcot, Oxfordshire"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
+            {"type":"function","function":{"name":"send_whatsapp","description":"Posle WhatsApp zpravu klientovi. Pouzij kdyz uzivatel rekne 'napis na whatsapp', 'posli whatsapp zpravu', 'whatsapp message'.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["client_name","message"]}}},
         ]
 
         messages = [{"role":"system","content":system_prompt}]
@@ -642,6 +644,33 @@ RULES:
                     return {"reply_cs": reply}
                 except Exception as e:
                     return {"reply_cs": f"Nepodařilo se načíst počasí: {e}"}
+
+            if action == "SEND_WHATSAPP":
+                client_name = args.get("client_name","")
+                message = args.get("message","")
+                conn = get_db_conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id,display_name,phone_primary FROM clients WHERE display_name ILIKE %s AND deleted_at IS NULL LIMIT 1", (f"%{client_name}%",))
+                        client = cur.fetchone()
+                    if not client:
+                        return {"reply_cs": f"Klienta '{client_name}' jsem nenašel v CRM."}
+                    phone = client["phone_primary"]
+                    if not phone:
+                        return {"reply_cs": f"Klient {client['display_name']} nemá telefonní číslo."}
+                    result = wa_send_message(phone, message)
+                    if "error" in result:
+                        return {"reply_cs": f"WhatsApp se nepodařilo odeslat: {result.get('error','')}"}
+                    with conn.cursor() as cur:
+                        cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                            VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
+                            (client["id"], message[:500], f"To: {phone}"))
+                    log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']}: {message[:100]}")
+                    conn.commit()
+                    return {"reply_cs": f"✅ WhatsApp zpráva odeslána klientovi {client['display_name']} na {phone}."}
+                except Exception as e:
+                    return {"reply_cs": f"Chyba při odesílání WhatsApp: {e}"}
+                finally: release_conn(conn)
 
             if action == "ADD_NOTE":
                 etype = args.get("entity_type","client")
@@ -2979,6 +3008,24 @@ async def wa_incoming(request: Request):
                         client = wa_find_client_by_phone(conn, sender)
                         client_id = client["id"] if client else None
                         client_name = client["display_name"] if client else None
+                        # Auto-create client from unknown WhatsApp number
+                        if not client:
+                            wa_name = ""
+                            for contact in value.get("contacts", []):
+                                if contact.get("wa_id") == sender:
+                                    profile = contact.get("profile", {})
+                                    wa_name = profile.get("name", "")
+                            display = wa_name or f"WhatsApp +{sender}"
+                            code = f"CL-WA-{sender[-6:]}"
+                            with conn.cursor() as cur:
+                                cur.execute("""INSERT INTO clients (client_code,client_type,display_name,phone_primary,source,status,tenant_id)
+                                    VALUES (%s,'individual',%s,%s,'whatsapp','new',1) ON CONFLICT DO NOTHING RETURNING id""",
+                                    (code, display, f"+{sender}"))
+                                row = cur.fetchone()
+                                if row:
+                                    client_id = row["id"]
+                                    client_name = display
+                                    log_activity(conn,"client",client_id,"auto_create",f"Klient vytvoren z WhatsApp: {display}")
                         with conn.cursor() as cur:
                             cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
                                 VALUES (1,%s,'whatsapp',%s,%s,'inbound',%s,now())""",
