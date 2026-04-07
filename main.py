@@ -426,6 +426,9 @@ async def startup():
                 if os.path.exists(schema_path):
                     with open(schema_path, "r", encoding="utf-8") as f: cur.execute(f.read())
                     conn.commit(); print("Schema initialized from schema.sql")
+            # Ensure tenant 1 has max_users=10
+            cur.execute("""UPDATE subscription_limits SET max_users=10 WHERE tenant_id=1 AND max_users < 10""")
+            conn.commit()
         release_conn(conn)
     except Exception as e: print(f"Schema check: {e}")
 
