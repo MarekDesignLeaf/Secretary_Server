@@ -214,6 +214,11 @@ END $$;
 
 # === CONFIG ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+if OPENAI_API_KEY:
+    print(f"DEBUG: OPENAI_API_KEY loaded, prefix: {OPENAI_API_KEY[:4]}****")
+else:
+    print("DEBUG: OPENAI_API_KEY is empty in env!")
+
 ai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # === WHATSAPP CONFIG ===
@@ -485,7 +490,8 @@ RULES:
 - When user says 'done' or 'completed' for a task, use complete_task.
 - When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report.
 - When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather.
-- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Find client by name, get their phone, send message."""
+- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Find client by name, get their phone, send message.
+- When user asks about clients database, how many clients, client statistics, sources, types, or any question about CRM data, use query_clients. Examples: 'kolik mam klientu', 'odkud jsou klienti', 'jaci klienti jsou aktivni', 'kolik mam zakazek', 'statistiky', 'prehled databaze'."""
 
         tools = [
             {"type":"function","function":{"name":"add_calendar_event","description":"Prida schuzku do kalendare","parameters":{"type":"object","properties":{"title":{"type":"string"},"start_time":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"duration":{"type":"integer","description":"minuty"}},"required":["title","start_time"]}}},
@@ -507,6 +513,7 @@ RULES:
             {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
             {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: Didcot, Oxfordshire"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
             {"type":"function","function":{"name":"send_whatsapp","description":"Posle WhatsApp zpravu klientovi. Pouzij kdyz uzivatel rekne 'napis na whatsapp', 'posli whatsapp zpravu', 'whatsapp message'.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["client_name","message"]}}},
+            {"type":"function","function":{"name":"query_clients","description":"Dotaz na databazi klientu. Pouzij kdyz se uzivatel pta kolik ma klientu, odkud jsou, jake typy, statistiky CRM, prehled databaze, aktivni/neaktivni klienti, zdroje klientu.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"Co chce uzivatel vedet o klientech/databazi. Napr: 'kolik klientu', 'statistiky', 'odkud jsou klienti', 'aktivni klienti', 'posledni klienti'"}},"required":["question"]}}},
         ]
 
         messages = [{"role":"system","content":system_prompt}]
@@ -705,6 +712,48 @@ RULES:
                     return {"reply_cs": f"✅ WhatsApp zpráva odeslána klientovi {client['display_name']} na {phone}.", "action_type":"WHATSAPP_SENT","action_data":{"client_name":client["display_name"],"phone":phone}}
                 except Exception as e:
                     return {"reply_cs": f"Chyba při odesílání WhatsApp: {e}"}
+                finally: release_conn(conn)
+
+            if action == "QUERY_CLIENTS":
+                question = args.get("question", "")
+                conn = get_db_conn()
+                try:
+                    with conn.cursor() as cur:
+                        stats = {}
+                        cur.execute("SELECT COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1")
+                        stats["total_clients"] = cur.fetchone()["cnt"]
+                        cur.execute("SELECT status, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY status")
+                        stats["by_status"] = {r["status"]: r["cnt"] for r in cur.fetchall()}
+                        cur.execute("SELECT source, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND source IS NOT NULL AND tenant_id=1 GROUP BY source")
+                        stats["by_source"] = {r["source"]: r["cnt"] for r in cur.fetchall()}
+                        cur.execute("SELECT client_type, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY client_type")
+                        stats["by_type"] = {r["client_type"]: r["cnt"] for r in cur.fetchall()}
+                        cur.execute("SELECT is_commercial, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY is_commercial")
+                        stats["commercial"] = {str(r["is_commercial"]): r["cnt"] for r in cur.fetchall()}
+                        cur.execute("SELECT display_name, phone_primary, email_primary, source, created_at::text FROM clients WHERE deleted_at IS NULL AND tenant_id=1 ORDER BY created_at DESC LIMIT 5")
+                        stats["recent_5"] = [dict(r) for r in cur.fetchall()]
+                        cur.execute("SELECT COUNT(*) as cnt FROM jobs WHERE deleted_at IS NULL")
+                        stats["total_jobs"] = cur.fetchone()["cnt"]
+                        cur.execute("SELECT COUNT(*) as cnt FROM leads WHERE tenant_id=1")
+                        stats["total_leads"] = cur.fetchone()["cnt"]
+                        cur.execute("SELECT COUNT(*) as cnt FROM invoices WHERE tenant_id=1")
+                        stats["total_invoices"] = cur.fetchone()["cnt"]
+                        cur.execute("SELECT COUNT(*) as cnt FROM tasks WHERE tenant_id=1")
+                        stats["total_tasks"] = cur.fetchone()["cnt"]
+                    # Build human-readable answer
+                    lines = [f"📊 Databáze CRM:"]
+                    lines.append(f"Klientů celkem: {stats['total_clients']}")
+                    if stats["by_status"]: lines.append(f"Podle stavu: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}")
+                    if stats["by_source"]: lines.append(f"Podle zdroje: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}")
+                    if stats["by_type"]: lines.append(f"Podle typu: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}")
+                    lines.append(f"Zakázek: {stats['total_jobs']}, Leadů: {stats['total_leads']}, Faktur: {stats['total_invoices']}, Úkolů: {stats['total_tasks']}")
+                    if stats["recent_5"]:
+                        lines.append("Posledních 5 klientů:")
+                        for c in stats["recent_5"]:
+                            lines.append(f"  - {c['display_name']} ({c.get('source','?')}) {c.get('phone_primary','')}")
+                    return {"reply_cs": "\n".join(lines)}
+                except Exception as e:
+                    return {"reply_cs": f"Chyba při dotazu na databázi: {e}"}
                 finally: release_conn(conn)
 
             if action == "ADD_NOTE":
