@@ -232,8 +232,8 @@ def parse_database_config():
     database_url = os.getenv("DATABASE_URL", "")
     if database_url:
         p = urlparse(database_url)
-        return {"dbname": p.path.lstrip("/"), "user": p.username, "password": p.password, "host": p.hostname, "port": str(p.port or 5432)}
-    return {"dbname": "secretary_db", "user": "postgres", "password": "", "host": "localhost", "port": "5432"}
+        return {"dbname": p.path.lstrip("/"), "user": p.username, "password": p.password, "host": p.hostname, "port": str(p.port or 5432), "options": "-c search_path=crm,public"}
+    return {"dbname": "secretary_db", "user": "postgres", "password": "", "host": "localhost", "port": "5432", "options": "-c search_path=crm,public"}
 
 DB_CONFIG = parse_database_config()
 db_pool = None
