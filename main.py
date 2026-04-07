@@ -1028,8 +1028,8 @@ async def sync_contacts(data: dict):
                                 cur.execute("RELEASE SAVEPOINT contact_sync")
                                 skipped += 1; continue
                             code = f"CL-PH-{clean[-6:]}"
-                            cur.execute("""INSERT INTO clients (client_code,client_type,display_name,phone_primary,email_primary,source,status,tenant_id)
-                                VALUES (%s,'individual',%s,%s,%s,'phone_sync','active',1)
+                            cur.execute("""INSERT INTO clients (client_code,client_type,display_name,phone_primary,email_primary,status,tenant_id)
+                                VALUES (%s,'individual',%s,%s,%s,'active',1)
                                 RETURNING id""",
                                 (code, name, phone, email if email else None))
                             row = cur.fetchone()
