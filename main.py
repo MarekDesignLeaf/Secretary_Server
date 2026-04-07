@@ -719,18 +719,21 @@ RULES:
                 conn = get_db_conn()
                 try:
                     with conn.cursor() as cur:
+                        # Add source column if missing
+                        cur.execute("ALTER TABLE clients ADD COLUMN IF NOT EXISTS source TEXT")
+                        conn.commit()
                         stats = {}
                         cur.execute("SELECT COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1")
                         stats["total_clients"] = cur.fetchone()["cnt"]
                         cur.execute("SELECT status, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY status")
                         stats["by_status"] = {r["status"]: r["cnt"] for r in cur.fetchall()}
-                        cur.execute("SELECT source, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND source IS NOT NULL AND tenant_id=1 GROUP BY source")
-                        stats["by_source"] = {r["source"]: r["cnt"] for r in cur.fetchall()}
+                        cur.execute("SELECT COALESCE(source,'unknown') as src, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY COALESCE(source,'unknown')")
+                        stats["by_source"] = {r["src"]: r["cnt"] for r in cur.fetchall()}
                         cur.execute("SELECT client_type, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY client_type")
                         stats["by_type"] = {r["client_type"]: r["cnt"] for r in cur.fetchall()}
                         cur.execute("SELECT is_commercial, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY is_commercial")
                         stats["commercial"] = {str(r["is_commercial"]): r["cnt"] for r in cur.fetchall()}
-                        cur.execute("SELECT display_name, phone_primary, email_primary, source, created_at::text FROM clients WHERE deleted_at IS NULL AND tenant_id=1 ORDER BY created_at DESC LIMIT 5")
+                        cur.execute("SELECT display_name, phone_primary, email_primary, COALESCE(source,'?') as source, created_at::text FROM clients WHERE deleted_at IS NULL AND tenant_id=1 ORDER BY created_at DESC LIMIT 5")
                         stats["recent_5"] = [dict(r) for r in cur.fetchall()]
                         cur.execute("SELECT COUNT(*) as cnt FROM jobs WHERE deleted_at IS NULL")
                         stats["total_jobs"] = cur.fetchone()["cnt"]
