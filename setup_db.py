@@ -33,30 +33,32 @@ def setup():
                 print(f"ℹ Databáze '{DB_NAME}' již existuje. Přeskakuji vytvoření.")
         admin_conn.close()
 
-        # 2. Fáze: Totální vyčištění a reinicializace schématu
-        print(f"\n--- Fáze 2: VYČIŠTĚNÍ A REINICIALIZACE schématu 'crm' ---")
+        # 2. Fáze: Bezpečná inicializace schématu (bez DROP)
+        print(f"\n--- Fáze 2: Bezpečná inicializace schématu 'crm' ---")
         conn = psycopg2.connect(
             dbname=DB_NAME,
             user=DB_USER,
             password=DB_PASSWORD,
             host=DB_HOST,
-            port=DB_PORT
+            port=DB_PORT,
+            options="-c search_path=crm,public"
         )
 
         with conn.cursor() as cur:
-            # TOTÁLNÍ RESET: Smazání starého schématu
-            print("❗ Mažu staré schéma 'crm' a všechna data...")
-            cur.execute("DROP SCHEMA IF EXISTS crm CASCADE")
+            # Vytvoří schema pokud neexistuje — existující data zachována
+            cur.execute("CREATE SCHEMA IF NOT EXISTS crm")
+            cur.execute("SET search_path TO crm, public")
 
-            # Reinicializace
-            print("Aplikuji 'schema.sql' pro vytvoření čisté struktury a triggerů...")
-            with open('schema.sql', 'r', encoding='utf-8') as f:
+            # Aplikuje schema_railway_snapshot.sql (pouze CREATE TABLE IF NOT EXISTS)
+            snapshot_path = 'schema_railway_snapshot.sql'
+            print(f"Aplikuji '{snapshot_path}' (pouze IF NOT EXISTS, žádný DROP)...")
+            with open(snapshot_path, 'r', encoding='utf-8') as f:
                 cur.execute(f.read())
 
             conn.commit()
-            print("✔ Schéma, tabulky a auditní triggery byly úspěšně reinicializovány.")
+            print("✔ Schéma zkontrolováno, chybějící tabulky doplněny, existující data zachována.")
 
-        print("\n[VÝSLEDEK] Infrastruktura Secretary je nyní v ČISTÉM výchozím stavu.")
+        print("\n[VÝSLEDEK] Infrastruktura Secretary je v bezpečném stavu.")
 
     except Exception as e:
         if conn:
