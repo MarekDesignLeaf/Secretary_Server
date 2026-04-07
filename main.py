@@ -426,6 +426,16 @@ async def startup():
                 if os.path.exists(schema_path):
                     with open(schema_path, "r", encoding="utf-8") as f: cur.execute(f.read())
                     conn.commit(); print("Schema initialized from schema.sql")
+            # Add per-client rate override columns (idempotent)
+            cur.execute("""
+                ALTER TABLE clients
+                ADD COLUMN IF NOT EXISTS rate_garden_maintenance DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS rate_hedge_trimming DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS rate_arborist_works DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS rate_waste_bulkbag DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS rate_minimum_charge DOUBLE PRECISION
+            """)
+            conn.commit()
             # Ensure tenant 1 has max_users=10
             cur.execute("""UPDATE subscription_limits SET max_users=10 WHERE tenant_id=1 AND max_users < 10""")
             conn.commit()
@@ -965,7 +975,7 @@ async def update_client(client_id: int, data: dict):
     conn = get_db_conn()
     try:
         sets = []; vals = []
-        for k in ["display_name","first_name","last_name","title","client_type","company_name","company_registration_no","vat_no","email_primary","email_secondary","phone_primary","phone_secondary","website","preferred_contact_method","billing_address_line1","billing_city","billing_postcode","billing_country","status","is_commercial"]:
+        for k in ["display_name","first_name","last_name","title","client_type","company_name","company_registration_no","vat_no","email_primary","email_secondary","phone_primary","phone_secondary","website","preferred_contact_method","billing_address_line1","billing_city","billing_postcode","billing_country","status","is_commercial","default_hourly_rate","rate_garden_maintenance","rate_hedge_trimming","rate_arborist_works","rate_waste_bulkbag","rate_minimum_charge"]:
             if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
         if not sets: raise HTTPException(400,"Zadna data")
         sets.append("updated_at=now()"); vals.append(client_id)
@@ -1494,17 +1504,29 @@ async def update_default_rates(tenant_id: int, data: dict, request: Request):
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
+_CLIENT_RATE_COL = {
+    "hourly_rate": "default_hourly_rate",
+    "garden_maintenance": "rate_garden_maintenance",
+    "hedge_trimming": "rate_hedge_trimming",
+    "arborist_works": "rate_arborist_works",
+    "garden_waste_bulkbag": "rate_waste_bulkbag",
+    "minimum_charge": "rate_minimum_charge",
+}
+
 def get_effective_rate(conn, tid, user_id=None, client_id=None, rate_type="hourly_rate"):
     """Get rate with fallback: user > client > tenant default."""
+    client_col = _CLIENT_RATE_COL.get(rate_type)
     with conn.cursor() as cur:
         if user_id:
-            cur.execute(f"SELECT {rate_type} FROM users WHERE id=%s AND tenant_id=%s", (user_id, tid))
+            try:
+                cur.execute(f"SELECT {rate_type} FROM users WHERE id=%s AND tenant_id=%s", (user_id, tid))
+                r = cur.fetchone()
+                if r and float(r.get(rate_type) or 0) > 0: return float(r[rate_type])
+            except Exception: pass
+        if client_id and client_col:
+            cur.execute(f"SELECT {client_col} FROM clients WHERE id=%s AND tenant_id=%s", (client_id, tid))
             r = cur.fetchone()
-            if r and float(r[rate_type] or 0) > 0: return float(r[rate_type])
-        if client_id and rate_type == "hourly_rate":
-            cur.execute("SELECT default_hourly_rate FROM clients WHERE id=%s AND tenant_id=%s", (client_id, tid))
-            r = cur.fetchone()
-            if r and float(r["default_hourly_rate"] or 0) > 0: return float(r["default_hourly_rate"])
+            if r and float(r.get(client_col) or 0) > 0: return float(r[client_col])
         cur.execute("SELECT rate FROM tenant_default_rates WHERE tenant_id=%s AND rate_type=%s", (tid, rate_type))
         r = cur.fetchone()
         return float(r["rate"]) if r else 0
