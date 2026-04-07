@@ -1,0 +1,433 @@
+        table_name         |             column_name             |        data_type         | is_nullable |                      column_default                       
+---------------------------+-------------------------------------+--------------------------+-------------+-----------------------------------------------------------
+ activity_timeline         | id                                  | bigint                   | NO          | 
+ activity_timeline         | entity_type                         | text                     | NO          | 
+ activity_timeline         | entity_id                           | text                     | NO          | 
+ activity_timeline         | action                              | text                     | NO          | 
+ activity_timeline         | description                         | text                     | NO          | 
+ activity_timeline         | user_name                           | text                     | YES         | 'Marek'::text
+ activity_timeline         | created_at                          | timestamp with time zone | YES         | now()
+ activity_timeline         | tenant_id                           | integer                  | YES         | 1
+ activity_timeline         | user_id_ref                         | text                     | YES         | 
+ audit_log                 | id                                  | bigint                   | NO          | 
+ audit_log                 | tenant_id                           | integer                  | YES         | 1
+ audit_log                 | user_id                             | bigint                   | YES         | 
+ audit_log                 | action                              | text                     | NO          | 
+ audit_log                 | entity_type                         | text                     | NO          | 
+ audit_log                 | entity_id                           | text                     | YES         | 
+ audit_log                 | old_values                          | jsonb                    | YES         | 
+ audit_log                 | new_values                          | jsonb                    | YES         | 
+ audit_log                 | created_at                          | timestamp with time zone | YES         | now()
+ client_notes              | id                                  | bigint                   | NO          | 
+ client_notes              | client_id                           | bigint                   | NO          | 
+ client_notes              | note                                | text                     | NO          | 
+ client_notes              | created_by                          | text                     | YES         | 'Marek'::text
+ client_notes              | created_at                          | timestamp with time zone | YES         | now()
+ client_notes              | tenant_id                           | integer                  | NO          | 1
+ clients                   | id                                  | bigint                   | NO          | 
+ clients                   | client_code                         | text                     | YES         | 
+ clients                   | client_type                         | text                     | NO          | 'domestic'::text
+ clients                   | title                               | text                     | YES         | 
+ clients                   | first_name                          | text                     | YES         | 
+ clients                   | last_name                           | text                     | YES         | 
+ clients                   | display_name                        | text                     | NO          | 
+ clients                   | company_name                        | text                     | YES         | 
+ clients                   | phone_primary                       | text                     | YES         | 
+ clients                   | phone_secondary                     | text                     | YES         | 
+ clients                   | email_primary                       | text                     | YES         | 
+ clients                   | email_secondary                     | text                     | YES         | 
+ clients                   | website                             | text                     | YES         | 
+ clients                   | preferred_contact_method            | text                     | NO          | 'email'::text
+ clients                   | billing_address_line1               | text                     | YES         | 
+ clients                   | billing_city                        | text                     | YES         | 
+ clients                   | billing_postcode                    | text                     | YES         | 
+ clients                   | billing_country                     | text                     | NO          | 'GB'::text
+ clients                   | status                              | text                     | NO          | 'active'::text
+ clients                   | is_commercial                       | boolean                  | NO          | false
+ clients                   | created_at                          | timestamp with time zone | NO          | now()
+ clients                   | updated_at                          | timestamp with time zone | NO          | now()
+ clients                   | deleted_at                          | timestamp with time zone | YES         | 
+ clients                   | created_by_user_id                  | bigint                   | YES         | 
+ clients                   | tenant_id                           | integer                  | NO          | 1
+ clients                   | company_registration_no             | text                     | YES         | 
+ clients                   | vat_no                              | text                     | YES         | 
+ clients                   | preferred_language_code             | text                     | YES         | 
+ clients                   | default_hourly_rate                 | numeric                  | YES         | 0
+ communications            | id                                  | bigint                   | NO          | 
+ communications            | client_id                           | bigint                   | YES         | 
+ communications            | subject                             | text                     | YES         | 
+ communications            | message_summary                     | text                     | NO          | ''::text
+ communications            | direction                           | text                     | NO          | 'inbound'::text
+ communications            | sent_at                             | timestamp with time zone | YES         | 
+ communications            | created_at                          | timestamp with time zone | NO          | now()
+ communications            | comm_type                           | text                     | YES         | 'telefon'::text
+ communications            | job_id                              | bigint                   | YES         | 
+ communications            | notes                               | text                     | YES         | 
+ communications            | tenant_id                           | integer                  | NO          | 1
+ industry_groups           | id                                  | bigint                   | NO          | nextval('crm.industry_groups_id_seq'::regclass)
+ industry_groups           | code                                | text                     | NO          | 
+ industry_groups           | name                                | text                     | NO          | 
+ industry_groups           | sort_order                          | integer                  | YES         | 0
+ industry_subtypes         | id                                  | bigint                   | NO          | nextval('crm.industry_subtypes_id_seq'::regclass)
+ industry_subtypes         | industry_group_id                   | bigint                   | NO          | 
+ industry_subtypes         | code                                | text                     | NO          | 
+ industry_subtypes         | name                                | text                     | NO          | 
+ industry_subtypes         | sort_order                          | integer                  | YES         | 0
+ invoice_items             | id                                  | bigint                   | NO          | 
+ invoice_items             | tenant_id                           | integer                  | NO          | 1
+ invoice_items             | invoice_id                          | bigint                   | NO          | 
+ invoice_items             | description                         | text                     | NO          | 
+ invoice_items             | quantity                            | numeric                  | NO          | 1
+ invoice_items             | unit_price                          | numeric                  | NO          | 0
+ invoice_items             | total                               | numeric                  | NO          | 0
+ invoice_items             | sort_order                          | integer                  | YES         | 0
+ invoice_items             | created_at                          | timestamp with time zone | YES         | now()
+ invoices                  | id                                  | bigint                   | NO          | 
+ invoices                  | invoice_number                      | text                     | YES         | 
+ invoices                  | client_id                           | bigint                   | NO          | 1
+ invoices                  | grand_total                         | numeric                  | NO          | 0
+ invoices                  | status                              | text                     | NO          | 'draft'::text
+ invoices                  | due_date                            | date                     | YES         | 
+ invoices                  | created_at                          | timestamp with time zone | NO          | now()
+ invoices                  | tenant_id                           | integer                  | NO          | 1
+ invoices                  | updated_at                          | timestamp with time zone | YES         | now()
+ invoices                  | notes                               | text                     | YES         | 
+ invoices                  | job_id                              | bigint                   | YES         | 
+ invoices                  | created_by                          | bigint                   | YES         | 
+ invoices                  | work_report_id                      | bigint                   | YES         | 
+ job_notes                 | id                                  | bigint                   | NO          | 
+ job_notes                 | job_id                              | bigint                   | NO          | 
+ job_notes                 | note                                | text                     | NO          | 
+ job_notes                 | created_by                          | text                     | YES         | 'Marek'::text
+ job_notes                 | created_at                          | timestamp with time zone | YES         | now()
+ job_notes                 | tenant_id                           | integer                  | NO          | 1
+ jobs                      | id                                  | bigint                   | NO          | 
+ jobs                      | job_number                          | text                     | YES         | 
+ jobs                      | client_id                           | bigint                   | NO          | 1
+ jobs                      | property_id                         | bigint                   | YES         | 1
+ jobs                      | quote_id                            | bigint                   | YES         | 
+ jobs                      | job_title                           | text                     | NO          | 
+ jobs                      | job_status                          | text                     | NO          | 'draft'::text
+ jobs                      | start_date_planned                  | date                     | YES         | 
+ jobs                      | created_at                          | timestamp with time zone | NO          | now()
+ jobs                      | updated_at                          | timestamp with time zone | NO          | now()
+ jobs                      | deleted_at                          | timestamp with time zone | YES         | 
+ jobs                      | tenant_id                           | integer                  | NO          | 1
+ leads                     | id                                  | bigint                   | NO          | 
+ leads                     | lead_code                           | text                     | YES         | 
+ leads                     | client_id                           | bigint                   | YES         | 
+ leads                     | lead_source                         | text                     | NO          | 'web'::text
+ leads                     | status                              | text                     | NO          | 'new'::text
+ leads                     | received_at                         | timestamp with time zone | NO          | now()
+ leads                     | created_at                          | timestamp with time zone | NO          | now()
+ leads                     | contact_name                        | text                     | YES         | 
+ leads                     | contact_email                       | text                     | YES         | 
+ leads                     | contact_phone                       | text                     | YES         | 
+ leads                     | description                         | text                     | YES         | 
+ leads                     | notes                               | text                     | YES         | 
+ leads                     | job_id                              | bigint                   | YES         | 
+ leads                     | updated_at                          | timestamp with time zone | YES         | now()
+ leads                     | tenant_id                           | integer                  | NO          | 1
+ migration_log             | id                                  | integer                  | NO          | 
+ migration_log             | filename                            | text                     | NO          | 
+ migration_log             | applied_at                          | timestamp with time zone | YES         | now()
+ notifications             | id                                  | bigint                   | NO          | 
+ notifications             | tenant_id                           | integer                  | NO          | 1
+ notifications             | user_id                             | bigint                   | YES         | 
+ notifications             | title                               | text                     | NO          | 
+ notifications             | body                                | text                     | YES         | 
+ notifications             | notification_type                   | text                     | YES         | 'info'::text
+ notifications             | entity_type                         | text                     | YES         | 
+ notifications             | entity_id                           | text                     | YES         | 
+ notifications             | is_read                             | boolean                  | YES         | false
+ notifications             | created_at                          | timestamp with time zone | YES         | now()
+ notifications             | read_at                             | timestamp with time zone | YES         | 
+ payments                  | id                                  | bigint                   | NO          | 
+ payments                  | tenant_id                           | integer                  | NO          | 1
+ payments                  | invoice_id                          | bigint                   | NO          | 
+ payments                  | amount                              | numeric                  | NO          | 
+ payments                  | payment_date                        | date                     | NO          | CURRENT_DATE
+ payments                  | payment_method                      | text                     | YES         | 'bank_transfer'::text
+ payments                  | reference                           | text                     | YES         | 
+ payments                  | notes                               | text                     | YES         | 
+ payments                  | created_by                          | bigint                   | YES         | 
+ payments                  | created_at                          | timestamp with time zone | YES         | now()
+ photos                    | id                                  | bigint                   | NO          | 
+ photos                    | entity_type                         | text                     | NO          | 
+ photos                    | entity_id                           | text                     | NO          | 
+ photos                    | filename                            | text                     | NO          | 
+ photos                    | description                         | text                     | YES         | 
+ photos                    | file_path                           | text                     | YES         | 
+ photos                    | thumbnail_base64                    | text                     | YES         | 
+ photos                    | created_by                          | text                     | YES         | 'Marek'::text
+ photos                    | created_at                          | timestamp with time zone | YES         | now()
+ photos                    | tenant_id                           | integer                  | NO          | 1
+ pricing_rules             | id                                  | bigint                   | NO          | 
+ pricing_rules             | tenant_id                           | integer                  | YES         | 1
+ pricing_rules             | scope                               | text                     | YES         | 'system'::text
+ pricing_rules             | scope_id                            | bigint                   | YES         | 
+ pricing_rules             | rule_type                           | text                     | NO          | 
+ pricing_rules             | rule_key                            | text                     | YES         | 
+ pricing_rules             | rate                                | numeric                  | NO          | 
+ pricing_rules             | currency                            | text                     | YES         | 'GBP'::text
+ pricing_rules             | created_at                          | timestamp with time zone | YES         | now()
+ properties                | id                                  | bigint                   | NO          | 
+ properties                | client_id                           | bigint                   | NO          | 
+ properties                | property_code                       | text                     | YES         | 
+ properties                | property_name                       | text                     | NO          | 
+ properties                | property_type                       | text                     | NO          | 'residential'::text
+ properties                | address_line1                       | text                     | NO          | ''::text
+ properties                | city                                | text                     | NO          | ''::text
+ properties                | postcode                            | text                     | NO          | ''::text
+ properties                | country                             | text                     | NO          | 'GB'::text
+ properties                | status                              | text                     | NO          | 'active'::text
+ properties                | created_at                          | timestamp with time zone | NO          | now()
+ properties                | updated_at                          | timestamp with time zone | NO          | now()
+ properties                | deleted_at                          | timestamp with time zone | YES         | 
+ properties                | tenant_id                           | integer                  | NO          | 1
+ quote_items               | id                                  | bigint                   | NO          | 
+ quote_items               | quote_id                            | bigint                   | NO          | 
+ quote_items               | description                         | text                     | NO          | 
+ quote_items               | quantity                            | numeric                  | NO          | 1
+ quote_items               | unit_price                          | numeric                  | NO          | 0
+ quote_items               | total                               | numeric                  | NO          | 0
+ quote_items               | sort_order                          | integer                  | NO          | 0
+ quotes                    | id                                  | bigint                   | NO          | 
+ quotes                    | tenant_id                           | integer                  | YES         | 1
+ quotes                    | quote_number                        | text                     | YES         | 
+ quotes                    | client_id                           | bigint                   | YES         | 
+ quotes                    | status                              | text                     | YES         | 'draft'::text
+ quotes                    | total                               | numeric                  | YES         | 0
+ quotes                    | created_at                          | timestamp with time zone | YES         | now()
+ quotes                    | quote_title                         | text                     | YES         | 
+ quotes                    | valid_until                         | date                     | YES         | 
+ quotes                    | notes                               | text                     | YES         | 
+ quotes                    | grand_total                         | numeric                  | YES         | 0
+ quotes                    | updated_at                          | timestamp with time zone | YES         | now()
+ roles                     | id                                  | bigint                   | NO          | 
+ roles                     | role_name                           | text                     | NO          | 
+ roles                     | description                         | text                     | YES         | 
+ roles                     | created_at                          | timestamp with time zone | YES         | now()
+ subscription_limits       | id                                  | bigint                   | NO          | nextval('crm.subscription_limits_id_seq'::regclass)
+ subscription_limits       | tenant_id                           | integer                  | NO          | 
+ subscription_limits       | max_users                           | integer                  | YES         | 
+ subscription_limits       | max_clients                         | integer                  | YES         | 
+ subscription_limits       | max_jobs_per_month                  | integer                  | YES         | 
+ subscription_limits       | max_voice_minutes                   | integer                  | YES         | 
+ subscription_limits       | created_at                          | timestamp with time zone | YES         | now()
+ subscription_limits       | updated_at                          | timestamp with time zone | YES         | now()
+ system_templates          | id                                  | bigint                   | NO          | nextval('crm.system_templates_id_seq'::regclass)
+ system_templates          | template_type                       | text                     | NO          | 
+ system_templates          | industry_group_id                   | bigint                   | YES         | 
+ system_templates          | industry_subtype_id                 | bigint                   | YES         | 
+ system_templates          | code                                | text                     | NO          | 
+ system_templates          | name                                | text                     | NO          | 
+ system_templates          | version                             | text                     | YES         | 
+ system_templates          | config_json                         | jsonb                    | NO          | 
+ system_templates          | is_system                           | boolean                  | YES         | true
+ system_templates          | created_at                          | timestamp with time zone | YES         | now()
+ system_templates          | updated_at                          | timestamp with time zone | YES         | now()
+ task_history              | id                                  | bigint                   | NO          | 
+ task_history              | task_id                             | text                     | NO          | 
+ task_history              | field_name                          | text                     | NO          | 
+ task_history              | old_value                           | text                     | YES         | 
+ task_history              | new_value                           | text                     | YES         | 
+ task_history              | changed_by                          | text                     | YES         | 'Marek'::text
+ task_history              | changed_at                          | timestamp with time zone | YES         | now()
+ task_history              | tenant_id                           | integer                  | NO          | 1
+ tasks                     | id                                  | text                     | NO          | 
+ tasks                     | title                               | text                     | NO          | 
+ tasks                     | description                         | text                     | YES         | 
+ tasks                     | task_type                           | text                     | YES         | 'interni_poznamka'::text
+ tasks                     | status                              | text                     | YES         | 'novy'::text
+ tasks                     | priority                            | text                     | YES         | 'bezna'::text
+ tasks                     | created_at                          | timestamp with time zone | YES         | now()
+ tasks                     | deadline                            | text                     | YES         | 
+ tasks                     | planned_date                        | text                     | YES         | 
+ tasks                     | time_window_start                   | text                     | YES         | 
+ tasks                     | time_window_end                     | text                     | YES         | 
+ tasks                     | estimated_minutes                   | integer                  | YES         | 
+ tasks                     | actual_minutes                      | integer                  | YES         | 
+ tasks                     | created_by                          | text                     | YES         | 
+ tasks                     | assigned_to                         | text                     | YES         | 
+ tasks                     | delegated_by                        | text                     | YES         | 
+ tasks                     | client_id                           | bigint                   | YES         | 
+ tasks                     | client_name                         | text                     | YES         | 
+ tasks                     | job_id                              | bigint                   | YES         | 
+ tasks                     | property_id                         | bigint                   | YES         | 
+ tasks                     | property_address                    | text                     | YES         | 
+ tasks                     | is_recurring                        | boolean                  | YES         | false
+ tasks                     | recurrence_rule                     | text                     | YES         | 
+ tasks                     | result                              | text                     | YES         | 
+ tasks                     | notes                               | jsonb                    | YES         | '[]'::jsonb
+ tasks                     | communication_method                | text                     | YES         | 
+ tasks                     | source                              | text                     | YES         | 'manualne'::text
+ tasks                     | is_billable                         | boolean                  | YES         | false
+ tasks                     | has_cost                            | boolean                  | YES         | false
+ tasks                     | waiting_for_payment                 | boolean                  | YES         | false
+ tasks                     | checklist                           | jsonb                    | YES         | '[]'::jsonb
+ tasks                     | is_completed                        | boolean                  | YES         | false
+ tasks                     | updated_at                          | timestamp with time zone | YES         | now()
+ tasks                     | tenant_id                           | integer                  | NO          | 1
+ tasks                     | version                             | bigint                   | NO          | 1
+ tasks                     | last_modified_by_device_id          | text                     | YES         | 
+ tasks                     | deleted_at_sync                     | timestamp with time zone | YES         | 
+ tenant_default_rates      | id                                  | bigint                   | NO          | nextval('crm.tenant_default_rates_id_seq'::regclass)
+ tenant_default_rates      | tenant_id                           | integer                  | NO          | 
+ tenant_default_rates      | rate_type                           | text                     | NO          | 
+ tenant_default_rates      | rate                                | numeric                  | NO          | 0
+ tenant_default_rates      | currency                            | text                     | YES         | 'GBP'::text
+ tenant_default_rates      | description                         | text                     | YES         | 
+ tenant_default_rates      | created_at                          | timestamp with time zone | YES         | now()
+ tenant_default_rates      | updated_at                          | timestamp with time zone | YES         | now()
+ tenant_industry_profile   | id                                  | bigint                   | NO          | nextval('crm.tenant_industry_profile_id_seq'::regclass)
+ tenant_industry_profile   | tenant_id                           | integer                  | NO          | 
+ tenant_industry_profile   | industry_group_id                   | bigint                   | NO          | 
+ tenant_industry_profile   | industry_subtype_id                 | bigint                   | YES         | 
+ tenant_industry_profile   | is_primary                          | boolean                  | YES         | true
+ tenant_industry_profile   | created_at                          | timestamp with time zone | YES         | now()
+ tenant_industry_profile   | updated_at                          | timestamp with time zone | YES         | now()
+ tenant_languages          | id                                  | bigint                   | NO          | nextval('crm.tenant_languages_id_seq'::regclass)
+ tenant_languages          | tenant_id                           | integer                  | NO          | 
+ tenant_languages          | language_code                       | text                     | NO          | 
+ tenant_languages          | language_scope                      | text                     | NO          | 
+ tenant_languages          | is_default                          | boolean                  | YES         | false
+ tenant_languages          | is_active                           | boolean                  | YES         | true
+ tenant_languages          | sort_order                          | integer                  | YES         | 0
+ tenant_languages          | created_at                          | timestamp with time zone | YES         | now()
+ tenant_operating_profile  | id                                  | bigint                   | NO          | nextval('crm.tenant_operating_profile_id_seq'::regclass)
+ tenant_operating_profile  | tenant_id                           | integer                  | NO          | 
+ tenant_operating_profile  | internal_language_mode              | text                     | NO          | 'single'::text
+ tenant_operating_profile  | customer_language_mode              | text                     | NO          | 'single'::text
+ tenant_operating_profile  | default_internal_language_code      | text                     | NO          | 'en'::text
+ tenant_operating_profile  | default_customer_language_code      | text                     | NO          | 'en'::text
+ tenant_operating_profile  | auto_translate_internal_to_customer | boolean                  | YES         | true
+ tenant_operating_profile  | auto_translate_customer_to_internal | boolean                  | YES         | true
+ tenant_operating_profile  | voice_input_strategy                | text                     | YES         | 'auto_detect'::text
+ tenant_operating_profile  | voice_output_strategy               | text                     | YES         | 'customer_default'::text
+ tenant_operating_profile  | workspace_mode                      | text                     | NO          | 'solo'::text
+ tenant_operating_profile  | max_active_users                    | integer                  | NO          | 1
+ tenant_operating_profile  | industry_group_id                   | bigint                   | YES         | 
+ tenant_operating_profile  | industry_subtype_id                 | bigint                   | YES         | 
+ tenant_operating_profile  | created_at                          | timestamp with time zone | YES         | now()
+ tenant_operating_profile  | updated_at                          | timestamp with time zone | YES         | now()
+ tenant_settings           | id                                  | bigint                   | NO          | nextval('crm.tenant_settings_id_seq'::regclass)
+ tenant_settings           | tenant_id                           | integer                  | NO          | 
+ tenant_settings           | date_format                         | text                     | YES         | 'DD/MM/YYYY'::text
+ tenant_settings           | time_format                         | text                     | YES         | '24h'::text
+ tenant_settings           | email_enabled                       | boolean                  | YES         | true
+ tenant_settings           | whatsapp_enabled                    | boolean                  | YES         | true
+ tenant_settings           | voice_enabled                       | boolean                  | YES         | true
+ tenant_settings           | client_portal_enabled               | boolean                  | YES         | false
+ tenant_settings           | created_at                          | timestamp with time zone | YES         | now()
+ tenant_settings           | updated_at                          | timestamp with time zone | YES         | now()
+ tenant_template_overrides | id                                  | bigint                   | NO          | nextval('crm.tenant_template_overrides_id_seq'::regclass)
+ tenant_template_overrides | tenant_id                           | integer                  | NO          | 
+ tenant_template_overrides | system_template_id                  | bigint                   | NO          | 
+ tenant_template_overrides | override_json                       | jsonb                    | YES         | 
+ tenant_template_overrides | is_active                           | boolean                  | YES         | true
+ tenant_template_overrides | created_at                          | timestamp with time zone | YES         | now()
+ tenant_template_overrides | updated_at                          | timestamp with time zone | YES         | now()
+ tenants                   | id                                  | integer                  | NO          | 
+ tenants                   | name                                | text                     | NO          | 
+ tenants                   | slug                                | text                     | NO          | 
+ tenants                   | status                              | text                     | YES         | 'active'::text
+ tenants                   | created_at                          | timestamp with time zone | YES         | now()
+ tenants                   | legal_type                          | text                     | YES         | 
+ tenants                   | company_registration_no             | text                     | YES         | 
+ tenants                   | vat_no                              | text                     | YES         | 
+ tenants                   | phone                               | text                     | YES         | 
+ tenants                   | email                               | text                     | YES         | 
+ tenants                   | website                             | text                     | YES         | 
+ tenants                   | country_code                        | text                     | YES         | 'GB'::text
+ tenants                   | timezone                            | text                     | YES         | 'Europe/London'::text
+ tenants                   | currency                            | text                     | YES         | 'GBP'::text
+ tenants                   | updated_at                          | timestamp with time zone | YES         | now()
+ users                     | id                                  | bigint                   | NO          | 
+ users                     | tenant_id                           | integer                  | YES         | 1
+ users                     | role_id                             | bigint                   | YES         | 
+ users                     | first_name                          | text                     | NO          | 
+ users                     | last_name                           | text                     | NO          | 
+ users                     | display_name                        | text                     | NO          | 
+ users                     | email                               | text                     | NO          | 
+ users                     | phone                               | text                     | YES         | 
+ users                     | status                              | text                     | YES         | 'active'::text
+ users                     | password_hash                       | text                     | YES         | ''::text
+ users                     | created_at                          | timestamp with time zone | YES         | now()
+ users                     | updated_at                          | timestamp with time zone | YES         | now()
+ users                     | deleted_at                          | timestamp with time zone | YES         | 
+ users                     | preferred_language_code             | text                     | YES         | 
+ users                     | is_owner                            | boolean                  | YES         | false
+ users                     | is_assistant                        | boolean                  | YES         | false
+ users                     | hourly_rate                         | numeric                  | YES         | 0
+ users                     | hourly_cost                         | numeric                  | YES         | 0
+ voice_sessions            | id                                  | text                     | NO          | 
+ voice_sessions            | tenant_id                           | integer                  | YES         | 1
+ voice_sessions            | user_id                             | bigint                   | YES         | 
+ voice_sessions            | session_type                        | text                     | YES         | 'work_report'::text
+ voice_sessions            | state                               | text                     | YES         | 'init'::text
+ voice_sessions            | dialog_step                         | text                     | YES         | 'client'::text
+ voice_sessions            | context                             | jsonb                    | YES         | '{}'::jsonb
+ voice_sessions            | created_at                          | timestamp with time zone | YES         | now()
+ voice_sessions            | updated_at                          | timestamp with time zone | YES         | now()
+ voice_sessions            | expires_at                          | timestamp with time zone | YES         | (now() + '01:00:00'::interval)
+ voice_sessions            | language_code                       | text                     | YES         | 
+ voice_sessions            | detected_language                   | text                     | YES         | 
+ waste_loads               | id                                  | bigint                   | NO          | 
+ waste_loads               | job_id                              | bigint                   | NO          | 1
+ waste_loads               | waste_type_id                       | bigint                   | NO          | 1
+ waste_loads               | quantity                            | numeric                  | NO          | 0
+ waste_loads               | unit                                | text                     | NO          | 'kg'::text
+ waste_loads               | load_date                           | date                     | NO          | CURRENT_DATE
+ waste_loads               | created_at                          | timestamp with time zone | NO          | now()
+ waste_loads               | tenant_id                           | integer                  | NO          | 1
+ waste_types               | id                                  | bigint                   | NO          | 
+ waste_types               | waste_code                          | text                     | NO          | 
+ waste_types               | name                                | text                     | NO          | 
+ waste_types               | default_unit                        | text                     | NO          | 'kg'::text
+ work_report_entries       | id                                  | bigint                   | NO          | 
+ work_report_entries       | work_report_id                      | bigint                   | NO          | 
+ work_report_entries       | type                                | text                     | NO          | 
+ work_report_entries       | description                         | text                     | YES         | 
+ work_report_entries       | hours                               | numeric                  | YES         | 0
+ work_report_entries       | unit_rate                           | numeric                  | YES         | 0
+ work_report_entries       | total_price                         | numeric                  | YES         | 0
+ work_report_materials     | id                                  | bigint                   | NO          | 
+ work_report_materials     | work_report_id                      | bigint                   | NO          | 
+ work_report_materials     | material_name                       | text                     | NO          | 
+ work_report_materials     | quantity                            | numeric                  | YES         | 0
+ work_report_materials     | unit                                | text                     | YES         | 'ks'::text
+ work_report_materials     | unit_price                          | numeric                  | YES         | 0
+ work_report_materials     | total_price                         | numeric                  | YES         | 0
+ work_report_waste         | id                                  | bigint                   | NO          | 
+ work_report_waste         | work_report_id                      | bigint                   | NO          | 
+ work_report_waste         | quantity                            | numeric                  | YES         | 0
+ work_report_waste         | unit                                | text                     | YES         | 'bulkbag'::text
+ work_report_waste         | unit_price                          | numeric                  | YES         | 0
+ work_report_waste         | total_price                         | numeric                  | YES         | 0
+ work_report_waste         | bulkbags                            | numeric                  | YES         | 0
+ work_report_waste         | cost_per_bag                        | numeric                  | YES         | 0
+ work_report_workers       | id                                  | bigint                   | NO          | 
+ work_report_workers       | work_report_id                      | bigint                   | NO          | 
+ work_report_workers       | user_id                             | bigint                   | YES         | 
+ work_report_workers       | worker_name                         | text                     | NO          | 
+ work_report_workers       | hours                               | numeric                  | NO          | 
+ work_report_workers       | hourly_rate                         | numeric                  | YES         | 0
+ work_report_workers       | total_price                         | numeric                  | YES         | 0
+ work_reports              | id                                  | bigint                   | NO          | 
+ work_reports              | tenant_id                           | integer                  | YES         | 1
+ work_reports              | client_id                           | bigint                   | NO          | 
+ work_reports              | property_id                         | bigint                   | YES         | 
+ work_reports              | job_id                              | bigint                   | YES         | 
+ work_reports              | work_date                           | date                     | NO          | 
+ work_reports              | total_hours                         | numeric                  | NO          | 
+ work_reports              | total_price                         | numeric                  | YES         | 0
+ work_reports              | currency                            | text                     | YES         | 'GBP'::text
+ work_reports              | notes                               | text                     | YES         | 
+ work_reports              | created_by                          | bigint                   | YES         | 
+ work_reports              | input_type                          | text                     | YES         | 'voice'::text
+ work_reports              | status                              | text                     | YES         | 'draft'::text
+ work_reports              | created_at                          | timestamp with time zone | YES         | now()
+ work_reports              | updated_at                          | timestamp with time zone | YES         | now()
+(429 rows)
+
