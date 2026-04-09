@@ -2319,7 +2319,7 @@ def validate_state_transition(current_status, new_status, rules, entity_name="en
     return None
 WORKSPACE_DEFAULTS = {
     "solo":     {"max_users":1,  "max_clients":500,  "max_jobs":100,  "max_voice":600},
-    "team":     {"max_users":5,  "max_clients":2000, "max_jobs":500,  "max_voice":3000},
+    "team":     {"max_users":10, "max_clients":2000, "max_jobs":500,  "max_voice":3000},
     "business": {"max_users":30, "max_clients":10000,"max_jobs":2000, "max_voice":10000},
 }
 LANGUAGE_PRESETS = {
