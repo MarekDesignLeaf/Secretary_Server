@@ -2224,6 +2224,74 @@ async def auth_me(user: dict = Depends(require_auth)):
         return dict(u)
     finally: release_conn(conn)
 
+@app.get("/auth/roles")
+async def auth_list_roles(admin: dict = Depends(require_role("admin"))):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT role_name, description FROM roles ORDER BY id")
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.get("/auth/users")
+async def auth_list_users(admin: dict = Depends(require_role("admin"))):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT u.id, u.display_name, u.email, u.phone, u.status,
+                r.role_name, u.created_at
+                FROM users u LEFT JOIN roles r ON u.role_id=r.id
+                WHERE u.tenant_id=%s AND u.deleted_at IS NULL
+                ORDER BY u.id""", (admin["tenant_id"],))
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.put("/auth/users/{user_id}")
+async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(require_role("admin"))):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL",
+                (user_id, admin["tenant_id"]))
+            if not cur.fetchone(): raise HTTPException(404, "User not found")
+            updates, params = [], []
+            if "display_name" in data:
+                updates.append("display_name=%s"); params.append(data["display_name"])
+            if "phone" in data:
+                updates.append("phone=%s"); params.append(data["phone"])
+            if "status" in data and data["status"] in ("active","inactive"):
+                updates.append("status=%s"); params.append(data["status"])
+            if "role" in data:
+                cur.execute("SELECT id FROM roles WHERE role_name=%s", (data["role"],))
+                row = cur.fetchone()
+                if not row: raise HTTPException(400, f"Unknown role: {data['role']}")
+                updates.append("role_id=%s"); params.append(row["id"])
+            if not updates: raise HTTPException(400, "Nothing to update")
+            updates.append("updated_at=now()")
+            params += [user_id, admin["tenant_id"]]
+            cur.execute(f"UPDATE users SET {','.join(updates)} WHERE id=%s AND tenant_id=%s", params)
+            conn.commit()
+        return {"ok": True}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.delete("/auth/users/{user_id}")
+async def auth_delete_user(user_id: int, admin: dict = Depends(require_role("admin"))):
+    if user_id == admin["user_id"]: raise HTTPException(400, "Cannot delete yourself")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL",
+                (user_id, admin["tenant_id"]))
+            if not cur.fetchone(): raise HTTPException(404, "User not found")
+            cur.execute("UPDATE users SET deleted_at=now(), status='inactive' WHERE id=%s", (user_id,))
+            conn.commit()
+        return {"ok": True}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
 @app.post("/auth/register")
 async def auth_register(data: dict, admin: dict = Depends(require_role("admin"))):
     """Admin-only: register new user."""
