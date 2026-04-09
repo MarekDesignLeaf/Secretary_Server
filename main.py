@@ -1676,8 +1676,16 @@ async def get_settings():
             cur.execute("SELECT COUNT(*) as cnt FROM jobs WHERE deleted_at IS NULL"); jc = cur.fetchone()['cnt']
             cur.execute("SELECT COUNT(*) as cnt FROM tasks"); tc = cur.fetchone()['cnt']
             cur.execute("SELECT COUNT(*) as cnt FROM leads"); lc = cur.fetchone()['cnt']
+            cur.execute("SELECT COUNT(*) as cnt FROM users WHERE deleted_at IS NULL"); uc = cur.fetchone()['cnt']
+            cur.execute("SELECT workspace_mode, max_active_users FROM tenant_operating_profile WHERE tenant_id=1")
+            op = cur.fetchone() or {}
+            cur.execute("SELECT max_users FROM subscription_limits WHERE tenant_id=1")
+            sl = cur.fetchone() or {}
             return {"company_name":"DesignLeaf","version":"1.2a","database":"PostgreSQL",
                     "clients_count":cc,"jobs_count":jc,"tasks_count":tc,"leads_count":lc,
+                    "users_count":uc,
+                    "workspace_mode":op.get("workspace_mode","solo"),
+                    "max_active_users":sl.get("max_users", op.get("max_active_users",1)),
                     "ai_configured":bool(OPENAI_API_KEY),"environment":os.getenv("RAILWAY_ENVIRONMENT","local")}
     except Exception as e: return {"company_name":"DesignLeaf","version":"1.2a","error":str(e)}
     finally: release_conn(conn)
