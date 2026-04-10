@@ -386,6 +386,12 @@ def resolve_voice_language(config, request_lang=None):
         return config.get("default_internal_lang", "en")
     return "en"
 
+def tr(lang, cs, en, pl=None):
+    """Return translated string based on language code (cs/en/pl)."""
+    if lang == "cs": return cs
+    if lang == "pl": return pl if pl is not None else en
+    return en
+
 # ========== TENANT GUARD ==========
 def verify_tenant(conn, tenant_id):
     """Verify tenant exists and is active. Raises HTTPException if not."""
@@ -541,8 +547,8 @@ RULES:
                         cid = cur.fetchone()['id']
                         log_activity(conn,"client",cid,"create",f"Klient {args['name']} vytvoren")
                         conn.commit()
-                    return {"reply_cs":f"Klient {args['name']} ({code}) je v CRM.","action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                    return {"reply_cs":tr(lang,f"Klient {args['name']} ({code}) je v CRM.",f"Client {args['name']} ({code}) added to CRM.",f"Klient {args['name']} ({code}) dodany do CRM."),"action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":tr(lang,f"Chyba: {e}",f"Error: {e}",f"Błąd: {e}")}
                 finally: release_conn(conn)
 
             if action == "SEARCH_CONTACTS":
@@ -555,7 +561,7 @@ RULES:
                         cur.execute("SELECT id,client_code,display_name,email_primary,phone_primary FROM clients WHERE deleted_at IS NULL AND (display_name ILIKE %s OR email_primary ILIKE %s OR phone_primary ILIKE %s) LIMIT 10",(s,s,s))
                         crm = [dict(r) for r in cur.fetchall()]
                 finally: release_conn(conn)
-                return {"reply_cs":ai_msg.content or f"Hledam '{q}'...","action_type":"SEARCH_CONTACTS","action_data":{"query":q,"crm_results":crm},"is_question":True}
+                return {"reply_cs":ai_msg.content or tr(lang,f"Hledám '{q}'...",f"Searching for '{q}'...",f"Szukam '{q}'..."),"action_type":"SEARCH_CONTACTS","action_data":{"query":q,"crm_results":crm},"is_question":True}
 
             if action == "CREATE_TASK":
                 t = args.get("title","Ukol")
@@ -571,8 +577,8 @@ RULES:
                         task = dict(cur.fetchone())
                         log_activity(conn,"task",tid,"create",f"Ukol '{t}' vytvoren")
                         conn.commit()
-                    return {"reply_cs":f"Vytvořila jsem úkol: {t}.","action_type":"CREATE_TASK","action_data":task}
-                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                    return {"reply_cs":tr(lang,f"Vytvořila jsem úkol: {t}.",f"Task created: {t}.",f"Zadanie utworzone: {t}."),"action_type":"CREATE_TASK","action_data":task}
+                except Exception as e: conn.rollback(); return {"reply_cs":tr(lang,f"Chyba: {e}",f"Error: {e}",f"Błąd: {e}")}
                 finally: release_conn(conn)
 
             if action == "CREATE_JOB":
@@ -592,8 +598,8 @@ RULES:
                         jid = cur.fetchone()['id']
                         log_activity(conn,"job",jid,"create",f"Zakazka '{t}' ({code}) vytvorena")
                         conn.commit()
-                    return {"reply_cs":f"Zakázka {code}: {t} vytvořena.","action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                    return {"reply_cs":tr(lang,f"Zakázka {code}: {t} vytvořena.",f"Job {code}: {t} created.",f"Zlecenie {code}: {t} utworzone."),"action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":tr(lang,f"Chyba: {e}",f"Error: {e}",f"Błąd: {e}")}
                 finally: release_conn(conn)
 
             if action == "CREATE_LEAD":
@@ -608,8 +614,8 @@ RULES:
                         lid = cur.fetchone()['id']
                         log_activity(conn,"lead",lid,"create",f"Lead '{n}' z {args.get('source','?')}")
                         conn.commit()
-                    return {"reply_cs":f"Lead {code} od {n} zaevidován.","action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                    return {"reply_cs":tr(lang,f"Lead {code} od {n} zaevidován.",f"Lead {code} from {n} registered.",f"Lead {code} od {n} zarejestrowany."),"action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":tr(lang,f"Chyba: {e}",f"Error: {e}",f"Błąd: {e}")}
                 finally: release_conn(conn)
 
             if action == "START_WORK_REPORT":
@@ -628,7 +634,7 @@ RULES:
                     with urllib.request.urlopen(geo_url, timeout=5) as r:
                         geo = json.loads(r.read())
                     if not geo.get("results"):
-                        return {"reply_cs": f"Lokalitu '{loc}' jsem nenašel. Zkus jiný název města."}
+                        return {"reply_cs": tr(lang,f"Lokalitu '{loc}' jsem nenašel. Zkus jiný název města.",f"Location '{loc}' not found. Try a different city name.",f"Nie znaleziono lokalizacji '{loc}'. Spróbuj innej nazwy miasta.")}
                     place = geo["results"][0]
                     lat, lon, name = place["latitude"], place["longitude"], place.get("name", loc)
                     # Fetch weather
@@ -639,15 +645,30 @@ RULES:
                     with urllib.request.urlopen(wx_url, timeout=8) as r:
                         wx = json.loads(r.read())
                     # Format daily summary
-                    wmo = {0:"☀️ Jasno",1:"🌤 Polojasno",2:"⛅ Oblačno",3:"☁️ Zataženo",45:"🌫 Mlha",48:"🌫 Námraza",
+                    wmo_cs = {0:"☀️ Jasno",1:"🌤 Polojasno",2:"⛅ Oblačno",3:"☁️ Zataženo",45:"🌫 Mlha",48:"🌫 Námraza",
                            51:"🌧 Mrholení",53:"🌧 Mrholení",55:"🌧 Mrholení",56:"🌧 Mrz. mrholení",57:"🌧 Mrz. mrholení",
                            61:"🌧 Déšť",63:"🌧 Střed. déšť",65:"🌧 Silný déšť",66:"🌧 Mrz. déšť",67:"🌧 Mrz. déšť",
                            71:"🌨 Sněžení",73:"🌨 Sněžení",75:"🌨 Silný sníh",77:"🌨 Krupky",
                            80:"🌦 Přeháňky",81:"🌦 Přeháňky",82:"🌦 Silné přeháňky",
                            85:"🌨 Sněh. přeháňky",86:"🌨 Sněh. přeháňky",
                            95:"⛈ Bouřka",96:"⛈ Bouřka s kroupami",99:"⛈ Silná bouřka"}
+                    wmo_en = {0:"☀️ Clear",1:"🌤 Mainly clear",2:"⛅ Partly cloudy",3:"☁️ Overcast",45:"🌫 Fog",48:"🌫 Icy fog",
+                           51:"🌧 Drizzle",53:"🌧 Drizzle",55:"🌧 Drizzle",56:"🌧 Freezing drizzle",57:"🌧 Freezing drizzle",
+                           61:"🌧 Rain",63:"🌧 Moderate rain",65:"🌧 Heavy rain",66:"🌧 Freezing rain",67:"🌧 Freezing rain",
+                           71:"🌨 Snow",73:"🌨 Snow",75:"🌨 Heavy snow",77:"🌨 Snow grains",
+                           80:"🌦 Showers",81:"🌦 Showers",82:"🌦 Heavy showers",
+                           85:"🌨 Snow showers",86:"🌨 Snow showers",
+                           95:"⛈ Thunderstorm",96:"⛈ Thunderstorm w/ hail",99:"⛈ Heavy thunderstorm"}
+                    wmo_pl = {0:"☀️ Bezchmurnie",1:"🌤 Przeważnie słonecznie",2:"⛅ Częściowe zachmurzenie",3:"☁️ Zachmurzenie",45:"🌫 Mgła",48:"🌫 Szron",
+                           51:"🌧 Mżawka",53:"🌧 Mżawka",55:"🌧 Mżawka",56:"🌧 Marznąca mżawka",57:"🌧 Marznąca mżawka",
+                           61:"🌧 Deszcz",63:"🌧 Umiarkowany deszcz",65:"🌧 Silny deszcz",66:"🌧 Marznący deszcz",67:"🌧 Marznący deszcz",
+                           71:"🌨 Śnieg",73:"🌨 Śnieg",75:"🌨 Intensywny śnieg",77:"🌨 Ziarna śniegu",
+                           80:"🌦 Przelotne opady",81:"🌦 Przelotne opady",82:"🌦 Intensywne przelotne opady",
+                           85:"🌨 Przelotny śnieg",86:"🌨 Przelotny śnieg",
+                           95:"⛈ Burza",96:"⛈ Burza z gradem",99:"⛈ Intensywna burza"}
+                    wmo = {"cs": wmo_cs, "pl": wmo_pl}.get(lang, wmo_en)
                     daily = wx.get("daily",{})
-                    lines = [f"📍 Počasí — {name} ({days} dní):"]
+                    lines = [tr(lang, f"📍 Počasí — {name} ({days} dní):", f"📍 Weather — {name} ({days} days):", f"📍 Pogoda — {name} ({days} dni):")]
                     for i, d in enumerate(daily.get("time",[])):
                         code = daily["weathercode"][i] if daily.get("weathercode") else 0
                         tmax = daily.get("temperature_2m_max",[None])[i]
@@ -655,11 +676,11 @@ RULES:
                         rain = daily.get("precipitation_sum",[None])[i]
                         rain_prob = daily.get("precipitation_probability_max",[None])[i]
                         wind = daily.get("windspeed_10m_max",[None])[i]
-                        desc = wmo.get(code, f"Kód {code}")
+                        desc = wmo.get(code, f"Code {code}")
                         line = f"\n{d}: {desc}, {tmin:.0f}–{tmax:.0f}°C"
-                        if rain and rain > 0: line += f", déšť {rain:.1f}mm"
+                        if rain and rain > 0: line += tr(lang, f", déšť {rain:.1f}mm", f", rain {rain:.1f}mm", f", deszcz {rain:.1f}mm")
                         if rain_prob: line += f" ({rain_prob}%)"
-                        if wind: line += f", vítr {wind:.0f} km/h"
+                        if wind: line += tr(lang, f", vítr {wind:.0f} km/h", f", wind {wind:.0f} km/h", f", wiatr {wind:.0f} km/h")
                         lines.append(line)
                     # Add hourly for today
                     hourly = wx.get("hourly",{})
@@ -668,7 +689,7 @@ RULES:
                     h_rain = hourly.get("precipitation_probability",[])
                     h_codes = hourly.get("weathercode",[])
                     if h_times:
-                        lines.append("\n⏰ Hodinová předpověď dnes:")
+                        lines.append(tr(lang, "\n⏰ Hodinová předpověď dnes:", "\n⏰ Hourly forecast today:", "\n⏰ Prognoza godzinowa dziś:"))
                         today_str = daily.get("time",[""])[0]
                         for j, ht in enumerate(h_times[:24]):
                             if today_str in ht:
@@ -678,11 +699,11 @@ RULES:
                                     rp = h_rain[j] if j < len(h_rain) else 0
                                     cd = h_codes[j] if j < len(h_codes) else 0
                                     emoji = wmo.get(cd,"")[:2]
-                                    lines.append(f"  {hour} {emoji} {t:.0f}°C, déšť {rp}%")
+                                    lines.append(tr(lang, f"  {hour} {emoji} {t:.0f}°C, déšť {rp}%", f"  {hour} {emoji} {t:.0f}°C, rain {rp}%", f"  {hour} {emoji} {t:.0f}°C, deszcz {rp}%"))
                     reply = "\n".join(lines)
                     return {"reply_cs": reply}
                 except Exception as e:
-                    return {"reply_cs": f"Nepodařilo se načíst počasí: {e}"}
+                    return {"reply_cs": tr(lang, f"Nepodařilo se načíst počasí: {e}", f"Failed to load weather: {e}", f"Nie udało się pobrać pogody: {e}")}
 
             if action == "SEND_WHATSAPP":
                 client_name = args.get("client_name","")
@@ -694,24 +715,24 @@ RULES:
                         client = cur.fetchone()
                     if not client:
                         release_conn(conn)
-                        return {"reply_cs": f"Klienta '{client_name}' jsem nenašel v CRM."}
+                        return {"reply_cs": tr(lang, f"Klienta '{client_name}' jsem nenašel v CRM.", f"Client '{client_name}' not found in CRM.", f"Nie znalazłem klienta '{client_name}' w CRM.")}
                     phone = client["phone_primary"]
                     if not phone:
                         release_conn(conn)
-                        return {"reply_cs": f"Klient {client['display_name']} nemá telefonní číslo."}
+                        return {"reply_cs": tr(lang, f"Klient {client['display_name']} nemá telefonní číslo.", f"Client {client['display_name']} has no phone number.", f"Klient {client['display_name']} nie ma numeru telefonu.")}
                     result = wa_send_message(phone, message)
                     if "error" in result:
                         release_conn(conn)
-                        return {"reply_cs": f"WhatsApp se nepodařilo odeslat: {result.get('error','')}"}
+                        return {"reply_cs": tr(lang, f"WhatsApp se nepodařilo odeslat: {result.get('error','')}", f"WhatsApp failed to send: {result.get('error','')}", f"Nie udało się wysłać WhatsApp: {result.get('error','')}")}
                     with conn.cursor() as cur:
                         cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
                             VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
                             (client["id"], message[:500], f"To: {phone}"))
                     log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']}: {message[:100]}")
                     conn.commit()
-                    return {"reply_cs": f"✅ WhatsApp zpráva odeslána klientovi {client['display_name']} na {phone}.", "action_type":"WHATSAPP_SENT","action_data":{"client_name":client["display_name"],"phone":phone}}
+                    return {"reply_cs": tr(lang, f"✅ WhatsApp zpráva odeslána klientovi {client['display_name']} na {phone}.", f"✅ WhatsApp message sent to {client['display_name']} at {phone}.", f"✅ Wiadomość WhatsApp wysłana do {client['display_name']} na {phone}."), "action_type":"WHATSAPP_SENT","action_data":{"client_name":client["display_name"],"phone":phone}}
                 except Exception as e:
-                    return {"reply_cs": f"Chyba při odesílání WhatsApp: {e}"}
+                    return {"reply_cs": tr(lang, f"Chyba při odesílání WhatsApp: {e}", f"Error sending WhatsApp: {e}", f"Błąd podczas wysyłania WhatsApp: {e}")}
                 finally: release_conn(conn)
 
             if action == "QUERY_CLIENTS":
@@ -744,19 +765,19 @@ RULES:
                         cur.execute("SELECT COUNT(*) as cnt FROM tasks WHERE tenant_id=1")
                         stats["total_tasks"] = cur.fetchone()["cnt"]
                     # Build human-readable answer
-                    lines = [f"📊 Databáze CRM:"]
-                    lines.append(f"Klientů celkem: {stats['total_clients']}")
-                    if stats["by_status"]: lines.append(f"Podle stavu: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}")
-                    if stats["by_source"]: lines.append(f"Podle zdroje: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}")
-                    if stats["by_type"]: lines.append(f"Podle typu: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}")
-                    lines.append(f"Zakázek: {stats['total_jobs']}, Leadů: {stats['total_leads']}, Faktur: {stats['total_invoices']}, Úkolů: {stats['total_tasks']}")
+                    lines = [tr(lang, "📊 Databáze CRM:", "📊 CRM Database:", "📊 Baza CRM:")]
+                    lines.append(tr(lang, f"Klientů celkem: {stats['total_clients']}", f"Total clients: {stats['total_clients']}", f"Klientów łącznie: {stats['total_clients']}"))
+                    if stats["by_status"]: lines.append(tr(lang, f"Podle stavu: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}", f"By status: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}", f"Według statusu: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}"))
+                    if stats["by_source"]: lines.append(tr(lang, f"Podle zdroje: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}", f"By source: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}", f"Według źródła: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}"))
+                    if stats["by_type"]: lines.append(tr(lang, f"Podle typu: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}", f"By type: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}", f"Według typu: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}"))
+                    lines.append(tr(lang, f"Zakázek: {stats['total_jobs']}, Leadů: {stats['total_leads']}, Faktur: {stats['total_invoices']}, Úkolů: {stats['total_tasks']}", f"Jobs: {stats['total_jobs']}, Leads: {stats['total_leads']}, Invoices: {stats['total_invoices']}, Tasks: {stats['total_tasks']}", f"Zleceń: {stats['total_jobs']}, Leadów: {stats['total_leads']}, Faktur: {stats['total_invoices']}, Zadań: {stats['total_tasks']}"))
                     if stats["recent_5"]:
-                        lines.append("Posledních 5 klientů:")
+                        lines.append(tr(lang, "Posledních 5 klientů:", "Last 5 clients:", "Ostatnich 5 klientów:"))
                         for c in stats["recent_5"]:
                             lines.append(f"  - {c['display_name']} ({c.get('source','?')}) {c.get('phone_primary','')}")
                     return {"reply_cs": "\n".join(lines)}
                 except Exception as e:
-                    return {"reply_cs": f"Chyba při dotazu na databázi: {e}"}
+                    return {"reply_cs": tr(lang, f"Chyba při dotazu na databázi: {e}", f"Error querying database: {e}", f"Błąd podczas zapytania do bazy danych: {e}")}
                 finally: release_conn(conn)
 
             if action == "ADD_NOTE":
@@ -772,7 +793,7 @@ RULES:
                             if row:
                                 cur.execute("INSERT INTO client_notes (client_id,note) VALUES (%s,%s)",(row['id'],note))
                                 log_activity(conn,"client",row['id'],"note",f"Poznamka: {note[:50]}")
-                            else: return {"reply_cs":f"Klient '{ename}' nenalezen."}
+                            else: return {"reply_cs":tr(lang,f"Klient '{ename}' nenalezen.",f"Client '{ename}' not found.",f"Nie znaleziono klienta '{ename}'.")}
                         elif etype == "job":
                             ename = args.get("entity_name","")
                             cur.execute("SELECT id FROM jobs WHERE job_title ILIKE %s AND deleted_at IS NULL LIMIT 1",(f"%{ename}%",))
@@ -780,10 +801,10 @@ RULES:
                             if row:
                                 cur.execute("INSERT INTO job_notes (job_id,note) VALUES (%s,%s)",(row['id'],note))
                                 log_activity(conn,"job",row['id'],"note",f"Poznamka: {note[:50]}")
-                            else: return {"reply_cs":f"Zakazka '{ename}' nenalezena."}
+                            else: return {"reply_cs":tr(lang,f"Zakázka '{ename}' nenalezena.",f"Job '{ename}' not found.",f"Nie znaleziono zlecenia '{ename}'.")}
                         conn.commit()
-                    return {"reply_cs":f"Poznámka přidána.","action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                    return {"reply_cs":tr(lang,"Poznámka přidána.","Note added.","Notatka dodana."),"action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":tr(lang,f"Chyba: {e}",f"Error: {e}",f"Błąd: {e}")}
                 finally: release_conn(conn)
 
             if action == "UPDATE_TASK":
@@ -793,7 +814,7 @@ RULES:
                     with conn.cursor() as cur:
                         cur.execute("SELECT id,title FROM tasks WHERE title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
                         row = cur.fetchone()
-                        if not row: return {"reply_cs":f"Úkol '{title_q}' nenalezen."}
+                        if not row: return {"reply_cs":tr(lang,f"Úkol '{title_q}' nenalezen.",f"Task '{title_q}' not found.",f"Zadanie '{title_q}' nie znalezione.")}
                         sets = []; vals = []
                         if "status" in args: sets.append("status=%s"); vals.append(args["status"])
                         if "priority" in args: sets.append("priority=%s"); vals.append(args["priority"])
@@ -804,8 +825,8 @@ RULES:
                             log_activity(conn,"task",row['id'],"update",f"Ukol '{row['title']}' upraven")
                             conn.commit()
                         changes = ", ".join([f"{k}={v}" for k,v in args.items() if k != "title"])
-                    return {"reply_cs":f"Úkol '{row['title']}' upraven: {changes}.","action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                    return {"reply_cs":tr(lang,f"Úkol '{row['title']}' upraven: {changes}.",f"Task '{row['title']}' updated: {changes}.",f"Zadanie '{row['title']}' zaktualizowane: {changes}."),"action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":tr(lang,f"Chyba: {e}",f"Error: {e}",f"Błąd: {e}")}
                 finally: release_conn(conn)
 
             if action == "UPDATE_JOB":
@@ -815,15 +836,15 @@ RULES:
                     with conn.cursor() as cur:
                         cur.execute("SELECT id,job_title,job_status FROM jobs WHERE job_title ILIKE %s AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
                         row = cur.fetchone()
-                        if not row: return {"reply_cs":f"Zakázka '{title_q}' nenalezena."}
+                        if not row: return {"reply_cs":tr(lang,f"Zakázka '{title_q}' nenalezena.",f"Job '{title_q}' not found.",f"Nie znaleziono zlecenia '{title_q}'.")}
                         new_status = args.get("status",row['job_status'])
                         err = validate_state_transition(row['job_status'], new_status, JOB_TRANSITIONS, "Job")
-                        if err: return {"reply_cs":f"Neplatný přechod: {err}"}
+                        if err: return {"reply_cs":tr(lang,f"Neplatný přechod: {err}",f"Invalid transition: {err}",f"Nieprawidłowe przejście: {err}")}
                         cur.execute("UPDATE jobs SET job_status=%s,updated_at=now() WHERE id=%s",(new_status,row['id']))
                         log_activity(conn,"job",row['id'],"status_change",f"Zakazka '{row['job_title']}': {row['job_status']} -> {new_status}")
                         conn.commit()
-                    return {"reply_cs":f"Zakázka '{row['job_title']}' změněna na: {new_status}.","action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                    return {"reply_cs":tr(lang,f"Zakázka '{row['job_title']}' změněna na: {new_status}.",f"Job '{row['job_title']}' changed to: {new_status}.",f"Zlecenie '{row['job_title']}' zmieniono na: {new_status}."),"action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":tr(lang,f"Chyba: {e}",f"Error: {e}",f"Błąd: {e}")}
                 finally: release_conn(conn)
 
             if action == "LIST_TASKS":
@@ -838,9 +859,10 @@ RULES:
                         sql += " ORDER BY CASE priority WHEN 'kriticka' THEN 1 WHEN 'urgentni' THEN 2 WHEN 'vysoka' THEN 3 ELSE 4 END LIMIT 15"
                         cur.execute(sql,params)
                         rows = cur.fetchall()
-                    if not rows: return {"reply_cs":"Nemáš žádné aktivní úkoly."}
-                    items = [f"- {r['title']} ({r['priority']}, {r['status']})" + (f" klient: {r['client_name']}" if r.get('client_name') else "") + (f" DL: {r['deadline']}" if r.get('deadline') else "") for r in rows]
-                    return {"reply_cs":f"Máš {len(rows)} úkolů:\n" + "\n".join(items),"action_type":"LIST_TASKS"}
+                    if not rows: return {"reply_cs":tr(lang,"Nemáš žádné aktivní úkoly.","You have no active tasks.","Nie masz żadnych aktywnych zadań.")}
+                    client_lbl = tr(lang,"klient","client","klient")
+                    items = [f"- {r['title']} ({r['priority']}, {r['status']})" + (f" {client_lbl}: {r['client_name']}" if r.get('client_name') else "") + (f" DL: {r['deadline']}" if r.get('deadline') else "") for r in rows]
+                    return {"reply_cs":tr(lang,f"Máš {len(rows)} úkolů:\n",f"You have {len(rows)} tasks:\n",f"Masz {len(rows)} zadań:\n") + "\n".join(items),"action_type":"LIST_TASKS"}
                 finally: release_conn(conn)
 
             if action == "COMPLETE_TASK":
@@ -850,29 +872,29 @@ RULES:
                     with conn.cursor() as cur:
                         cur.execute("SELECT id,title FROM tasks WHERE title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
                         row = cur.fetchone()
-                        if not row: return {"reply_cs":f"Úkol '{title_q}' nenalezen nebo už je hotový."}
-                        result = args.get("result","Dokončeno")
+                        if not row: return {"reply_cs":tr(lang,f"Úkol '{title_q}' nenalezen nebo už je hotový.",f"Task '{title_q}' not found or already completed.",f"Zadanie '{title_q}' nie znalezione lub już ukończone.")}
+                        result = args.get("result",tr(lang,"Dokončeno","Completed","Zakończono"))
                         cur.execute("UPDATE tasks SET status='hotovo',is_completed=TRUE,result=%s,updated_at=now() WHERE id=%s",(result,row['id']))
                         log_activity(conn,"task",row['id'],"complete",f"Ukol '{row['title']}' dokoncen: {result}")
                         conn.commit()
-                    return {"reply_cs":f"Úkol '{row['title']}' dokončen. Výsledek: {result}","action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
+                    return {"reply_cs":tr(lang,f"Úkol '{row['title']}' dokončen. Výsledek: {result}",f"Task '{row['title']}' completed. Result: {result}",f"Zadanie '{row['title']}' ukończone. Wynik: {result}"),"action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":tr(lang,f"Chyba: {e}",f"Error: {e}",f"Błąd: {e}")}
                 finally: release_conn(conn)
 
             # === CLIENT-SIDE ACTIONS (passthrough to Android) ===
             human = {
-                "ADD_CALENDAR_EVENT": f"Zapisuji {args.get('title','')} do kalendáře.",
-                "MODIFY_CALENDAR_EVENT": f"Měním událost {args.get('event_title','')}.",
-                "DELETE_CALENDAR_EVENT": f"Mažu událost {args.get('event_title','')}.",
-                "LIST_CALENDAR_EVENTS": "Podívám se do kalendáře.",
-                "CALL_CONTACT": f"Vytáčím {args.get('phone','')}.",
-                "SEND_EMAIL": f"Posílám email na {args.get('to','')}.",
+                "ADD_CALENDAR_EVENT": tr(lang, f"Zapisuji {args.get('title','')} do kalendáře.", f"Adding {args.get('title','')} to calendar.", f"Dodaję {args.get('title','')} do kalendarza."),
+                "MODIFY_CALENDAR_EVENT": tr(lang, f"Měním událost {args.get('event_title','')}.", f"Modifying event {args.get('event_title','')}.", f"Zmieniam wydarzenie {args.get('event_title','')}." ),
+                "DELETE_CALENDAR_EVENT": tr(lang, f"Mažu událost {args.get('event_title','')}.", f"Deleting event {args.get('event_title','')}.", f"Usuwam wydarzenie {args.get('event_title','')}." ),
+                "LIST_CALENDAR_EVENTS": tr(lang, "Podívám se do kalendáře.", "Looking at the calendar.", "Sprawdzam kalendarz."),
+                "CALL_CONTACT": tr(lang, f"Vytáčím {args.get('phone','')}.", f"Dialling {args.get('phone','')}.", f"Wybieram numer {args.get('phone','')}." ),
+                "SEND_EMAIL": tr(lang, f"Posílám email na {args.get('to','')}.", f"Sending email to {args.get('to','')}.", f"Wysyłam email do {args.get('to','')}." ),
             }
-            reply = ai_msg.content or human.get(action, f"Hotovo.")
+            reply = ai_msg.content or human.get(action, tr(lang, "Hotovo.", "Done.", "Gotowe."))
             return {"reply_cs":reply,"action_type":action,"action_data":args}
 
         # No tool call — plain text reply
-        reply = ai_msg.content or "Rozumím."
+        reply = ai_msg.content or tr(lang, "Rozumím.", "Understood.", "Rozumiem.")
         # Fallback: if reply mentions work report but GPT didn't call tool, force it
         wr_kw = ["work report","výkaz","vykaz","nahlášení práce","nahlaseni prace","zapsat práci","zapsat praci","raport pracy","zahajuji proces"]
         if any(kw in (reply + " " + msg.text).lower() for kw in wr_kw):
@@ -880,7 +902,8 @@ RULES:
         return {"reply_cs":reply,"is_question":"?" in reply}
     except Exception as e:
         import traceback; traceback.print_exc()
-        return {"reply_cs":f"Chyba: {type(e).__name__}: {str(e)}"}
+        _lang = locals().get("lang", "en")
+        return {"reply_cs":tr(_lang,f"Chyba: {type(e).__name__}: {str(e)}",f"Error: {type(e).__name__}: {str(e)}",f"Błąd: {type(e).__name__}: {str(e)}")}
 
 # ========== REST API: CLIENTS ==========
 @app.get("/crm/clients")
