@@ -15,6 +15,10 @@ async def get_clients():
         r.raise_for_status()
         return r.json()
 
+@app.get("/")
+async def root():
+    return {"ok": True, "mcp": "/mcp", "api_base_url": API_BASE_URL}
+
 @app.get("/health")
 async def health():
     return {"ok": True}
