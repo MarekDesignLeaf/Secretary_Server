@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import uvicorn
 from openai import OpenAI
 from datetime import datetime, timedelta
@@ -30,6 +30,129 @@ JWT_REFRESH_EXPIRE_DAYS = 30
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
 PROTECTED_PREFIXES = ["/crm/", "/process", "/voice/", "/work-reports"]
 PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
+
+PERMISSION_DEFINITIONS = [
+    {"permission_code": "crm_read", "module_name": "crm", "name": "View CRM", "description": "Read clients, jobs, leads and invoices."},
+    {"permission_code": "crm_write", "module_name": "crm", "name": "Edit CRM", "description": "Create and update CRM records."},
+    {"permission_code": "crm_delete", "module_name": "crm", "name": "Delete CRM", "description": "Delete CRM records."},
+    {"permission_code": "calendar_read", "module_name": "calendar", "name": "View calendar", "description": "Read calendar data and availability."},
+    {"permission_code": "calendar_write", "module_name": "calendar", "name": "Edit calendar", "description": "Create and update calendar entries."},
+    {"permission_code": "contacts_read", "module_name": "contacts", "name": "View contacts", "description": "Read synced contacts and client contact details."},
+    {"permission_code": "contacts_write", "module_name": "contacts", "name": "Edit contacts", "description": "Create and update contact records."},
+    {"permission_code": "voice_commands", "module_name": "assistant", "name": "Voice commands", "description": "Use voice commands and guided voice workflows."},
+    {"permission_code": "settings_access", "module_name": "settings", "name": "Settings access", "description": "Open and change application settings."},
+    {"permission_code": "import_data", "module_name": "data", "name": "Import data", "description": "Run imports and ingest external data."},
+    {"permission_code": "export_data", "module_name": "data", "name": "Export data", "description": "Export CRM and operational data."},
+    {"permission_code": "manage_users", "module_name": "users", "name": "Manage users", "description": "Create users, edit rights and remove users."},
+]
+
+ROLE_PERMISSION_DEFAULTS = {
+    "admin": {
+        "crm_read": True,
+        "crm_write": True,
+        "crm_delete": True,
+        "calendar_read": True,
+        "calendar_write": True,
+        "contacts_read": True,
+        "contacts_write": True,
+        "voice_commands": True,
+        "settings_access": True,
+        "import_data": True,
+        "export_data": True,
+        "manage_users": True,
+    },
+    "manager": {
+        "crm_read": True,
+        "crm_write": True,
+        "crm_delete": False,
+        "calendar_read": True,
+        "calendar_write": True,
+        "contacts_read": True,
+        "contacts_write": True,
+        "voice_commands": True,
+        "settings_access": True,
+        "import_data": True,
+        "export_data": True,
+        "manage_users": False,
+    },
+    "worker": {
+        "crm_read": True,
+        "crm_write": False,
+        "crm_delete": False,
+        "calendar_read": True,
+        "calendar_write": True,
+        "contacts_read": True,
+        "contacts_write": False,
+        "voice_commands": True,
+        "settings_access": False,
+        "import_data": False,
+        "export_data": False,
+        "manage_users": False,
+    },
+    "assistant": {
+        "crm_read": True,
+        "crm_write": True,
+        "crm_delete": False,
+        "calendar_read": True,
+        "calendar_write": True,
+        "contacts_read": True,
+        "contacts_write": True,
+        "voice_commands": True,
+        "settings_access": True,
+        "import_data": False,
+        "export_data": False,
+        "manage_users": False,
+    },
+    "viewer": {
+        "crm_read": True,
+        "crm_write": False,
+        "crm_delete": False,
+        "calendar_read": True,
+        "calendar_write": False,
+        "contacts_read": True,
+        "contacts_write": False,
+        "voice_commands": False,
+        "settings_access": False,
+        "import_data": False,
+        "export_data": False,
+        "manage_users": False,
+    },
+}
+
+ALL_PERMISSION_CODES = [p["permission_code"] for p in PERMISSION_DEFINITIONS]
+
+CLIENT_SERVICE_RATE_KEYS = [
+    "garden_maintenance",
+    "hedge_trimming",
+    "arborist_works",
+    "hourly_rate",
+    "garden_waste_bulkbag",
+    "minimum_charge",
+]
+
+VISIBLE_CLIENT_SERVICE_RATE_KEYS = [
+    "garden_maintenance",
+    "hedge_trimming",
+    "arborist_works",
+    "garden_waste_bulkbag",
+    "minimum_charge",
+]
+
+SERVICE_RATE_DEFAULTS = {
+    "garden_maintenance": 27.0,
+    "hedge_trimming": 31.0,
+    "arborist_works": 34.0,
+    "hourly_rate": 27.0,
+    "garden_waste_bulkbag": 55.0,
+    "minimum_charge": 150.0,
+}
+
+DEFAULT_CONTACT_SECTIONS = [
+    ("employee", "Zaměstnanec", 10),
+    ("subcontractor", "Subkontraktor", 20),
+    ("material_supplier", "Dodavatel materiálu", 30),
+    ("equipment_vehicle_rental", "Půjčovny nářadí a aut", 40),
+]
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -61,6 +184,23 @@ def get_request_tenant_id(request: Request) -> int:
     """Extract tenant_id from authenticated request. Falls back to 1."""
     try: return request.state.user.get("tenant_id", 1)
     except: return 1
+
+def get_request_user_payload(request: Request) -> dict:
+    try:
+        return request.state.user
+    except Exception:
+        raise HTTPException(401, "Authentication required")
+
+def ensure_request_permissions(request: Request, *permission_codes) -> dict:
+    user = get_request_user_payload(request)
+    conn = get_db_conn()
+    try:
+        permissions = get_effective_permissions(conn, user["tenant_id"], user["user_id"], user.get("role"))
+        if not all(permissions.get(code, False) for code in permission_codes):
+            raise HTTPException(403, "Permission denied")
+        return user
+    finally:
+        release_conn(conn)
 
 def check_subscription_limit(conn, tenant_id, resource_type):
     """Check if tenant has reached subscription limit. Returns (ok, message)."""
@@ -94,14 +234,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_type TEXT DEFAULT 'interni_poznamka', status TEXT DEFAULT 'novy',
     priority TEXT DEFAULT 'bezna', created_at TIMESTAMPTZ DEFAULT now(),
     deadline TEXT, planned_date TEXT, time_window_start TEXT, time_window_end TEXT,
+    planned_start_at TIMESTAMPTZ, planned_end_at TIMESTAMPTZ,
     estimated_minutes INT, actual_minutes INT, created_by TEXT, assigned_to TEXT,
+    assigned_user_id BIGINT, planning_note TEXT, reminder_for_assignee_only BOOLEAN DEFAULT TRUE,
     delegated_by TEXT, client_id BIGINT, client_name TEXT, job_id BIGINT,
     property_id BIGINT, property_address TEXT, is_recurring BOOLEAN DEFAULT FALSE,
     recurrence_rule TEXT, result TEXT, notes JSONB DEFAULT '[]',
     communication_method TEXT, source TEXT DEFAULT 'manualne',
     is_billable BOOLEAN DEFAULT FALSE, has_cost BOOLEAN DEFAULT FALSE,
     waiting_for_payment BOOLEAN DEFAULT FALSE, checklist JSONB DEFAULT '[]',
-    is_completed BOOLEAN DEFAULT FALSE, updated_at TIMESTAMPTZ DEFAULT now()
+    is_completed BOOLEAN DEFAULT FALSE, calendar_sync_enabled BOOLEAN DEFAULT TRUE,
+    tenant_id INT NOT NULL DEFAULT 1, updated_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS client_notes (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -178,6 +321,52 @@ CREATE TABLE IF NOT EXISTS pricing_rules (
     rule_key TEXT, rate DECIMAL NOT NULL,
     currency TEXT DEFAULT 'GBP', created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS user_contact_sync (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT NOT NULL DEFAULT 1,
+    user_id BIGINT NOT NULL,
+    contact_key TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    phone_primary TEXT,
+    email_primary TEXT,
+    normalized_phone TEXT,
+    normalized_email TEXT,
+    is_client BOOLEAN NOT NULL DEFAULT FALSE,
+    linked_client_id BIGINT,
+    last_seen_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    CONSTRAINT uq_user_contact_sync UNIQUE (tenant_id, user_id, contact_key)
+);
+CREATE TABLE IF NOT EXISTS contact_sections (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT NOT NULL DEFAULT 1,
+    section_code TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    sort_order INT NOT NULL DEFAULT 100,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    CONSTRAINT uq_contact_sections UNIQUE (tenant_id, section_code)
+);
+CREATE TABLE IF NOT EXISTS shared_contacts (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT NOT NULL DEFAULT 1,
+    section_code TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    company_name TEXT,
+    phone_primary TEXT,
+    email_primary TEXT,
+    notes TEXT,
+    source TEXT DEFAULT 'manual',
+    normalized_phone TEXT,
+    normalized_email TEXT,
+    created_by BIGINT,
+    updated_by BIGINT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+);
 DO $$ BEGIN
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name TEXT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email TEXT;
@@ -197,6 +386,21 @@ DO $$ BEGIN
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS user_id_ref TEXT;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_user_id BIGINT;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_to TEXT;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS planned_start_at TIMESTAMPTZ;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS planned_end_at TIMESTAMPTZ;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS handover_note TEXT;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS handed_over_by TEXT;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS handed_over_at TIMESTAMPTZ;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS calendar_sync_enabled BOOLEAN DEFAULT TRUE;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id INT NOT NULL DEFAULT 1;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assigned_user_id BIGINT;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS planning_note TEXT;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS planned_start_at TIMESTAMPTZ;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS planned_end_at TIMESTAMPTZ;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_for_assignee_only BOOLEAN DEFAULT TRUE;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS calendar_sync_enabled BOOLEAN DEFAULT TRUE;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quote_title TEXT;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS valid_until DATE;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS notes TEXT;
@@ -261,6 +465,14 @@ def init_pool():
             db_pool.putconn(conn2)
             print("Roles seeded")
         except Exception as e: print(f"Role seed: {e}")
+        try:
+            conn_perm = db_pool.getconn()
+            with conn_perm.cursor() as cur:
+                cur.execute("SET search_path TO crm, public")
+            seed_permissions(conn_perm)
+            db_pool.putconn(conn_perm)
+            print("Permissions seeded")
+        except Exception as e: print(f"Permission seed: {e}")
         # Seed default service rates
         try:
             conn3 = db_pool.getconn()
@@ -281,6 +493,23 @@ def init_pool():
             db_pool.putconn(conn3)
             print("Service rates seeded")
         except Exception as e: print(f"Rate seed: {e}")
+        try:
+            conn_sections = db_pool.getconn()
+            with conn_sections.cursor() as cur:
+                cur.execute("SET search_path TO crm, public")
+                for section_code, display_name, sort_order in DEFAULT_CONTACT_SECTIONS:
+                    cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order)
+                        VALUES (1, %s, %s, TRUE, %s)
+                        ON CONFLICT (tenant_id, section_code) DO UPDATE SET
+                            display_name=EXCLUDED.display_name,
+                            sort_order=EXCLUDED.sort_order,
+                            is_active=TRUE,
+                            updated_at=now()""",
+                        (section_code, display_name, sort_order))
+                conn_sections.commit()
+            db_pool.putconn(conn_sections)
+            print("Contact sections seeded")
+        except Exception as e: print(f"Contact section seed: {e}")
     except Exception as e: print(f"DB pool FAIL: {e}")
 
 def get_db_conn():
@@ -318,6 +547,199 @@ def db_conn():
         yield c
     finally:
         release_conn(c)
+
+def complete_permission_map(values: Optional[Dict[str, Any]] = None) -> Dict[str, bool]:
+    src = values or {}
+    return {code: bool(src.get(code, False)) for code in ALL_PERMISSION_CODES}
+
+def default_permissions_for_role(role_name: Optional[str]) -> Dict[str, bool]:
+    key = (role_name or "viewer").lower()
+    return complete_permission_map(ROLE_PERMISSION_DEFAULTS.get(key, ROLE_PERMISSION_DEFAULTS["viewer"]))
+
+def normalize_permission_payload(raw: Any) -> Dict[str, bool]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized = {}
+    for code, value in raw.items():
+        if code in ALL_PERMISSION_CODES:
+            normalized[code] = bool(value)
+    return normalized
+
+def ensure_permission_tables(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS permissions (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                permission_code TEXT NOT NULL UNIQUE,
+                module_name TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                role_id BIGINT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                permission_id BIGINT NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+                allowed BOOLEAN NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                updated_at TIMESTAMPTZ DEFAULT now(),
+                CONSTRAINT uq_role_permissions UNIQUE (role_id, permission_id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_permission_overrides (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                permission_id BIGINT NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+                allowed BOOLEAN NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                updated_at TIMESTAMPTZ DEFAULT now(),
+                CONSTRAINT uq_user_permission_overrides UNIQUE (user_id, permission_id)
+            )
+        """)
+    conn.commit()
+
+def seed_permissions(conn):
+    ensure_permission_tables(conn)
+    with conn.cursor() as cur:
+        for permission in PERMISSION_DEFINITIONS:
+            cur.execute("""
+                INSERT INTO permissions (permission_code, module_name, name, description, updated_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (permission_code) DO UPDATE SET
+                    module_name = EXCLUDED.module_name,
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    updated_at = now()
+            """, (
+                permission["permission_code"],
+                permission["module_name"],
+                permission["name"],
+                permission["description"],
+            ))
+        cur.execute("SELECT id, permission_code FROM permissions")
+        permission_ids = {row["permission_code"]: row["id"] for row in cur.fetchall()}
+        for role_name, defaults in ROLE_PERMISSION_DEFAULTS.items():
+            cur.execute("SELECT id FROM roles WHERE role_name=%s", (role_name,))
+            role_row = cur.fetchone()
+            if not role_row:
+                continue
+            for permission_code in ALL_PERMISSION_CODES:
+                permission_id = permission_ids.get(permission_code)
+                if permission_id is None:
+                    continue
+                cur.execute("""
+                    INSERT INTO role_permissions (role_id, permission_id, allowed, updated_at)
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (role_id, permission_id) DO UPDATE SET
+                        allowed = EXCLUDED.allowed,
+                        updated_at = now()
+                """, (role_row["id"], permission_id, bool(defaults.get(permission_code, False))))
+    conn.commit()
+
+def load_permission_catalog(conn) -> List[Dict[str, Any]]:
+    ensure_permission_tables(conn)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT permission_code, module_name, name, description
+            FROM permissions
+            ORDER BY module_name, id
+        """)
+        return [dict(row) for row in cur.fetchall()]
+
+def load_role_permission_maps(conn) -> Dict[str, Dict[str, bool]]:
+    ensure_permission_tables(conn)
+    role_maps: Dict[str, Dict[str, bool]] = {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT r.role_name, p.permission_code, rp.allowed
+            FROM role_permissions rp
+            JOIN roles r ON r.id = rp.role_id
+            JOIN permissions p ON p.id = rp.permission_id
+        """)
+        for row in cur.fetchall():
+            role_name = (row["role_name"] or "viewer").lower()
+            role_maps.setdefault(role_name, {})[row["permission_code"]] = bool(row["allowed"])
+    for role_name in ROLE_PERMISSION_DEFAULTS.keys():
+        merged = default_permissions_for_role(role_name)
+        merged.update(role_maps.get(role_name, {}))
+        role_maps[role_name] = merged
+    return role_maps
+
+def load_user_permission_overrides(conn, tenant_id: int, user_ids: Optional[List[int]] = None) -> Dict[int, Dict[str, bool]]:
+    ensure_permission_tables(conn)
+    params: List[Any] = [tenant_id]
+    user_filter = ""
+    if user_ids:
+        user_filter = " AND u.id = ANY(%s)"
+        params.append(user_ids)
+    overrides: Dict[int, Dict[str, bool]] = {}
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT u.id AS user_id, p.permission_code, upo.allowed
+            FROM user_permission_overrides upo
+            JOIN users u ON u.id = upo.user_id
+            JOIN permissions p ON p.id = upo.permission_id
+            WHERE u.tenant_id = %s AND u.deleted_at IS NULL{user_filter}
+        """, params)
+        for row in cur.fetchall():
+            overrides.setdefault(int(row["user_id"]), {})[row["permission_code"]] = bool(row["allowed"])
+    return overrides
+
+def get_effective_permissions(conn, tenant_id: int, user_id: int, role_name: Optional[str] = None) -> Dict[str, bool]:
+    resolved_role = role_name
+    if not resolved_role:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT r.role_name
+                FROM users u
+                LEFT JOIN roles r ON r.id = u.role_id
+                WHERE u.id=%s AND u.tenant_id=%s AND u.deleted_at IS NULL
+            """, (user_id, tenant_id))
+            row = cur.fetchone()
+            resolved_role = row["role_name"] if row else "viewer"
+    role_permissions = load_role_permission_maps(conn).get((resolved_role or "viewer").lower(), default_permissions_for_role(resolved_role))
+    overrides = load_user_permission_overrides(conn, tenant_id, [user_id]).get(user_id, {})
+    effective = dict(role_permissions)
+    effective.update(overrides)
+    return complete_permission_map(effective)
+
+def save_user_permission_overrides(conn, tenant_id: int, user_id: int, role_name: Optional[str], permissions: Dict[str, bool]):
+    normalized = normalize_permission_payload(permissions)
+    if not normalized:
+        return
+    role_defaults = load_role_permission_maps(conn).get((role_name or "viewer").lower(), default_permissions_for_role(role_name))
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT p.id, p.permission_code
+            FROM permissions p
+        """)
+        permission_rows = {row["permission_code"]: row["id"] for row in cur.fetchall()}
+        for code in ALL_PERMISSION_CODES:
+            if code not in normalized:
+                continue
+            permission_id = permission_rows.get(code)
+            if permission_id is None:
+                continue
+            requested = bool(normalized[code])
+            default_value = bool(role_defaults.get(code, False))
+            if requested == default_value:
+                cur.execute("DELETE FROM user_permission_overrides WHERE user_id=%s AND permission_id=%s", (user_id, permission_id))
+            else:
+                cur.execute("""
+                    INSERT INTO user_permission_overrides (user_id, permission_id, allowed, updated_at)
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (user_id, permission_id) DO UPDATE SET
+                        allowed = EXCLUDED.allowed,
+                        updated_at = now()
+                """, (user_id, permission_id, requested))
+
+def clear_user_permission_overrides(conn, user_id: int):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM user_permission_overrides WHERE user_id=%s", (user_id,))
 
 def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1, user_id=None, details=None):
     with conn.cursor() as cur:
@@ -386,6 +808,118 @@ def resolve_voice_language(config, request_lang=None):
         return config.get("default_internal_lang", "en")
     return "en"
 
+def parse_planning_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except Exception:
+            continue
+    return None
+
+def planning_window_from_values(start_value: Any = None, end_value: Any = None, date_value: Any = None) -> tuple[Optional[datetime], Optional[datetime]]:
+    start_dt = parse_planning_datetime(start_value)
+    end_dt = parse_planning_datetime(end_value)
+    if not start_dt and date_value:
+        date_dt = parse_planning_datetime(date_value)
+        if date_dt:
+            start_dt = date_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+            end_dt = start_dt + timedelta(hours=1)
+    elif start_dt and not end_dt:
+        end_dt = start_dt + timedelta(hours=1)
+    return start_dt, end_dt
+
+def format_planning_datetime(value: Optional[datetime]) -> Optional[str]:
+    return value.strftime("%Y-%m-%dT%H:%M:%S") if value else None
+
+def get_user_display_name(conn, tenant_id: int, user_id: Optional[int]) -> Optional[str]:
+    if not user_id:
+        return None
+    with conn.cursor() as cur:
+        cur.execute("""SELECT display_name
+            FROM users
+            WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""", (user_id, tenant_id))
+        row = cur.fetchone()
+    return row["display_name"] if row else None
+
+def resolve_assigned_user(conn, tenant_id: int, assigned_user_id: Any = None, assigned_to: Any = None) -> tuple[Optional[int], Optional[str]]:
+    if assigned_user_id not in (None, "", 0, "0"):
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, display_name
+                FROM users
+                WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""", (assigned_user_id, tenant_id))
+            row = cur.fetchone()
+        if row:
+            return int(row["id"]), row["display_name"]
+    assignee_text = (assigned_to or "").strip()
+    if assignee_text:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, display_name
+                FROM users
+                WHERE tenant_id=%s AND deleted_at IS NULL AND (
+                    display_name ILIKE %s OR email ILIKE %s OR COALESCE(phone,'') ILIKE %s
+                )
+                ORDER BY status='active' DESC, id
+                LIMIT 1""", (tenant_id, f"%{assignee_text}%", f"%{assignee_text}%", f"%{assignee_text}%"))
+            row = cur.fetchone()
+        if row:
+            return int(row["id"]), row["display_name"]
+        return None, assignee_text
+    return None, None
+
+def build_calendar_entry(
+    entry_type: str,
+    source: dict,
+    current_user_id: Optional[int],
+    job_title: Optional[str] = None,
+) -> Optional[dict]:
+    planned_start, planned_end = planning_window_from_values(
+        source.get("planned_start_at"),
+        source.get("planned_end_at"),
+        source.get("planned_date") or source.get("start_date_planned") or source.get("deadline"),
+    )
+    if not planned_start:
+        return None
+    assigned_user_id = source.get("assigned_user_id")
+    try:
+        assigned_user_id = int(assigned_user_id) if assigned_user_id is not None else None
+    except Exception:
+        assigned_user_id = None
+    assigned_to = source.get("assigned_to")
+    is_assigned_to_current = bool(current_user_id and assigned_user_id and current_user_id == assigned_user_id)
+    if entry_type == "task":
+        display_mode = "reminder" if is_assigned_to_current else "info"
+    else:
+        display_mode = "assigned" if is_assigned_to_current else "shared"
+    return {
+        "entry_key": f"{entry_type}:{source.get('id')}",
+        "entry_type": entry_type,
+        "source_id": source.get("id"),
+        "title": source.get("title") or source.get("job_title") or "",
+        "client_name": source.get("client_name"),
+        "job_title": job_title,
+        "assigned_user_id": assigned_user_id,
+        "assigned_to": assigned_to,
+        "is_assigned_to_current": is_assigned_to_current,
+        "display_mode": display_mode,
+        "planned_start_at": format_planning_datetime(planned_start),
+        "planned_end_at": format_planning_datetime(planned_end),
+        "planned_date": source.get("planned_date") or source.get("start_date_planned") or source.get("deadline"),
+        "description": source.get("planning_note") or source.get("handover_note"),
+        "calendar_sync_enabled": bool(source.get("calendar_sync_enabled", True)),
+        "reminder_for_assignee_only": bool(source.get("reminder_for_assignee_only", True)),
+        "status": source.get("status") or source.get("job_status"),
+    }
+
 # ========== TENANT GUARD ==========
 def verify_tenant(conn, tenant_id):
     """Verify tenant exists and is active. Raises HTTPException if not."""
@@ -412,6 +946,237 @@ def verify_tenant_ownership(conn, tenant_id, table, record_id):
 def audit_config_change(conn, tenant_id, action, detail):
     """Log configuration change to activity_timeline."""
     log_activity(conn, "tenant_config", str(tenant_id), action, detail, tenant_id=tenant_id)
+
+def normalize_phone(phone: Optional[str]) -> str:
+    raw = (phone or "").strip()
+    return "".join(ch for ch in raw if ch.isdigit())
+
+def normalize_email(email: Optional[str]) -> str:
+    return (email or "").strip().lower()
+
+def build_contact_key(name: Optional[str], phone: Optional[str], email: Optional[str]) -> str:
+    normalized_phone = normalize_phone(phone)
+    normalized_email = normalize_email(email)
+    normalized_name = (name or "").strip().lower()
+    return normalized_phone or normalized_email or normalized_name
+
+def normalize_section_code(value: Optional[str]) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    chars = []
+    prev_sep = False
+    for ch in raw:
+        if ch.isalnum():
+            chars.append(ch)
+            prev_sep = False
+        elif not prev_sep:
+            chars.append("_")
+            prev_sep = True
+    return "".join(chars).strip("_")
+
+def choose_preferred_value(*values):
+    best = ""
+    for value in values:
+        candidate = (value or "").strip()
+        if len(candidate) > len(best):
+            best = candidate
+    return best or None
+
+def client_info_score(row: Dict[str, Any]) -> int:
+    keys = [
+        "display_name", "first_name", "last_name", "company_name", "phone_primary",
+        "email_primary", "billing_address_line1", "billing_city", "billing_postcode", "website"
+    ]
+    return sum(1 for key in keys if row.get(key))
+
+def find_matching_clients(cur, tenant_id: int, normalized_phone: str, normalized_email: str):
+    if not normalized_phone and not normalized_email:
+        return []
+    clauses = []
+    params: List[Any] = [tenant_id]
+    if normalized_phone:
+        clauses.append("REPLACE(REPLACE(REPLACE(COALESCE(phone_primary,''),'+',''),' ',''),'-','') = %s")
+        params.append(normalized_phone)
+    if normalized_email:
+        clauses.append("LOWER(COALESCE(email_primary,'')) = %s")
+        params.append(normalized_email)
+    sql = f"SELECT * FROM clients WHERE tenant_id=%s AND deleted_at IS NULL AND ({' OR '.join(clauses)})"
+    cur.execute(sql, params)
+    return [dict(row) for row in cur.fetchall()]
+
+def load_selected_contact_rows(cur, tenant_id: int, normalized_phone: str, normalized_email: str, linked_client_id: Optional[int] = None):
+    clauses = []
+    params: List[Any] = [tenant_id]
+    if linked_client_id:
+        clauses.append("linked_client_id = %s")
+        params.append(linked_client_id)
+    if normalized_phone:
+        clauses.append("normalized_phone = %s")
+        params.append(normalized_phone)
+    if normalized_email:
+        clauses.append("normalized_email = %s")
+        params.append(normalized_email)
+    if not clauses:
+        return []
+    cur.execute(f"""SELECT * FROM user_contact_sync
+        WHERE tenant_id=%s AND is_client=TRUE AND ({' OR '.join(clauses)})""", params)
+    return [dict(row) for row in cur.fetchall()]
+
+def merge_contact_rows_into_client(conn, tenant_id: int, primary_client_id: int, selected_rows: List[Dict[str, Any]], existing_client: Optional[Dict[str, Any]] = None):
+    if not selected_rows:
+        return
+    with conn.cursor() as cur:
+        if existing_client is None:
+            cur.execute("SELECT * FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (primary_client_id, tenant_id))
+            existing_client = dict(cur.fetchone() or {})
+        names = [row.get("display_name") for row in selected_rows]
+        phones = [row.get("phone_primary") for row in selected_rows]
+        emails = [row.get("email_primary") for row in selected_rows]
+        display_name = choose_preferred_value(existing_client.get("display_name"), *names)
+        phone_primary = choose_preferred_value(existing_client.get("phone_primary"), *phones)
+        email_primary = choose_preferred_value(existing_client.get("email_primary"), *emails)
+        cur.execute("""UPDATE clients
+            SET display_name=%s,
+                phone_primary=%s,
+                email_primary=%s,
+                source=COALESCE(source, 'synced_contact'),
+                updated_at=now()
+            WHERE id=%s AND tenant_id=%s""",
+            (display_name, phone_primary, email_primary, primary_client_id, tenant_id))
+
+def reconcile_contact_selection(conn, tenant_id: int, user_id: int, contact_key: str):
+    with conn.cursor() as cur:
+        cur.execute("""SELECT * FROM user_contact_sync
+            WHERE tenant_id=%s AND user_id=%s AND contact_key=%s""", (tenant_id, user_id, contact_key))
+        row = cur.fetchone()
+        if not row:
+            return None
+        row = dict(row)
+        linked_client_id = row.get("linked_client_id")
+        normalized_phone = row.get("normalized_phone") or ""
+        normalized_email = row.get("normalized_email") or ""
+        if not row.get("is_client"):
+            if linked_client_id:
+                cur.execute("""SELECT COUNT(*) AS c FROM user_contact_sync
+                    WHERE tenant_id=%s AND linked_client_id=%s AND is_client=TRUE""", (tenant_id, linked_client_id))
+                selected_count = int((cur.fetchone() or {}).get("c") or 0)
+                if selected_count == 0:
+                    cur.execute("SELECT source FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (linked_client_id, tenant_id))
+                    client = cur.fetchone()
+                    if client and (client.get("source") or "") == "synced_contact":
+                        cur.execute("UPDATE clients SET deleted_at=now(), status='archived', updated_at=now() WHERE id=%s AND tenant_id=%s", (linked_client_id, tenant_id))
+                cur.execute("""UPDATE user_contact_sync
+                    SET linked_client_id=NULL, updated_at=now()
+                    WHERE tenant_id=%s AND user_id=%s AND contact_key=%s""", (tenant_id, user_id, contact_key))
+            return None
+
+        selected_rows = load_selected_contact_rows(cur, tenant_id, normalized_phone, normalized_email, linked_client_id)
+        matches = find_matching_clients(cur, tenant_id, normalized_phone, normalized_email)
+        primary = max(matches, key=client_info_score) if matches else None
+        if primary is None:
+            code_seed = normalized_phone[-6:] if normalized_phone else uuid.uuid4().hex[:6].upper()
+            code = f"CL-SYNC-{code_seed.upper()}"
+            cur.execute("""INSERT INTO clients (tenant_id, client_code, client_type, display_name, phone_primary, email_primary, status, source)
+                VALUES (%s,%s,'individual',%s,%s,%s,'active','synced_contact')
+                RETURNING *""",
+                (tenant_id, code, row.get("display_name") or "Client", row.get("phone_primary"), row.get("email_primary")))
+            primary = dict(cur.fetchone())
+        merge_contact_rows_into_client(conn, tenant_id, primary["id"], selected_rows, primary)
+        for duplicate in matches:
+            if duplicate["id"] == primary["id"]:
+                continue
+            if (duplicate.get("source") or "") == "synced_contact":
+                cur.execute("""UPDATE clients
+                    SET deleted_at=now(), status='archived', updated_at=now()
+                    WHERE id=%s AND tenant_id=%s""", (duplicate["id"], tenant_id))
+        cur.execute("""UPDATE user_contact_sync
+            SET linked_client_id=%s, updated_at=now()
+            WHERE tenant_id=%s AND is_client=TRUE
+              AND (linked_client_id=%s OR normalized_phone=%s OR normalized_email=%s)""",
+            (primary["id"], tenant_id, primary["id"], normalized_phone or None, normalized_email or None))
+        return primary["id"]
+
+def ensure_contact_section(cur, tenant_id: int, section_code: str):
+    cur.execute("""SELECT section_code, display_name
+        FROM contact_sections
+        WHERE tenant_id=%s AND section_code=%s AND is_active=TRUE""", (tenant_id, section_code))
+    section = cur.fetchone()
+    if not section:
+        raise HTTPException(404, "Contact section not found")
+    return dict(section)
+
+def find_shared_contact(cur, tenant_id: int, normalized_phone: str, normalized_email: str):
+    if not normalized_phone and not normalized_email:
+        return None
+    clauses = []
+    params: List[Any] = [tenant_id]
+    if normalized_phone:
+        clauses.append("normalized_phone=%s")
+        params.append(normalized_phone)
+    if normalized_email:
+        clauses.append("normalized_email=%s")
+        params.append(normalized_email)
+    cur.execute(f"""SELECT *
+        FROM shared_contacts
+        WHERE tenant_id=%s AND deleted_at IS NULL AND ({' OR '.join(clauses)})
+        ORDER BY updated_at DESC LIMIT 1""", params)
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict[str, Any], source: str = "manual"):
+    section_code = normalize_section_code(data.get("section_code"))
+    if not section_code:
+        raise HTTPException(400, "section_code required")
+    ensure_contact_section(cur, tenant_id, section_code)
+    display_name = (data.get("display_name") or data.get("name") or "").strip()
+    if not display_name:
+        raise HTTPException(400, "display_name required")
+    company_name = (data.get("company_name") or "").strip() or None
+    phone_primary = (data.get("phone_primary") or data.get("phone") or "").strip() or None
+    email_primary = (data.get("email_primary") or data.get("email") or "").strip() or None
+    notes = (data.get("notes") or "").strip() or None
+    normalized_phone = normalize_phone(phone_primary)
+    normalized_email = normalize_email(email_primary)
+    existing = find_shared_contact(cur, tenant_id, normalized_phone, normalized_email)
+    if existing:
+        cur.execute("""UPDATE shared_contacts
+            SET section_code=%s,
+                display_name=%s,
+                company_name=%s,
+                phone_primary=%s,
+                email_primary=%s,
+                notes=%s,
+                source=%s,
+                normalized_phone=%s,
+                normalized_email=%s,
+                updated_by=%s,
+                updated_at=now()
+            WHERE id=%s AND tenant_id=%s
+            RETURNING *""",
+            (
+                section_code,
+                choose_preferred_value(existing.get("display_name"), display_name),
+                choose_preferred_value(existing.get("company_name"), company_name),
+                choose_preferred_value(existing.get("phone_primary"), phone_primary),
+                choose_preferred_value(existing.get("email_primary"), email_primary),
+                choose_preferred_value(existing.get("notes"), notes),
+                existing.get("source") or source,
+                normalized_phone or existing.get("normalized_phone"),
+                normalized_email or existing.get("normalized_email"),
+                user_id,
+                existing["id"],
+                tenant_id,
+            ))
+        return dict(cur.fetchone()), False
+    cur.execute("""INSERT INTO shared_contacts
+        (tenant_id, section_code, display_name, company_name, phone_primary, email_primary, notes, source,
+         normalized_phone, normalized_email, created_by, updated_by)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING *""",
+        (tenant_id, section_code, display_name, company_name, phone_primary, email_primary, notes, source,
+         normalized_phone or None, normalized_email or None, user_id, user_id))
+    return dict(cur.fetchone()), True
 
 @app.on_event("startup")
 async def startup():
@@ -445,7 +1210,7 @@ class MessageRequest(BaseModel):
 
 # === AI PROCESS ===
 @app.post("/process")
-async def process_message(msg: MessageRequest):
+async def process_message(msg: MessageRequest, request: Request):
     try:
         now = msg.current_datetime or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entity_ctx = ""
@@ -487,9 +1252,9 @@ RULES:
 - You are a VOICE assistant. The user speaks to you and you speak back. NEVER say you can only communicate via text. NEVER say you are a text-based AI. You ARE a voice assistant.
 - Be concise, human, friendly. Remember conversation history.
 - NEVER say 'executing...' or 'performing...' — always respond naturally describing what you did.
-- To create a task use create_task. To change status use update_task. To complete use complete_task.
+- To create a task use create_task. To change status, planning or assignment use update_task. To complete use complete_task.
 - To list tasks use list_tasks.
-- For jobs: create_job for new, update_job for status change.
+- For jobs: create_job for new, update_job for status changes, planning and handover.
 - For notes: add_note with entity_type 'client' or 'job'.
 - For leads: create_lead.
 - For calendar: list_calendar_events, add/modify/delete_calendar_event.
@@ -510,12 +1275,12 @@ RULES:
             {"type":"function","function":{"name":"call_contact","description":"Vytoci telefonni cislo","parameters":{"type":"object","properties":{"phone":{"type":"string"}},"required":["phone"]}}},
             {"type":"function","function":{"name":"send_email","description":"Posle email","parameters":{"type":"object","properties":{"to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},"required":["to","subject","body"]}}},
             {"type":"function","function":{"name":"create_client","description":"Vytvori noveho klienta v CRM","parameters":{"type":"object","properties":{"name":{"type":"string"},"email":{"type":"string"},"phone":{"type":"string"}},"required":["name"]}}},
-            {"type":"function","function":{"name":"create_task","description":"Vytvori ukol. Pouzij pro: zavolat, email, schuzka, objednavka, kalkulace, kontrola, pripomenuti.","parameters":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"task_type":{"type":"string","enum":["volat","email","schuzka","objednat_material","vytvorit_kalkulaci","poslat_kalkulaci","navsteva_klienta","zamereni","realizace","kontrola","reklamace","pripomenout_se","interni_poznamka","fotodokumentace"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"deadline":{"type":"string"},"assigned_to":{"type":"string"},"client_name":{"type":"string"}},"required":["title"]}}},
-            {"type":"function","function":{"name":"create_job","description":"Vytvori novou zakazku","parameters":{"type":"object","properties":{"title":{"type":"string"},"client_name":{"type":"string"},"description":{"type":"string"},"start_date":{"type":"string"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"create_task","description":"Vytvori ukol. Pouzij pro: zavolat, email, schuzka, objednavka, kalkulace, kontrola, pripomenuti.","parameters":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"task_type":{"type":"string","enum":["volat","email","schuzka","objednat_material","vytvorit_kalkulaci","poslat_kalkulaci","navsteva_klienta","zamereni","realizace","kontrola","reklamace","pripomenout_se","interni_poznamka","fotodokumentace"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"deadline":{"type":"string"},"planned_date":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"assigned_to":{"type":"string"},"planning_note":{"type":"string"},"client_name":{"type":"string"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"create_job","description":"Vytvori novou zakazku","parameters":{"type":"object","properties":{"title":{"type":"string"},"client_name":{"type":"string"},"description":{"type":"string"},"start_date":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"assigned_to":{"type":"string"},"handover_note":{"type":"string"}},"required":["title"]}}},
             {"type":"function","function":{"name":"add_note","description":"Prida poznamku ke klientovi nebo zakazce","parameters":{"type":"object","properties":{"entity_type":{"type":"string","enum":["client","job"]},"entity_name":{"type":"string"},"note":{"type":"string"}},"required":["entity_type","note"]}}},
             {"type":"function","function":{"name":"create_lead","description":"Vytvori novy lead/poptavku","parameters":{"type":"object","properties":{"name":{"type":"string"},"source":{"type":"string","enum":["checkatrade","web","telefon","doporuceni","jiny"]},"note":{"type":"string"}},"required":["name","source"]}}},
-            {"type":"function","function":{"name":"update_task","description":"Zmeni stav, prioritu nebo vysledek ukolu","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev ukolu k nalezeni"},"status":{"type":"string","enum":["novy","naplanovany","v_reseni","ceka_na_klienta","ceka_na_material","ceka_na_platbu","hotovo","zruseno","predano_dal"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"result":{"type":"string","description":"Vysledek ukolu"}},"required":["title"]}}},
-            {"type":"function","function":{"name":"update_job","description":"Zmeni stav zakazky","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev zakazky"},"status":{"type":"string","enum":["nova","v_reseni","ceka_na_klienta","ceka_na_material","naplanovano","v_realizaci","dokonceno","vyfakturovano","uzavreno","pozastaveno","zruseno"]}},"required":["title"]}}},
+            {"type":"function","function":{"name":"update_task","description":"Zmeni stav, prioritu, vysledek, plan nebo prirazeni ukolu","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev ukolu k nalezeni"},"status":{"type":"string","enum":["novy","naplanovany","v_reseni","ceka_na_klienta","ceka_na_material","ceka_na_platbu","hotovo","zruseno","predano_dal"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"result":{"type":"string","description":"Vysledek ukolu"},"assigned_to":{"type":"string"},"planned_date":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planning_note":{"type":"string"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"update_job","description":"Zmeni stav, plan nebo predani zakazky","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev zakazky"},"status":{"type":"string","enum":["nova","v_reseni","ceka_na_klienta","ceka_na_material","naplanovano","v_realizaci","dokonceno","vyfakturovano","uzavreno","pozastaveno","zruseno"]},"assigned_to":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"handover_note":{"type":"string"}},"required":["title"]}}},
             {"type":"function","function":{"name":"list_tasks","description":"Vypise ukoly podle filtru","parameters":{"type":"object","properties":{"status":{"type":"string"},"client_name":{"type":"string"},"only_active":{"type":"boolean"}}}}},
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
             {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
@@ -578,12 +1343,24 @@ RULES:
                 conn = get_db_conn()
                 try:
                     tid = str(uuid.uuid4())
+                    tenant_id = get_request_tenant_id(request)
+                    assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
+                    planning_start, planning_end = planning_window_from_values(
+                        args.get("planned_start_at"),
+                        args.get("planned_end_at"),
+                        args.get("planned_date") or args.get("deadline"),
+                    )
+                    current_user_name = get_user_display_name(conn, tenant_id, request.state.user.get("user_id"))
                     with conn.cursor() as cur:
-                        cur.execute("""INSERT INTO tasks (id,title,description,task_type,status,priority,deadline,
-                            assigned_to,client_name,created_by,source) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                        cur.execute("""INSERT INTO tasks (
+                                id,title,description,task_type,status,priority,deadline,planned_date,
+                                planned_start_at,planned_end_at,assigned_to,assigned_user_id,planning_note,
+                                delegated_by,client_name,created_by,source,tenant_id
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
                             (tid,t,args.get("description"),args.get("task_type","interni_poznamka"),"novy",
-                             args.get("priority","bezna"),args.get("deadline"),args.get("assigned_to"),
-                             args.get("client_name"),"Marek","hlasovy_prikaz"))
+                             args.get("priority","bezna"),args.get("deadline"),args.get("planned_date"),
+                             planning_start, planning_end, assigned_to, assigned_user_id, args.get("planning_note"),
+                             current_user_name, args.get("client_name"), current_user_name or "Marek", "hlasovy_prikaz", tenant_id))
                         task = dict(cur.fetchone())
                         log_activity(conn,"task",tid,"create",f"Ukol '{t}' vytvoren")
                         conn.commit()
@@ -600,15 +1377,27 @@ RULES:
                 conn = get_db_conn()
                 try:
                     code = f"JOB-{uuid.uuid4().hex[:6].upper()}"
+                    tenant_id = get_request_tenant_id(request)
                     cname = args.get("client_name","")
                     cid = None
+                    assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
+                    planning_start, planning_end = planning_window_from_values(
+                        args.get("planned_start_at"), args.get("planned_end_at"), args.get("start_date")
+                    )
+                    current_user_name = get_user_display_name(conn, tenant_id, request.state.user.get("user_id"))
                     with conn.cursor() as cur:
                         if cname:
-                            cur.execute("SELECT id FROM clients WHERE display_name ILIKE %s AND deleted_at IS NULL LIMIT 1",(f"%{cname}%",))
+                            cur.execute("SELECT id FROM clients WHERE tenant_id=%s AND display_name ILIKE %s AND deleted_at IS NULL LIMIT 1",(tenant_id, f"%{cname}%",))
                             row = cur.fetchone()
                             if row: cid = row['id']
-                        cur.execute("INSERT INTO jobs (job_number,client_id,job_title,job_status,start_date_planned) VALUES (%s,%s,%s,'nova',%s) RETURNING id",
-                            (code,cid,t,args.get("start_date")))
+                        cur.execute("""INSERT INTO jobs (
+                                tenant_id,job_number,client_id,job_title,job_status,start_date_planned,
+                                planned_start_at,planned_end_at,assigned_user_id,assigned_to,handover_note,
+                                handed_over_by,handed_over_at,calendar_sync_enabled
+                            ) VALUES (%s,%s,%s,%s,'nova',%s,%s,%s,%s,%s,%s,%s,%s,TRUE) RETURNING id""",
+                            (tenant_id, code, cid, t, args.get("start_date"), planning_start, planning_end,
+                             assigned_user_id, assigned_to, args.get("handover_note"), current_user_name,
+                             datetime.utcnow() if (assigned_to or args.get("handover_note")) else None))
                         jid = cur.fetchone()['id']
                         log_activity(conn,"job",jid,"create",f"Zakazka '{t}' ({code}) vytvorena")
                         conn.commit()
@@ -864,14 +1653,32 @@ RULES:
                 title_q = args.get("title","")
                 conn = get_db_conn()
                 try:
+                    tenant_id = get_request_tenant_id(request)
                     with conn.cursor() as cur:
-                        cur.execute("SELECT id,title FROM tasks WHERE title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
+                        cur.execute("""SELECT id,title FROM tasks
+                            WHERE tenant_id=%s AND title ILIKE %s AND is_completed=FALSE
+                            ORDER BY created_at DESC LIMIT 1""",(tenant_id, f"%{title_q}%",))
                         row = cur.fetchone()
                         if not row: return {"reply_cs":tr(f"Task '{title_q}' not found.", f"Úkol '{title_q}' nenalezen.", f"Nie znaleziono zadania '{title_q}'.")}
                         sets = []; vals = []
                         if "status" in args: sets.append("status=%s"); vals.append(args["status"])
                         if "priority" in args: sets.append("priority=%s"); vals.append(args["priority"])
                         if "result" in args: sets.append("result=%s"); vals.append(args["result"])
+                        if "assigned_to" in args:
+                            assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
+                            sets.append("assigned_to=%s"); vals.append(assigned_to)
+                            sets.append("assigned_user_id=%s"); vals.append(assigned_user_id)
+                            sets.append("delegated_by=%s"); vals.append(get_user_display_name(conn, tenant_id, request.state.user.get("user_id")))
+                        if "planning_note" in args:
+                            sets.append("planning_note=%s"); vals.append(args["planning_note"])
+                        if "planned_date" in args:
+                            sets.append("planned_date=%s"); vals.append(args["planned_date"])
+                        if "planned_start_at" in args or "planned_end_at" in args or "planned_date" in args:
+                            planning_start, planning_end = planning_window_from_values(
+                                args.get("planned_start_at"), args.get("planned_end_at"), args.get("planned_date")
+                            )
+                            sets.append("planned_start_at=%s"); vals.append(planning_start)
+                            sets.append("planned_end_at=%s"); vals.append(planning_end)
                         if sets:
                             sets.append("updated_at=now()"); vals.append(row['id'])
                             cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=%s",vals)
@@ -890,14 +1697,35 @@ RULES:
                 title_q = args.get("title","")
                 conn = get_db_conn()
                 try:
+                    tenant_id = get_request_tenant_id(request)
                     with conn.cursor() as cur:
-                        cur.execute("SELECT id,job_title,job_status FROM jobs WHERE job_title ILIKE %s AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
+                        cur.execute("""SELECT id,job_title,job_status FROM jobs
+                            WHERE tenant_id=%s AND job_title ILIKE %s AND deleted_at IS NULL
+                            ORDER BY created_at DESC LIMIT 1""",(tenant_id, f"%{title_q}%",))
                         row = cur.fetchone()
                         if not row: return {"reply_cs":tr(f"Job '{title_q}' not found.", f"Zakázka '{title_q}' nenalezena.", f"Nie znaleziono zlecenia '{title_q}'.")}
                         new_status = args.get("status",row['job_status'])
                         err = validate_state_transition(row['job_status'], new_status, JOB_TRANSITIONS, "Job")
                         if err: return {"reply_cs":tr(f"Invalid transition: {err}", f"Neplatný přechod: {err}", f"Nieprawidłowe przejście: {err}")}
-                        cur.execute("UPDATE jobs SET job_status=%s,updated_at=now() WHERE id=%s",(new_status,row['id']))
+                        sets = ["job_status=%s"]
+                        vals = [new_status]
+                        if "assigned_to" in args:
+                            assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
+                            sets.extend(["assigned_to=%s", "assigned_user_id=%s"])
+                            vals.extend([assigned_to, assigned_user_id])
+                            sets.extend(["handed_over_by=%s", "handed_over_at=%s"])
+                            vals.extend([get_user_display_name(conn, tenant_id, request.state.user.get("user_id")), datetime.utcnow()])
+                        if "handover_note" in args:
+                            sets.append("handover_note=%s"); vals.append(args.get("handover_note"))
+                            sets.extend(["handed_over_by=%s", "handed_over_at=%s"])
+                            vals.extend([get_user_display_name(conn, tenant_id, request.state.user.get("user_id")), datetime.utcnow()])
+                        if "planned_start_at" in args or "planned_end_at" in args:
+                            planning_start, planning_end = planning_window_from_values(args.get("planned_start_at"), args.get("planned_end_at"))
+                            sets.extend(["planned_start_at=%s", "planned_end_at=%s"])
+                            vals.extend([planning_start, planning_end])
+                        sets.append("updated_at=now()")
+                        vals.append(row['id'])
+                        cur.execute(f"UPDATE jobs SET {','.join(sets)} WHERE id=%s", vals)
                         log_activity(conn,"job",row['id'],"status_change",f"Zakazka '{row['job_title']}': {row['job_status']} -> {new_status}")
                         conn.commit()
                     return {"reply_cs":tr(
@@ -999,11 +1827,12 @@ async def search_clients(q: str = Query(..., min_length=1)):
     finally: release_conn(conn)
 
 @app.get("/crm/clients/{client_id}")
-async def get_client_detail(client_id: int):
+async def get_client_detail(client_id: int, request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM clients WHERE id=%s AND deleted_at IS NULL",(client_id,))
+            cur.execute("SELECT * FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL",(client_id, tid))
             cl = cur.fetchone()
             if not cl: raise HTTPException(404,"Klient nenalezen")
             cur.execute("SELECT * FROM properties WHERE client_id=%s AND deleted_at IS NULL",(client_id,))
@@ -1016,8 +1845,12 @@ async def get_client_detail(client_id: int):
             tasks = cur.fetchall()
             cur.execute("SELECT id,note,created_by,created_at::text FROM client_notes WHERE client_id=%s ORDER BY created_at DESC LIMIT 20",(client_id,))
             notes = cur.fetchall()
+            service_rate_overrides = get_client_service_rate_overrides(conn, tid, client_id)
             return {"client":dict(cl),"properties":[dict(p) for p in props],"recent_jobs":[dict(j) for j in jobs],
-                    "communications":[dict(c) for c in comms],"tasks":[dict(t) for t in tasks],"notes":[dict(n) for n in notes]}
+                    "communications":[dict(c) for c in comms],"tasks":[dict(t) for t in tasks],"notes":[dict(n) for n in notes],
+                    "service_rates": get_client_service_rates(conn, tid, client_id),
+                    "service_rate_overrides": {k: v for k, v in service_rate_overrides.items() if k in VISIBLE_CLIENT_SERVICE_RATE_KEYS},
+                    "has_individual_service_rates": bool(service_rate_overrides)}
     finally: release_conn(conn)
 
 @app.post("/crm/clients")
@@ -1082,70 +1915,114 @@ async def archive_client(client_id: int):
     finally: release_conn(conn)
 
 @app.post("/crm/clients/sync-contacts")
-async def sync_contacts(data: dict):
-    """Sync phone contacts to CRM. Filters UK numbers if requested."""
-    filter_uk = data.get("filter_uk", False)
+async def sync_contacts(data: dict, request: Request):
+    """Store imported contacts per user and decide which of them should exist as shared server clients."""
+    tenant_id = get_request_tenant_id(request)
+    user_id = request.state.user.get("user_id")
+    filter_uk = bool(data.get("filter_uk", False))
     contacts = data.get("contacts", [])
-    if not contacts: raise HTTPException(400, "No contacts provided")
+    if not user_id:
+        raise HTTPException(401, "Authenticated user is required")
+    if not contacts:
+        raise HTTPException(400, "No contacts provided")
 
     def is_uk_number(phone: str) -> bool:
-        # Standard UK mobile: 07xxx, or +447xxx
-        # Standard UK landline: 01xxx, 02xxx, or +441xxx, +442xxx
-        clean = phone.replace("+", "").replace(" ", "").replace("-", "")
-        # Remove leading '44' if present and starts with 447, 441, 442
+        clean = normalize_phone(phone)
         if clean.startswith("44"):
             clean = "0" + clean[2:]
         return clean.startswith(("07", "01", "02"))
 
     conn = get_db_conn()
-    created = 0; skipped = 0; errors = []
+    errors = []
     try:
-        batch_size = 50
-        for i in range(0, len(contacts), batch_size):
-            batch = contacts[i:i+batch_size]
+        with conn.cursor() as cur:
+            seen_keys = set()
+            for contact in contacts:
+                name = (contact.get("name") or "").strip()
+                phone = (contact.get("phone") or "").strip()
+                email = (contact.get("email") or "").strip()
+                if not name and not phone and not email:
+                    continue
+                if filter_uk and phone and not is_uk_number(phone):
+                    continue
+                contact_key = contact.get("contact_key") or build_contact_key(name, phone, email)
+                if not contact_key or contact_key in seen_keys:
+                    continue
+                seen_keys.add(contact_key)
+                selected_flag = contact.get("selected_as_client")
+                cur.execute("""INSERT INTO user_contact_sync
+                    (tenant_id, user_id, contact_key, display_name, phone_primary, email_primary, normalized_phone, normalized_email, is_client, last_seen_at, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, FALSE),now(),now())
+                    ON CONFLICT (tenant_id, user_id, contact_key) DO UPDATE SET
+                        display_name=EXCLUDED.display_name,
+                        phone_primary=EXCLUDED.phone_primary,
+                        email_primary=EXCLUDED.email_primary,
+                        normalized_phone=EXCLUDED.normalized_phone,
+                        normalized_email=EXCLUDED.normalized_email,
+                        is_client=CASE WHEN %s IS NULL THEN user_contact_sync.is_client ELSE %s END,
+                        last_seen_at=now(),
+                        updated_at=now()""",
+                    (
+                        tenant_id,
+                        user_id,
+                        contact_key,
+                        name or phone or email or "Contact",
+                        phone or None,
+                        email or None,
+                        normalize_phone(phone) or None,
+                        normalize_email(email) or None,
+                        selected_flag,
+                        selected_flag,
+                        selected_flag,
+                    ))
+            conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute("""SELECT contact_key FROM user_contact_sync
+                WHERE tenant_id=%s AND user_id=%s""", (tenant_id, user_id))
+            contact_keys = [row["contact_key"] for row in cur.fetchall()]
+
+        for contact_key in contact_keys:
             try:
-                with conn.cursor() as cur:
-                    for c in batch:
-                        try:
-                            cur.execute("SAVEPOINT contact_sync")
-                            name = c.get("name","").strip()
-                            phone = c.get("phone","").strip()
-                            email = c.get("email","")
-                            if not name or not phone: continue
+                reconcile_contact_selection(conn, tenant_id, user_id, contact_key)
+            except Exception as reconcile_error:
+                errors.append(f"{contact_key}: {reconcile_error}")
+        conn.commit()
 
-                            # Apply UK filter if requested
-                            if filter_uk and not is_uk_number(phone):
-                                skipped += 1; cur.execute("RELEASE SAVEPOINT contact_sync"); continue
+        with conn.cursor() as cur:
+            cur.execute("""SELECT ucs.contact_key, ucs.display_name, ucs.phone_primary, ucs.email_primary,
+                                  ucs.is_client, ucs.linked_client_id, c.display_name AS linked_client_name
+                FROM user_contact_sync ucs
+                LEFT JOIN clients c ON c.id = ucs.linked_client_id AND c.deleted_at IS NULL
+                WHERE ucs.tenant_id=%s AND ucs.user_id=%s
+                ORDER BY LOWER(ucs.display_name), LOWER(COALESCE(ucs.email_primary,'')), LOWER(COALESCE(ucs.phone_primary,''))""",
+                (tenant_id, user_id))
+            rows = [dict(row) for row in cur.fetchall()]
 
-                            clean = phone.replace("+","").replace(" ","").replace("-","")
-                            cur.execute("SELECT id FROM clients WHERE REPLACE(REPLACE(REPLACE(phone_primary,'+',''),' ',''),'-','') = %s AND deleted_at IS NULL LIMIT 1", (clean,))
-                            if cur.fetchone():
-                                cur.execute("RELEASE SAVEPOINT contact_sync")
-                                skipped += 1; continue
-                            code = f"CL-PH-{clean[-6:]}"
-                            cur.execute("""INSERT INTO clients (client_code,client_type,display_name,phone_primary,email_primary,status,tenant_id)
-                                VALUES (%s,'individual',%s,%s,%s,'active',1)
-                                RETURNING id""",
-                                (code, name, phone, email if email else None))
-                            row = cur.fetchone()
-                            if row:
-                                created += 1
-                                log_activity(conn,"client",row["id"],"sync",f"Kontakt importovan z telefonu: {name}")
-                                cur.execute("RELEASE SAVEPOINT contact_sync")
-                            else:
-                                cur.execute("ROLLBACK TO SAVEPOINT contact_sync")
-                                skipped += 1
-                        except Exception as e:
-                            cur.execute("ROLLBACK TO SAVEPOINT contact_sync")
-                            errors.append(f"{c.get('name', 'Unknown')}: {str(e)}")
-                    conn.commit()
-            except Exception as e:
-                conn.rollback()
-                errors.append(f"Batch error: {str(e)}")
-        return {"created": created, "skipped": skipped, "errors": errors, "total": len(contacts)}
+        return {
+            "total_contacts": len(rows),
+            "selected_clients": sum(1 for row in rows if row.get("is_client")),
+            "contacts": [
+                {
+                    "contact_key": row["contact_key"],
+                    "name": row["display_name"],
+                    "phone": row.get("phone_primary"),
+                    "email": row.get("email_primary"),
+                    "selected_as_client": bool(row.get("is_client")),
+                    "linked_client_id": row.get("linked_client_id"),
+                    "linked_client_name": row.get("linked_client_name"),
+                }
+                for row in rows
+            ],
+            "errors": errors,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
-    finally: release_conn(conn)
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
 
 @app.post("/crm/clients/{client_id}/notes")
 async def add_client_note(client_id: int, data: dict):
@@ -1168,7 +2045,14 @@ async def get_jobs(request: Request, client_id: Optional[int] = None, status: Op
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT j.id,j.job_number,j.job_title,j.job_status,j.client_id,j.property_id,j.quote_id,j.start_date_planned::text,j.created_at::text,j.updated_at::text,c.display_name as client_name FROM jobs j LEFT JOIN clients c ON j.client_id=c.id WHERE j.deleted_at IS NULL AND j.tenant_id=%s"
+            sql = """SELECT j.id,j.job_number,j.job_title,j.job_status,j.client_id,j.property_id,j.quote_id,
+                j.start_date_planned::text,j.planned_start_at::text,j.planned_end_at::text,
+                j.assigned_user_id,j.assigned_to,j.handover_note,j.handed_over_by,j.handed_over_at::text,
+                COALESCE(j.calendar_sync_enabled, TRUE) AS calendar_sync_enabled,
+                j.created_at::text,j.updated_at::text,c.display_name as client_name
+                FROM jobs j
+                LEFT JOIN clients c ON j.client_id=c.id
+                WHERE j.deleted_at IS NULL AND j.tenant_id=%s"""
             params = [tid]
             if client_id: sql += " AND j.client_id=%s"; params.append(client_id)
             if status: sql += " AND j.job_status=%s"; params.append(status)
@@ -1177,14 +2061,17 @@ async def get_jobs(request: Request, client_id: Optional[int] = None, status: Op
     finally: release_conn(conn)
 
 @app.get("/crm/jobs/{job_id}")
-async def get_job_detail(job_id: int):
+async def get_job_detail(job_id: int, request: Request):
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM jobs WHERE id=%s AND deleted_at IS NULL",(job_id,))
+            cur.execute("""SELECT *
+                FROM jobs WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""",(job_id, tid))
             job = cur.fetchone()
             if not job: raise HTTPException(404)
-            cur.execute("SELECT * FROM tasks WHERE job_id=%s ORDER BY created_at DESC",(job_id,))
+            cur.execute("""SELECT *
+                FROM tasks WHERE job_id=%s AND tenant_id=%s ORDER BY created_at DESC""",(job_id, tid))
             tasks = cur.fetchall()
             cur.execute("SELECT id,note,created_by,created_at::text FROM job_notes WHERE job_id=%s ORDER BY created_at DESC",(job_id,))
             notes = cur.fetchall()
@@ -1199,9 +2086,35 @@ async def create_job(data: dict, request: Request):
         ok, msg = check_subscription_limit(conn, tid, "jobs")
         if not ok: raise HTTPException(429, msg)
         code = f"JOB-{uuid.uuid4().hex[:6].upper()}"
+        assigned_user_id, assigned_to = resolve_assigned_user(conn, tid, data.get("assigned_user_id"), data.get("assigned_to"))
+        planning_start, planning_end = planning_window_from_values(
+            data.get("planned_start_at"), data.get("planned_end_at"), data.get("start_date")
+        )
+        handover_note = (data.get("handover_note") or "").strip() or None
+        handover_by = get_user_display_name(conn, tid, request.state.user.get("user_id"))
+        handover_at = datetime.utcnow() if (handover_note or assigned_to) else None
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO jobs (job_number,client_id,property_id,job_title,job_status,start_date_planned) VALUES (%s,%s,%s,%s,'nova',%s) RETURNING id",
-                (code,data.get("client_id"),data.get("property_id",data.get("client_id")),data.get("title","Zakazka"),data.get("start_date")))
+            cur.execute("""INSERT INTO jobs (
+                    tenant_id, job_number, client_id, property_id, job_title, job_status,
+                    start_date_planned, planned_start_at, planned_end_at,
+                    assigned_user_id, assigned_to, handover_note, handed_over_by, handed_over_at, calendar_sync_enabled
+                ) VALUES (%s,%s,%s,%s,%s,'nova',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (
+                    tid,
+                    code,
+                    data.get("client_id"),
+                    data.get("property_id",data.get("client_id")),
+                    data.get("title","Zakazka"),
+                    data.get("start_date"),
+                    planning_start,
+                    planning_end,
+                    assigned_user_id,
+                    assigned_to,
+                    handover_note,
+                    handover_by,
+                    handover_at,
+                    data.get("calendar_sync_enabled", True),
+                ))
             jid = cur.fetchone()['id']
             log_activity(conn,"job",jid,"create",f"Zakazka {code} vytvorena")
             conn.commit()
@@ -1210,7 +2123,7 @@ async def create_job(data: dict, request: Request):
     finally: release_conn(conn)
 
 @app.put("/crm/jobs/{job_id}")
-async def update_job(job_id: int, data: dict):
+async def update_job(job_id: int, data: dict, request: Request):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -1222,7 +2135,25 @@ async def update_job(job_id: int, data: dict):
                 err = validate_state_transition(row["job_status"], data["job_status"], JOB_TRANSITIONS, "Job")
                 if err: raise HTTPException(422, err)
             sets = []; vals = []
-            for k in ["job_title","job_status","start_date_planned"]:
+            if "assigned_user_id" in data or "assigned_to" in data:
+                assigned_user_id, assigned_to = resolve_assigned_user(conn, request.state.user.get("tenant_id", 1), data.get("assigned_user_id"), data.get("assigned_to"))
+                sets.append("assigned_user_id=%s"); vals.append(assigned_user_id)
+                sets.append("assigned_to=%s"); vals.append(assigned_to)
+                sets.append("handed_over_by=%s"); vals.append(get_user_display_name(conn, request.state.user.get("tenant_id", 1), request.state.user.get("user_id")))
+                sets.append("handed_over_at=%s"); vals.append(datetime.utcnow())
+            if "handover_note" in data:
+                sets.append("handover_note=%s"); vals.append((data.get("handover_note") or "").strip() or None)
+                sets.append("handed_over_by=%s"); vals.append(get_user_display_name(conn, request.state.user.get("tenant_id", 1), request.state.user.get("user_id")))
+                sets.append("handed_over_at=%s"); vals.append(datetime.utcnow())
+            if "planned_start_at" in data or "planned_end_at" in data or "start_date_planned" in data:
+                planning_start, planning_end = planning_window_from_values(
+                    data.get("planned_start_at"), data.get("planned_end_at"), data.get("start_date_planned")
+                )
+                if "planned_start_at" in data or "start_date_planned" in data:
+                    sets.append("planned_start_at=%s"); vals.append(planning_start)
+                if "planned_end_at" in data or "planned_start_at" in data:
+                    sets.append("planned_end_at=%s"); vals.append(planning_end)
+            for k in ["job_title","job_status","start_date_planned","calendar_sync_enabled"]:
                 if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
             if not sets: raise HTTPException(400)
             sets.append("updated_at=now()"); vals.append(job_id)
@@ -1241,7 +2172,7 @@ async def get_tasks(request: Request, status: Optional[str]=None, client_id: Opt
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = "SELECT * FROM tasks WHERE tenant_id=%s"; params = [tid]
+            sql = """SELECT * FROM tasks WHERE tenant_id=%s"""; params = [tid]
             if status: sql += " AND status=%s"; params.append(status)
             if client_id: sql += " AND client_id=%s"; params.append(client_id)
             if job_id: sql += " AND job_id=%s"; params.append(job_id)
@@ -1251,35 +2182,58 @@ async def get_tasks(request: Request, status: Optional[str]=None, client_id: Opt
     finally: release_conn(conn)
 
 @app.post("/crm/tasks")
-async def api_create_task(data: dict):
+async def api_create_task(data: dict, request: Request):
     conn = get_db_conn()
     try:
-        tid = data.get("id",str(uuid.uuid4()))
+        task_id = data.get("id",str(uuid.uuid4()))
+        tenant_id = get_request_tenant_id(request)
+        assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, data.get("assigned_user_id"), data.get("assigned_to"))
+        planning_start, planning_end = planning_window_from_values(
+            data.get("planned_start_at"), data.get("planned_end_at"), data.get("planned_date") or data.get("deadline")
+        )
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO tasks (id,title,description,task_type,status,priority,deadline,planned_date,
-                estimated_minutes,created_by,assigned_to,client_id,client_name,job_id,property_id,property_address,
-                is_recurring,recurrence_rule,communication_method,source,is_billable,has_cost,checklist)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
-                (tid,data.get("title",""),data.get("description"),data.get("task_type","interni_poznamka"),
+                planned_start_at,planned_end_at,estimated_minutes,created_by,assigned_to,assigned_user_id,
+                planning_note,reminder_for_assignee_only,delegated_by,client_id,client_name,job_id,property_id,property_address,
+                is_recurring,recurrence_rule,communication_method,source,is_billable,has_cost,checklist,calendar_sync_enabled,tenant_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                (task_id,data.get("title",""),data.get("description"),data.get("task_type","interni_poznamka"),
                  data.get("status","novy"),data.get("priority","bezna"),data.get("deadline"),data.get("planned_date"),
-                 data.get("estimated_minutes"),data.get("created_by","Marek"),data.get("assigned_to"),
+                 planning_start, planning_end,
+                 data.get("estimated_minutes"),data.get("created_by","Marek"),assigned_to,assigned_user_id,
+                 data.get("planning_note"),data.get("reminder_for_assignee_only", True),data.get("delegated_by"),
                  data.get("client_id"),data.get("client_name"),data.get("job_id"),data.get("property_id"),
                  data.get("property_address"),data.get("is_recurring",False),data.get("recurrence_rule"),
                  data.get("communication_method"),data.get("source","manualne"),
-                 data.get("is_billable",False),data.get("has_cost",False),json.dumps(data.get("checklist",[]))))
+                 data.get("is_billable",False),data.get("has_cost",False),json.dumps(data.get("checklist",[])),
+                 data.get("calendar_sync_enabled", True),tenant_id))
             task = dict(cur.fetchone())
-            log_activity(conn,"task",tid,"create",f"Ukol '{data.get('title','')}' vytvoren")
+            log_activity(conn,"task",task_id,"create",f"Ukol '{data.get('title','')}' vytvoren")
             conn.commit()
         return task
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
 @app.put("/crm/tasks/{task_id}")
-async def update_task(task_id: str, data: dict):
+async def update_task(task_id: str, data: dict, request: Request):
     conn = get_db_conn()
     try:
         sets = []; vals = []
-        for k in ["title","description","task_type","status","priority","deadline","assigned_to","result","is_completed","actual_minutes","planned_date"]:
+        tenant_id = get_request_tenant_id(request)
+        if "assigned_user_id" in data or "assigned_to" in data:
+            assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, data.get("assigned_user_id"), data.get("assigned_to"))
+            sets.append("assigned_to=%s"); vals.append(assigned_to)
+            sets.append("assigned_user_id=%s"); vals.append(assigned_user_id)
+            sets.append("delegated_by=%s"); vals.append(get_user_display_name(conn, tenant_id, request.state.user.get("user_id")))
+        if "planned_start_at" in data or "planned_end_at" in data or "planned_date" in data or "deadline" in data:
+            planning_start, planning_end = planning_window_from_values(
+                data.get("planned_start_at"), data.get("planned_end_at"), data.get("planned_date") or data.get("deadline")
+            )
+            if "planned_start_at" in data or "planned_date" in data or "deadline" in data:
+                sets.append("planned_start_at=%s"); vals.append(planning_start)
+            if "planned_end_at" in data or "planned_start_at" in data:
+                sets.append("planned_end_at=%s"); vals.append(planning_end)
+        for k in ["title","description","task_type","status","priority","deadline","result","is_completed","actual_minutes","planned_date","planning_note","reminder_for_assignee_only","calendar_sync_enabled"]:
             if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
         if "notes" in data: sets.append("notes=%s"); vals.append(json.dumps(data["notes"]))
         if "checklist" in data: sets.append("checklist=%s"); vals.append(json.dumps(data["checklist"]))
@@ -1291,6 +2245,53 @@ async def update_task(task_id: str, data: dict):
         return {"status":"updated"}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
+
+@app.get("/crm/calendar-feed")
+async def get_calendar_feed(request: Request, days: int = 30):
+    user = ensure_request_permissions(request, "calendar_read")
+    tenant_id = user["tenant_id"]
+    current_user_id = user.get("user_id")
+    conn = get_db_conn()
+    try:
+        entries = []
+        cutoff = datetime.utcnow() - timedelta(days=1)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT j.id, j.job_title, j.job_status, j.client_id, c.display_name AS client_name,
+                    j.start_date_planned::text, j.planned_start_at::text, j.planned_end_at::text,
+                    j.assigned_user_id, j.assigned_to, j.handover_note, COALESCE(j.calendar_sync_enabled, TRUE) AS calendar_sync_enabled
+                FROM jobs j
+                LEFT JOIN clients c ON c.id = j.client_id
+                WHERE j.tenant_id=%s AND j.deleted_at IS NULL
+                ORDER BY COALESCE(j.planned_start_at, j.created_at) DESC""", (tenant_id,))
+            for row in cur.fetchall():
+                entry = build_calendar_entry("job", dict(row), current_user_id)
+                if not entry:
+                    continue
+                start_dt = parse_planning_datetime(entry.get("planned_start_at"))
+                if start_dt and start_dt >= cutoff and start_dt <= datetime.utcnow() + timedelta(days=days):
+                    entries.append(entry)
+
+            cur.execute("""SELECT t.id, t.title, t.status, t.client_id, t.client_name, t.job_id,
+                    j.job_title, t.deadline, t.planned_date, t.planned_start_at::text, t.planned_end_at::text,
+                    t.assigned_user_id, t.assigned_to, t.planning_note,
+                    COALESCE(t.reminder_for_assignee_only, TRUE) AS reminder_for_assignee_only,
+                    COALESCE(t.calendar_sync_enabled, TRUE) AS calendar_sync_enabled
+                FROM tasks t
+                LEFT JOIN jobs j ON j.id = t.job_id
+                WHERE t.tenant_id=%s AND COALESCE(t.is_completed, FALSE)=FALSE
+                ORDER BY COALESCE(t.planned_start_at, t.created_at) DESC""", (tenant_id,))
+            for row in cur.fetchall():
+                entry = build_calendar_entry("task", dict(row), current_user_id, row.get("job_title"))
+                if not entry:
+                    continue
+                start_dt = parse_planning_datetime(entry.get("planned_start_at"))
+                if start_dt and start_dt >= cutoff and start_dt <= datetime.utcnow() + timedelta(days=days):
+                    entries.append(entry)
+
+        entries.sort(key=lambda item: item.get("planned_start_at") or "")
+        return entries
+    finally:
+        release_conn(conn)
 
 @app.delete("/crm/tasks/{task_id}")
 async def delete_task(task_id: str):
@@ -1441,6 +2442,209 @@ async def create_invoice(data: dict):
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
+@app.get("/crm/contact-sections")
+async def get_contact_sections(request: Request):
+    user = ensure_request_permissions(request, "contacts_read")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT section_code, display_name, is_default, sort_order
+                FROM contact_sections
+                WHERE tenant_id=%s AND is_active=TRUE
+                ORDER BY sort_order, LOWER(display_name)""", (user["tenant_id"],))
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        release_conn(conn)
+
+@app.post("/crm/contact-sections")
+async def create_contact_section(data: dict, request: Request):
+    user = ensure_request_permissions(request, "contacts_write")
+    tenant_id = user["tenant_id"]
+    display_name = (data.get("display_name") or "").strip()
+    if not display_name:
+        raise HTTPException(400, "display_name required")
+    section_code = normalize_section_code(data.get("section_code") or display_name)
+    if not section_code:
+        raise HTTPException(400, "section_code required")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_sort FROM contact_sections WHERE tenant_id=%s", (tenant_id,))
+            max_sort = int((cur.fetchone() or {}).get("max_sort") or 0)
+            cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order, is_active, updated_at)
+                VALUES (%s,%s,%s,FALSE,%s,TRUE,now())
+                ON CONFLICT (tenant_id, section_code) DO UPDATE SET
+                    display_name=EXCLUDED.display_name,
+                    is_active=TRUE,
+                    updated_at=now()
+                RETURNING section_code, display_name, is_default, sort_order""",
+                (tenant_id, section_code, display_name, max_sort + 10))
+            row = dict(cur.fetchone())
+            conn.commit()
+            return row
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+@app.get("/crm/contacts")
+async def get_shared_contacts(request: Request):
+    user = ensure_request_permissions(request, "contacts_read")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT c.id, c.section_code, s.display_name AS section_name, c.display_name, c.company_name,
+                                  c.phone_primary, c.email_primary, c.notes, c.source, c.created_at::text, c.updated_at::text
+                FROM shared_contacts c
+                LEFT JOIN contact_sections s ON s.tenant_id=c.tenant_id AND s.section_code=c.section_code
+                WHERE c.tenant_id=%s AND c.deleted_at IS NULL
+                ORDER BY s.sort_order, LOWER(c.display_name), c.id""", (user["tenant_id"],))
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        release_conn(conn)
+
+@app.post("/crm/contacts")
+async def create_shared_contact(data: dict, request: Request):
+    user = ensure_request_permissions(request, "contacts_write")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            row, created = merge_shared_contact(cur, user["tenant_id"], user["user_id"], data, source=data.get("source") or "manual")
+            log_activity(conn, "shared_contact", row["id"], "create" if created else "merge", f"Contact {row['display_name']} saved", tenant_id=user["tenant_id"], user_id=user["user_id"])
+            conn.commit()
+            return row
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+@app.put("/crm/contacts/{contact_id}")
+async def update_shared_contact(contact_id: int, data: dict, request: Request):
+    user = ensure_request_permissions(request, "contacts_write")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM shared_contacts WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (contact_id, user["tenant_id"]))
+            existing = cur.fetchone()
+            if not existing:
+                raise HTTPException(404, "Contact not found")
+            existing = dict(existing)
+            section_code = normalize_section_code(data.get("section_code") or existing.get("section_code"))
+            ensure_contact_section(cur, user["tenant_id"], section_code)
+            display_name = (data.get("display_name") or existing.get("display_name") or "").strip()
+            if not display_name:
+                raise HTTPException(400, "display_name required")
+            phone_primary = (data.get("phone_primary") or existing.get("phone_primary") or "").strip() or None
+            email_primary = (data.get("email_primary") or existing.get("email_primary") or "").strip() or None
+            cur.execute("""UPDATE shared_contacts
+                SET section_code=%s,
+                    display_name=%s,
+                    company_name=%s,
+                    phone_primary=%s,
+                    email_primary=%s,
+                    notes=%s,
+                    normalized_phone=%s,
+                    normalized_email=%s,
+                    updated_by=%s,
+                    updated_at=now()
+                WHERE id=%s AND tenant_id=%s
+                RETURNING *""",
+                (
+                    section_code,
+                    display_name,
+                    (data.get("company_name") if "company_name" in data else existing.get("company_name")) or None,
+                    phone_primary,
+                    email_primary,
+                    (data.get("notes") if "notes" in data else existing.get("notes")) or None,
+                    normalize_phone(phone_primary) or None,
+                    normalize_email(email_primary) or None,
+                    user["user_id"],
+                    contact_id,
+                    user["tenant_id"],
+                ))
+            row = dict(cur.fetchone())
+            log_activity(conn, "shared_contact", row["id"], "update", f"Contact {row['display_name']} updated", tenant_id=user["tenant_id"], user_id=user["user_id"])
+            conn.commit()
+            return row
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+@app.delete("/crm/contacts/{contact_id}")
+async def delete_shared_contact(contact_id: int, request: Request):
+    user = ensure_request_permissions(request, "contacts_write")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE shared_contacts
+                SET deleted_at=now(), updated_at=now(), updated_by=%s
+                WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL
+                RETURNING id, display_name""", (user["user_id"], contact_id, user["tenant_id"]))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Contact not found")
+            log_activity(conn, "shared_contact", row["id"], "archive", f"Contact {row['display_name']} archived", tenant_id=user["tenant_id"], user_id=user["user_id"])
+            conn.commit()
+            return {"status": "archived", "id": row["id"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+@app.post("/crm/contacts/import")
+async def import_shared_contacts(data: dict, request: Request):
+    user = ensure_request_permissions(request, "contacts_write")
+    contacts = data.get("contacts", [])
+    if not contacts:
+        raise HTTPException(400, "No contacts provided")
+    conn = get_db_conn()
+    imported = 0
+    merged = 0
+    errors = []
+    try:
+        with conn.cursor() as cur:
+            for contact in contacts:
+                if not contact.get("selected"):
+                    continue
+                try:
+                    row, created = merge_shared_contact(cur, user["tenant_id"], user["user_id"], contact, source="phone_import")
+                    if created:
+                        imported += 1
+                    else:
+                        merged += 1
+                except Exception as row_error:
+                    errors.append(str(row_error))
+            conn.commit()
+        return {"imported": imported, "merged": merged, "errors": errors}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+def map_work_entry_type_to_service_rate(entry_type):
+    low = str(entry_type or "").strip().lower().replace(" ", "_")
+    if low in ("pruning", "hedge_trimming", "hedge", "trimming", "trim"):
+        return "hedge_trimming"
+    if low in ("arborist", "arborist_works", "tree", "tree_surgeon", "tree-surgeon", "tree_surgery"):
+        return "arborist_works"
+    if low in ("waste", "garden_waste_bulkbag", "bulkbag"):
+        return "garden_waste_bulkbag"
+    return "garden_maintenance" if low in ("maintenance", "garden_maintenance", "") else "hourly_rate"
+
 @app.post("/crm/invoices/from-work-report")
 async def create_invoice_from_work_report(data: dict, request: Request):
     """Create an invoice from a work report. Calculates profit using worker costs."""
@@ -1463,10 +2667,6 @@ async def create_invoice_from_work_report(data: dict, request: Request):
             # Get workers with costs
             cur.execute("SELECT w.*, u.hourly_cost FROM work_report_workers w LEFT JOIN users u ON LOWER(u.display_name)=LOWER(w.worker_name) AND u.tenant_id=%s WHERE w.work_report_id=%s", (tid, wr_id))
             workers = cur.fetchall()
-            # Get client default rate
-            cur.execute("SELECT default_hourly_rate FROM clients WHERE id=%s AND tenant_id=%s", (wr["client_id"], tid))
-            cl = cur.fetchone()
-            client_rate = float(cl["default_hourly_rate"] or 0) if cl else 0
             # Create invoice
             code = f"INV-{uuid.uuid4().hex[:6].upper()}"
             due_date = data.get("due_date")
@@ -1484,7 +2684,9 @@ async def create_invoice_from_work_report(data: dict, request: Request):
             for i, e in enumerate(entries):
                 hrs = float(e.get("hours",0) or 0)
                 rate = float(e.get("unit_rate",0) or 0)
-                if rate == 0 and client_rate > 0: rate = client_rate
+                if rate == 0:
+                    rate_type = map_work_entry_type_to_service_rate(e.get("type"))
+                    rate = get_effective_rate(conn, tid, client_id=wr.get("client_id"), rate_type=rate_type)
                 item_total = float(e.get("total_price",0) or hrs * rate)
                 cur.execute("""INSERT INTO invoice_items (invoice_id,description,quantity,unit_price,total,sort_order,tenant_id)
                     VALUES (%s,%s,%s,%s,%s,%s,%s)""",
@@ -1545,13 +2747,90 @@ async def update_client_rate(client_id: int, data: dict, request: Request):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            hourly_rate = float(data.get("default_hourly_rate", 0) or 0)
             cur.execute("UPDATE clients SET default_hourly_rate=%s, updated_at=now() WHERE id=%s AND tenant_id=%s RETURNING id,display_name,default_hourly_rate",
-                (data.get("default_hourly_rate",0), client_id, tid))
+                (hourly_rate, client_id, tid))
             c = cur.fetchone()
             if not c: raise HTTPException(404, "Client not found")
+            cur.execute("""DELETE FROM pricing_rules
+                WHERE tenant_id=%s AND scope='client' AND scope_id=%s
+                  AND rule_type='service_rate' AND rule_key IN ('hourly_rate','garden_maintenance')""",
+                (tid, client_id))
+            if hourly_rate > 0:
+                for rule_key in ("hourly_rate", "garden_maintenance"):
+                    cur.execute("""INSERT INTO pricing_rules (tenant_id, scope, scope_id, rule_type, rule_key, rate)
+                        VALUES (%s,'client',%s,'service_rate',%s,%s)""",
+                        (tid, client_id, rule_key, hourly_rate))
             log_activity(conn, "client", client_id, "update_rate", f"Default rate: {c['default_hourly_rate']} GBP/h")
             conn.commit()
         return dict(c)
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.get("/crm/clients/{client_id}/service-rates")
+async def get_client_service_rates_api(client_id: int, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (client_id, tid))
+            if not cur.fetchone(): raise HTTPException(404, "Client not found")
+        overrides = get_client_service_rate_overrides(conn, tid, client_id)
+        return {
+            "client_id": client_id,
+            "service_rates": get_client_service_rates(conn, tid, client_id),
+            "service_rate_overrides": {k: v for k, v in overrides.items() if k in VISIBLE_CLIENT_SERVICE_RATE_KEYS},
+            "has_individual_service_rates": bool(overrides),
+        }
+    finally: release_conn(conn)
+
+@app.put("/crm/clients/{client_id}/service-rates")
+async def update_client_service_rates(client_id: int, data: dict, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        normalized = {}
+        for key, value in (data or {}).items():
+            if key not in CLIENT_SERVICE_RATE_KEYS:
+                continue
+            try:
+                rate = float(value)
+            except (TypeError, ValueError):
+                continue
+            if rate > 0:
+                normalized[key] = rate
+        if "garden_maintenance" in normalized and "hourly_rate" not in normalized:
+            normalized["hourly_rate"] = normalized["garden_maintenance"]
+        if "hourly_rate" in normalized and "garden_maintenance" not in normalized:
+            normalized["garden_maintenance"] = normalized["hourly_rate"]
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, display_name FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (client_id, tid))
+            client = cur.fetchone()
+            if not client: raise HTTPException(404, "Client not found")
+            cur.execute("""DELETE FROM pricing_rules
+                WHERE tenant_id=%s AND scope='client' AND scope_id=%s
+                  AND rule_type='service_rate' AND rule_key = ANY(%s)""",
+                (tid, client_id, CLIENT_SERVICE_RATE_KEYS))
+            for rule_key, rate in normalized.items():
+                cur.execute("""INSERT INTO pricing_rules (tenant_id, scope, scope_id, rule_type, rule_key, rate)
+                    VALUES (%s,'client',%s,'service_rate',%s,%s)""",
+                    (tid, client_id, rule_key, rate))
+            legacy_hourly = normalized.get("hourly_rate") or normalized.get("garden_maintenance") or 0
+            cur.execute("UPDATE clients SET default_hourly_rate=%s, updated_at=now() WHERE id=%s AND tenant_id=%s",
+                (legacy_hourly, client_id, tid))
+            if normalized:
+                log_activity(conn, "client", client_id, "update_service_rates", f"Individual service rates updated for {client['display_name']}")
+            else:
+                log_activity(conn, "client", client_id, "reset_service_rates", f"Individual service rates cleared for {client['display_name']}")
+            conn.commit()
+        overrides = get_client_service_rate_overrides(conn, tid, client_id)
+        return {
+            "client_id": client_id,
+            "service_rates": get_client_service_rates(conn, tid, client_id),
+            "service_rate_overrides": {k: v for k, v in overrides.items() if k in VISIBLE_CLIENT_SERVICE_RATE_KEYS},
+            "has_individual_service_rates": bool(overrides),
+        }
     except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
@@ -1586,6 +2865,21 @@ async def update_default_rates(tenant_id: int, data: dict, request: Request):
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
+def get_client_service_rate_overrides(conn, tid, client_id):
+    with conn.cursor() as cur:
+        cur.execute("""SELECT rule_key, rate
+            FROM pricing_rules
+            WHERE tenant_id=%s AND scope='client' AND scope_id=%s
+              AND rule_type='service_rate' AND rule_key = ANY(%s)""",
+            (tid, client_id, CLIENT_SERVICE_RATE_KEYS))
+        return {row["rule_key"]: float(row["rate"]) for row in cur.fetchall() if row.get("rule_key")}
+
+def get_client_service_rates(conn, tid, client_id):
+    return {
+        key: get_effective_rate(conn, tid, client_id=client_id, rate_type=key)
+        for key in VISIBLE_CLIENT_SERVICE_RATE_KEYS
+    }
+
 def get_effective_rate(conn, tid, user_id=None, client_id=None, rate_type="hourly_rate"):
     """Get rate with fallback: user > client > tenant default."""
     with conn.cursor() as cur:
@@ -1593,13 +2887,22 @@ def get_effective_rate(conn, tid, user_id=None, client_id=None, rate_type="hourl
             cur.execute(f"SELECT {rate_type} FROM users WHERE id=%s AND tenant_id=%s", (user_id, tid))
             r = cur.fetchone()
             if r and float(r[rate_type] or 0) > 0: return float(r[rate_type])
+        if client_id:
+            cur.execute("""SELECT rate
+                FROM pricing_rules
+                WHERE tenant_id=%s AND scope='client' AND scope_id=%s
+                  AND rule_type='service_rate' AND rule_key=%s
+                ORDER BY created_at DESC LIMIT 1""", (tid, client_id, rate_type))
+            r = cur.fetchone()
+            if r and float(r["rate"] or 0) > 0: return float(r["rate"])
         if client_id and rate_type == "hourly_rate":
             cur.execute("SELECT default_hourly_rate FROM clients WHERE id=%s AND tenant_id=%s", (client_id, tid))
             r = cur.fetchone()
             if r and float(r["default_hourly_rate"] or 0) > 0: return float(r["default_hourly_rate"])
         cur.execute("SELECT rate FROM tenant_default_rates WHERE tenant_id=%s AND rate_type=%s", (tid, rate_type))
         r = cur.fetchone()
-        return float(r["rate"]) if r else 0
+        if r and float(r["rate"] or 0) > 0: return float(r["rate"])
+    return SERVICE_RATE_DEFAULTS.get(rate_type, 0.0)
 
 # === BATCH INVOICE FROM WORK REPORTS ===
 @app.post("/crm/invoices/batch-from-work-reports")
@@ -2269,6 +3572,19 @@ def require_role(*roles):
         return user
     return checker
 
+def require_permission(*permission_codes):
+    """Factory for permission-based access."""
+    async def checker(user: dict = Depends(require_auth)):
+        conn = get_db_conn()
+        try:
+            permissions = get_effective_permissions(conn, user["tenant_id"], user["user_id"], user.get("role"))
+            if not all(permissions.get(code, False) for code in permission_codes):
+                raise HTTPException(403, "Permission denied")
+            return user
+        finally:
+            release_conn(conn)
+    return checker
+
 @app.post("/auth/login")
 async def auth_login(data: dict):
     email = data.get("email","").strip().lower()
@@ -2287,6 +3603,7 @@ async def auth_login(data: dict):
             if not user["password_hash"] or not verify_password(password, user["password_hash"]):
                 raise HTTPException(401, "Invalid credentials")
             role = user["role_name"] or "viewer"
+            permissions = get_effective_permissions(conn, user["tenant_id"], user["id"], role)
             access = create_token(user["id"], user["tenant_id"], role, "access")
             refresh = create_token(user["id"], user["tenant_id"], role, "refresh")
             log_activity(conn, "user", str(user["id"]), "login", f"{user['display_name']} logged in", tenant_id=user["tenant_id"], user_id=user["id"])
@@ -2294,7 +3611,7 @@ async def auth_login(data: dict):
         return {
             "access_token": access, "refresh_token": refresh, "token_type": "bearer",
             "user": {"id": user["id"], "display_name": user["display_name"], "email": user["email"],
-                     "role": role, "tenant_id": user["tenant_id"], "is_owner": user["is_owner"]}
+                     "role": role, "tenant_id": user["tenant_id"], "is_owner": user["is_owner"], "permissions": permissions}
         }
     finally: release_conn(conn)
 
@@ -2316,40 +3633,74 @@ async def auth_me(user: dict = Depends(require_auth)):
                 u.preferred_language_code, r.role_name FROM users u LEFT JOIN roles r ON u.role_id=r.id WHERE u.id=%s""", (user["user_id"],))
             u = cur.fetchone()
             if not u: raise HTTPException(404, "User not found")
-        return dict(u)
+        payload = dict(u)
+        payload["permissions"] = get_effective_permissions(conn, u["tenant_id"], u["id"], u.get("role_name"))
+        return payload
+    finally: release_conn(conn)
+
+@app.get("/auth/permissions")
+async def auth_list_permissions(admin: dict = Depends(require_permission("manage_users"))):
+    conn = get_db_conn()
+    try:
+        return load_permission_catalog(conn)
     finally: release_conn(conn)
 
 @app.get("/auth/roles")
-async def auth_list_roles(admin: dict = Depends(require_role("admin"))):
+async def auth_list_roles(admin: dict = Depends(require_permission("manage_users"))):
     conn = get_db_conn()
     try:
+        catalog = load_permission_catalog(conn)
+        role_maps = load_role_permission_maps(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT role_name, description FROM roles ORDER BY id")
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            role_name = (row.get("role_name") or "viewer").lower()
+            row["permissions"] = complete_permission_map(role_maps.get(role_name, default_permissions_for_role(role_name)))
+            row["permission_details"] = catalog
+        return rows
     finally: release_conn(conn)
 
 @app.get("/auth/users")
-async def auth_list_users(admin: dict = Depends(require_role("admin"))):
+async def auth_list_users(admin: dict = Depends(require_permission("manage_users"))):
     conn = get_db_conn()
     try:
+        role_maps = load_role_permission_maps(conn)
+        user_overrides = load_user_permission_overrides(conn, admin["tenant_id"])
         with conn.cursor() as cur:
             cur.execute("""SELECT u.id, u.display_name, u.email, u.phone, u.status,
                 r.role_name, u.created_at
                 FROM users u LEFT JOIN roles r ON u.role_id=r.id
                 WHERE u.tenant_id=%s AND u.deleted_at IS NULL
                 ORDER BY u.id""", (admin["tenant_id"],))
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            user_id = int(row["id"])
+            role_name = (row.get("role_name") or "viewer").lower()
+            role_permissions = complete_permission_map(role_maps.get(role_name, default_permissions_for_role(role_name)))
+            overrides = normalize_permission_payload(user_overrides.get(user_id, {}))
+            effective = dict(role_permissions)
+            effective.update(overrides)
+            row["role_permissions"] = role_permissions
+            row["user_permission_overrides"] = overrides
+            row["permissions"] = complete_permission_map(effective)
+        return rows
     finally: release_conn(conn)
 
 @app.put("/auth/users/{user_id}")
-async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(require_role("admin"))):
+async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(require_permission("manage_users"))):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL",
+            cur.execute("""SELECT u.id, r.role_name
+                FROM users u
+                LEFT JOIN roles r ON r.id = u.role_id
+                WHERE u.id=%s AND u.tenant_id=%s AND u.deleted_at IS NULL""",
                 (user_id, admin["tenant_id"]))
-            if not cur.fetchone(): raise HTTPException(404, "User not found")
+            user_row = cur.fetchone()
+            if not user_row: raise HTTPException(404, "User not found")
             updates, params = [], []
+            resolved_role = user_row["role_name"] or "viewer"
             if "display_name" in data:
                 updates.append("display_name=%s"); params.append(data["display_name"])
             if "phone" in data:
@@ -2361,10 +3712,18 @@ async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(requi
                 row = cur.fetchone()
                 if not row: raise HTTPException(400, f"Unknown role: {data['role']}")
                 updates.append("role_id=%s"); params.append(row["id"])
-            if not updates: raise HTTPException(400, "Nothing to update")
-            updates.append("updated_at=now()")
-            params += [user_id, admin["tenant_id"]]
-            cur.execute(f"UPDATE users SET {','.join(updates)} WHERE id=%s AND tenant_id=%s", params)
+                resolved_role = data["role"]
+            if updates:
+                updates.append("updated_at=now()")
+                params += [user_id, admin["tenant_id"]]
+                cur.execute(f"UPDATE users SET {','.join(updates)} WHERE id=%s AND tenant_id=%s", params)
+            permissions_payload = normalize_permission_payload(data.get("permissions"))
+            if permissions_payload:
+                save_user_permission_overrides(conn, admin["tenant_id"], user_id, resolved_role, permissions_payload)
+            elif data.get("reset_permission_overrides") is True:
+                clear_user_permission_overrides(conn, user_id)
+            if not updates and not permissions_payload and data.get("reset_permission_overrides") is not True:
+                raise HTTPException(400, "Nothing to update")
             conn.commit()
         return {"ok": True}
     except HTTPException: raise
@@ -2372,7 +3731,7 @@ async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(requi
     finally: release_conn(conn)
 
 @app.delete("/auth/users/{user_id}")
-async def auth_delete_user(user_id: int, admin: dict = Depends(require_role("admin"))):
+async def auth_delete_user(user_id: int, admin: dict = Depends(require_permission("manage_users"))):
     if user_id == admin["user_id"]: raise HTTPException(400, "Cannot delete yourself")
     conn = get_db_conn()
     try:
@@ -2388,7 +3747,7 @@ async def auth_delete_user(user_id: int, admin: dict = Depends(require_role("adm
     finally: release_conn(conn)
 
 @app.post("/auth/register")
-async def auth_register(data: dict, admin: dict = Depends(require_role("admin"))):
+async def auth_register(data: dict, admin: dict = Depends(require_permission("manage_users"))):
     """Admin-only: register new user."""
     email = data.get("email","").strip().lower()
     password = data.get("password","").strip()
@@ -2411,9 +3770,18 @@ async def auth_register(data: dict, admin: dict = Depends(require_role("admin"))
                 (admin["tenant_id"], role_id, data.get("first_name",""), data.get("last_name",""),
                  display_name, email, data.get("phone",""), hash_password(password)))
             uid = cur.fetchone()["id"]
+            permissions_payload = normalize_permission_payload(data.get("permissions"))
+            if permissions_payload:
+                save_user_permission_overrides(conn, admin["tenant_id"], uid, role_name, permissions_payload)
             log_activity(conn, "user", str(uid), "register", f"User {display_name} registered by admin", tenant_id=admin["tenant_id"], user_id=admin["user_id"])
             conn.commit()
-        return {"id": uid, "email": email, "display_name": display_name, "role": role_name}
+        return {
+            "id": uid,
+            "email": email,
+            "display_name": display_name,
+            "role": role_name,
+            "permissions": get_effective_permissions(conn, admin["tenant_id"], uid, role_name)
+        }
     except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
@@ -2599,6 +3967,68 @@ async def get_tenant_config_endpoint(tenant_id: int):
         config["warnings"] = warnings
         return config
     finally: release_conn(conn)
+
+@app.put("/tenant/config/{tenant_id}/languages")
+async def update_tenant_languages_endpoint(tenant_id: int, data: dict, user: dict = Depends(require_permission("manage_users"))):
+    conn = get_db_conn()
+    try:
+        if user["tenant_id"] != tenant_id:
+            raise HTTPException(403, "Permission denied")
+        verify_tenant(conn, tenant_id)
+        default_customer_lang = data.get("default_customer_language_code")
+        default_internal_lang = data.get("default_internal_language_code")
+        if not default_customer_lang and not default_internal_lang:
+            raise HTTPException(400, "No language update requested")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT internal_language_mode, customer_language_mode,
+                    default_internal_language_code, default_customer_language_code
+                FROM tenant_operating_profile
+                WHERE tenant_id=%s
+            """, (tenant_id,))
+            profile = cur.fetchone()
+            if not profile:
+                raise HTTPException(404, "Tenant config not found")
+            resolved_internal = default_internal_lang or profile["default_internal_language_code"]
+            resolved_customer = default_customer_lang or profile["default_customer_language_code"]
+            cur.execute("""
+                UPDATE tenant_operating_profile
+                SET default_internal_language_code=%s,
+                    default_customer_language_code=%s,
+                    updated_at=now()
+                WHERE tenant_id=%s
+            """, (resolved_internal, resolved_customer, tenant_id))
+
+            def upsert_default_language(scope: str, code: str):
+                cur.execute("""
+                    UPDATE tenant_languages
+                    SET is_default = CASE WHEN language_code=%s THEN true ELSE false END
+                    WHERE tenant_id=%s AND language_scope=%s
+                """, (code, tenant_id, scope))
+                cur.execute("""
+                    INSERT INTO tenant_languages (tenant_id, language_code, language_scope, is_default, is_active, sort_order)
+                    VALUES (%s, %s, %s, true, true, 1)
+                    ON CONFLICT (tenant_id, language_code, language_scope) DO UPDATE SET
+                        is_default=true,
+                        is_active=true
+                """, (tenant_id, code, scope))
+
+            if default_internal_lang:
+                upsert_default_language("internal", resolved_internal)
+                upsert_default_language("voice_input", resolved_internal)
+            if default_customer_lang:
+                upsert_default_language("customer", resolved_customer)
+                upsert_default_language("voice_output", resolved_customer)
+            conn.commit()
+            _tenant_config_cache.pop(tenant_id, None)
+        return get_tenant_config(conn, tenant_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
 
 @app.get("/onboarding/industry-subtypes/{group_id}")
 async def get_industry_subtypes(group_id: int):
@@ -2822,6 +4252,18 @@ async def schema_audit():
     finally: release_conn(conn)
 
 # ========== PRICING ENGINE ==========
+def map_pricing_rule_to_service_rate(rule_type, rule_key=None):
+    if rule_type == "waste_rate":
+        return "garden_waste_bulkbag"
+    if rule_type != "task_rate":
+        return None
+    low = str(rule_key or "").strip().lower().replace(" ", "_")
+    if low in ("pruning", "hedge", "hedge_trimming", "trim", "trimming"):
+        return "hedge_trimming"
+    if low in ("arborist", "arborist_works", "tree", "tree_surgeon", "tree-surgeon", "tree_surgery"):
+        return "arborist_works"
+    return "garden_maintenance"
+
 def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_id=None):
     """Priority: job → client → system default"""
     with conn.cursor() as cur:
@@ -2839,6 +4281,11 @@ def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_
             (tenant_id,rule_type,rule_key))
         r = cur.fetchone()
         if r: return float(r['rate'])
+    mapped_service_rate = map_pricing_rule_to_service_rate(rule_type, rule_key)
+    if mapped_service_rate:
+        rate = get_effective_rate(conn, tenant_id, client_id=client_id, rate_type=mapped_service_rate)
+        if rate > 0:
+            return rate
     defaults = {"worker_rate":35.0,"task_rate":35.0,"waste_rate":80.0,"material_price":0.0}
     return defaults.get(rule_type, 0.0)
 
