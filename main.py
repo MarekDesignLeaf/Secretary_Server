@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import uvicorn
 from openai import OpenAI
+import httpx
 from datetime import datetime, timedelta
 import base64
 import jwt as pyjwt
@@ -30,7 +31,7 @@ JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
-PROTECTED_PREFIXES = ["/crm/", "/process", "/voice/", "/work-reports"]
+PROTECTED_PREFIXES = ["/crm/", "/plants/", "/process", "/voice/", "/work-reports"]
 PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
 
 PERMISSION_DEFINITIONS = [
@@ -458,9 +459,144 @@ WA_PHONE_ID = env_first("WHATSAPP_PHONE_NUMBER_ID", "WA_PHONE_ID", "META_WHATSAP
 WA_ACCOUNT_ID = env_first("WHATSAPP_BUSINESS_ACCOUNT_ID", "WA_ACCOUNT_ID", "META_WHATSAPP_BUSINESS_ACCOUNT_ID")
 WA_TOKEN = env_first("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOKEN")
 WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="designleaf_webhook_2026")
+PLANTNET_API_KEY = env_first("PLANTNET_API_KEY", "PLANT_ID_API_KEY", "PLANTNET_PRIVATE_API_KEY")
+PLANTNET_PROJECT = env_first("PLANTNET_PROJECT", default="all")
 
 def get_wa_api_url() -> str:
     return f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
+
+def tr_lang(lang: str, en: str, cs: str, pl: str) -> str:
+    code = (lang or "en").split("-")[0].lower()
+    return cs if code == "cs" else pl if code == "pl" else en
+
+async def plantnet_identify(files: List[UploadFile], organs: List[str], language: str) -> dict:
+    if not PLANTNET_API_KEY:
+        raise HTTPException(503, tr_lang(
+            language,
+            "Plant recognition service is not configured.",
+            "Služba pro rozpoznávání rostlin není nastavená.",
+            "Usługa rozpoznawania roślin nie jest skonfigurowana."
+        ))
+    payload_files = []
+    for index, upload in enumerate(files):
+        content = await upload.read()
+        if not content:
+            raise HTTPException(400, f"Image {index + 1} is empty")
+        payload_files.append((
+            "images",
+            (
+                upload.filename or f"plant_{index + 1}.jpg",
+                content,
+                upload.content_type or "image/jpeg",
+            ),
+        ))
+    lang_code = (language or "en").split("-")[0].lower()
+    params = {"api-key": PLANTNET_API_KEY, "lang": lang_code, "include-related-images": "false", "nb-results": "5"}
+    data = [("organs", organ or "auto") for organ in organs]
+    url = f"https://my-api.plantnet.org/v2/identify/{PLANTNET_PROJECT}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(url, params=params, data=data, files=payload_files)
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500]
+        if exc.response.status_code in (401, 403):
+            raise HTTPException(502, tr_lang(
+                language,
+                "Plant identification service rejected the API key.",
+                "Služba pro rozpoznání rostlin odmítla API klíč.",
+                "Usługa rozpoznawania roślin odrzuciła klucz API."
+            ))
+        raise HTTPException(502, f"Plant identification failed: {detail}")
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Plant identification network error: {exc}")
+
+def build_plant_guidance(language: str, display_name: str, scientific_name: str, family: str = "", genus: str = "") -> tuple[str, str]:
+    common_label = display_name or scientific_name or "the plant"
+    if not ai_client:
+        summary = tr_lang(
+            language,
+            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Family: {family or 'unknown'}.",
+            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Čeleď: {family or 'neuvedena'}.",
+            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Rodzina: {family or 'nie podano'}."
+        )
+        return summary, summary
+    language_name = "Czech" if language.startswith("cs") else "Polish" if language.startswith("pl") else "English"
+    prompt = (
+        f"Plant identified as {common_label} ({scientific_name}). Family: {family or 'unknown'}. Genus: {genus or 'unknown'}.\n"
+        f"Write in {language_name}. Keep it concise and practical for a gardener.\n"
+        f"Return exactly 4 short lines:\n"
+        f"1. Description: ...\n"
+        f"2. Needs: ...\n"
+        f"3. Best place: ...\n"
+        f"4. Note: mention uncertainty if species can vary."
+    )
+    try:
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You write short practical plant summaries."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=220,
+        )
+        guidance = (response.choices[0].message.content or "").strip()
+        spoken = tr_lang(
+            language,
+            f"It is most likely {common_label}. {guidance.splitlines()[0] if guidance else ''}",
+            f"Nejspíš je to {common_label}. {guidance.splitlines()[0] if guidance else ''}",
+            f"Najprawdopodobniej to {common_label}. {guidance.splitlines()[0] if guidance else ''}",
+        ).strip()
+        return guidance or common_label, spoken
+    except Exception:
+        fallback = tr_lang(
+            language,
+            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Family: {family or 'unknown'}.",
+            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Čeleď: {family or 'neuvedena'}.",
+            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Rodzina: {family or 'nie podano'}."
+        )
+        return fallback, fallback
+
+def map_plantnet_result(raw: dict, language: str, requested_organs: List[str]) -> dict:
+    results = raw.get("results") or []
+    if not results:
+        raise HTTPException(404, tr_lang(
+            language,
+            "No matching plant was found. Try clearer photos of the whole plant, leaf, flower or fruit.",
+            "Nebyla nalezena shoda. Zkus jasnější fotky celé rostliny, listu, květu nebo plodu.",
+            "Nie znaleziono pasującej rośliny. Spróbuj wyraźniejszych zdjęć całej rośliny, liścia, kwiatu albo owocu."
+        ))
+    def suggestion(item: dict) -> dict:
+        species = item.get("species") or {}
+        common_names = species.get("commonNames") or []
+        scientific_name = species.get("scientificNameWithoutAuthor") or species.get("scientificName") or ""
+        family = (species.get("family") or {}).get("scientificNameWithoutAuthor")
+        genus = (species.get("genus") or {}).get("scientificNameWithoutAuthor")
+        display_name = common_names[0] if common_names else scientific_name
+        return {
+            "display_name": display_name,
+            "scientific_name": scientific_name,
+            "common_names": common_names,
+            "family": family,
+            "genus": genus,
+            "score": float(item.get("score") or 0.0),
+        }
+    top = suggestion(results[0])
+    guidance, spoken = build_plant_guidance(language, top["display_name"], top["scientific_name"], top["family"] or "", top["genus"] or "")
+    return {
+        "database": "Pl@ntNet",
+        "display_name": top["display_name"],
+        "scientific_name": top["scientific_name"],
+        "common_names": top["common_names"],
+        "family": top["family"],
+        "genus": top["genus"],
+        "score": top["score"],
+        "organs": requested_organs,
+        "guidance": guidance,
+        "spoken_summary": spoken,
+        "suggestions": [suggestion(item) for item in results[:5]],
+    }
 
 def parse_database_config():
     database_url = os.getenv("DATABASE_URL", "")
@@ -3484,6 +3620,45 @@ async def upload_job_photo(
         raise HTTPException(500, str(e))
     finally:
         release_conn(conn)
+
+@app.post("/plants/identify")
+async def identify_plant(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    organs_json: Optional[str] = Form(None),
+    language: Optional[str] = Form("en"),
+):
+    user = ensure_request_permissions(request, "crm_read")
+    tenant_id = user["tenant_id"]
+    if not files:
+        raise HTTPException(400, "No plant images uploaded")
+    if len(files) > 5:
+        raise HTTPException(400, "A maximum of 5 images is supported")
+    try:
+        raw_organs = json.loads(organs_json) if organs_json else []
+    except Exception:
+        raise HTTPException(400, "Invalid organs_json payload")
+    organs = []
+    for index in range(len(files)):
+        organ = (raw_organs[index] if index < len(raw_organs) else "auto") or "auto"
+        organs.append(str(organ).strip().lower() or "auto")
+    plantnet_raw = await plantnet_identify(files, organs, language or "en")
+    result = map_plantnet_result(plantnet_raw, language or "en", organs)
+    conn = get_db_conn()
+    try:
+        log_activity(
+            conn,
+            "plant_identification",
+            uuid.uuid4().hex[:12],
+            "identify",
+            f"Plant identified as {result['scientific_name'] or result['display_name']}",
+            tenant_id=tenant_id,
+            user_id=user.get("user_id"),
+        )
+        conn.commit()
+    finally:
+        release_conn(conn)
+    return result
 
 @app.post("/crm/jobs/{job_id}/audit")
 async def add_job_audit(job_id: int, data: dict, request: Request):
