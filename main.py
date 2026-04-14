@@ -445,11 +445,22 @@ else:
 ai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # === WHATSAPP CONFIG ===
-WA_PHONE_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-WA_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
-WA_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "EAAYNy9s0WWIBRP99Px2xSPuJNmFWpGpyn74NmQ4WjGnMldVwt0mmuOK8A9bzvDTW6vE3UZCKXda3PZBVSZBPiGPuoBkee6LjowBYSXdRwM5oqrCoxzVeRDLfMyDCr7mxwmuNX4q3XIbIqWpkINw8WFnv4v2pUtkNzBidVMwqYr1zQr1SrvCfykko2em8XjeliIqDqRfPSAJ")
-WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "designleaf_webhook_2026")
-WA_API_URL = f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
+def env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None:
+            trimmed = value.strip()
+            if trimmed:
+                return trimmed
+    return default
+
+WA_PHONE_ID = env_first("WHATSAPP_PHONE_NUMBER_ID", "WA_PHONE_ID", "META_WHATSAPP_PHONE_NUMBER_ID")
+WA_ACCOUNT_ID = env_first("WHATSAPP_BUSINESS_ACCOUNT_ID", "WA_ACCOUNT_ID", "META_WHATSAPP_BUSINESS_ACCOUNT_ID")
+WA_TOKEN = env_first("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOKEN")
+WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="designleaf_webhook_2026")
+
+def get_wa_api_url() -> str:
+    return f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
 
 def parse_database_config():
     database_url = os.getenv("DATABASE_URL", "")
@@ -1602,11 +1613,12 @@ RULES:
                         )}
                     result = wa_send_message(phone, message)
                     if "error" in result:
+                        extra_hint = f" {result.get('config_hint')}" if result.get("config_hint") else ""
                         release_conn(conn)
                         return {"reply_cs": tr(
-                            f"WhatsApp could not be sent: {result.get('error','')}",
-                            f"WhatsApp se nepodařilo odeslat: {result.get('error','')}",
-                            f"Nie udało się wysłać WhatsApp: {result.get('error','')}"
+                            f"WhatsApp could not be sent: {result.get('error','')}.{extra_hint}",
+                            f"WhatsApp se nepodařilo odeslat: {result.get('error','')}.{extra_hint}",
+                            f"Nie udało się wysłać WhatsApp: {result.get('error','')}.{extra_hint}"
                         )}
                     with conn.cursor() as cur:
                         cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
@@ -4897,7 +4909,14 @@ async def create_pricing_rule(data: dict):
 def wa_send_message(to_phone: str, message: str):
     """Send WhatsApp message via Cloud API. Auto-translates to English."""
     if not WA_TOKEN or not WA_PHONE_ID:
-        return {"error": "WhatsApp not configured"}
+        return {
+            "error": "WhatsApp not configured",
+            "config_error": True,
+            "missing": {
+                "WHATSAPP_ACCESS_TOKEN": not bool(WA_TOKEN),
+                "WHATSAPP_PHONE_NUMBER_ID": not bool(WA_PHONE_ID),
+            },
+        }
     # Auto-translate to English using GPT
     translated = message
     if ai_client:
@@ -4914,7 +4933,7 @@ def wa_send_message(to_phone: str, message: str):
         "type": "text",
         "text": {"body": translated}
     }).encode("utf-8")
-    req = urllib.request.Request(WA_API_URL, data=payload, method="POST",
+    req = urllib.request.Request(get_wa_api_url(), data=payload, method="POST",
         headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req) as resp:
@@ -4924,7 +4943,25 @@ def wa_send_message(to_phone: str, message: str):
             return result
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        return {"error": f"WhatsApp API {e.code}", "detail": body}
+        detail = body
+        meta_error = None
+        try:
+            parsed = json.loads(body)
+            meta_error = parsed.get("error") if isinstance(parsed, dict) else None
+        except Exception:
+            meta_error = None
+        human_error = f"WhatsApp API {e.code}"
+        if e.code == 401:
+            human_error = "WhatsApp authorization failed"
+        elif e.code == 403:
+            human_error = "WhatsApp access forbidden"
+        return {
+            "error": human_error,
+            "meta_status": e.code,
+            "detail": detail,
+            "meta_error": meta_error,
+            "config_hint": "Check Railway env vars WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID." if e.code in (401, 403) else None,
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -5001,7 +5038,8 @@ async def wa_send(request: Request, data: dict):
         raise HTTPException(400, "to and message required")
     result = wa_send_message(to, message)
     if "error" in result:
-        raise HTTPException(502, result)
+        status_code = 500 if result.get("config_error") else 502
+        raise HTTPException(status_code, result)
     conn = get_db_conn()
     try:
         translated = result.get("translated_text", message)
@@ -5016,7 +5054,12 @@ async def wa_send(request: Request, data: dict):
 
 @app.get("/whatsapp/status")
 async def wa_status():
-    return {"configured": bool(WA_TOKEN and WA_PHONE_ID), "phone_id": WA_PHONE_ID[:6]+"..." if WA_PHONE_ID else None}
+    return {
+        "configured": bool(WA_TOKEN and WA_PHONE_ID),
+        "phone_id": WA_PHONE_ID[:6]+"..." if WA_PHONE_ID else None,
+        "business_account_id": WA_ACCOUNT_ID[:6]+"..." if WA_ACCOUNT_ID else None,
+        "token_present": bool(WA_TOKEN),
+    }
 
 # ========== SYSTEM ==========
 @app.get("/")
