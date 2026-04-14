@@ -461,6 +461,7 @@ WA_TOKEN = env_first("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOK
 WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="designleaf_webhook_2026")
 PLANTNET_API_KEY = env_first("PLANTNET_API_KEY", "PLANT_ID_API_KEY", "PLANTNET_PRIVATE_API_KEY")
 PLANTNET_PROJECT = env_first("PLANTNET_PROJECT", default="all")
+PLANT_HEALTH_API_KEY = env_first("PLANT_HEALTH_API_KEY", "PLANT_ID_API_KEY")
 
 def get_wa_api_url() -> str:
     return f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
@@ -502,6 +503,43 @@ def plant_guidance_labels(language: str) -> dict:
         "best_place": "Best place",
         "note": "Note",
         "instruction": "Write in English. Keep it concise and practical for a gardener.",
+    }
+
+def plant_health_labels(language: str) -> dict:
+    code = (language or "en").split("-")[0].lower()
+    if code == "cs":
+        return {
+            "finding": "Nález",
+            "cause": "Příčina",
+            "treatment": "Léčba",
+            "prevention": "Prevence",
+            "healthy": "Rostlina podle fotek působí spíš zdravě.",
+            "instruction": "Piš česky. Buď stručný a praktický pro zahradníka. Zaměř se na diagnózu, léčbu a prevenci.",
+        }
+    if code == "pl":
+        return {
+            "finding": "Wniosek",
+            "cause": "Przyczyna",
+            "treatment": "Leczenie",
+            "prevention": "Zapobieganie",
+            "healthy": "Roślina na zdjęciach wygląda raczej zdrowo.",
+            "instruction": "Pisz po polsku. Bądź zwięzły i praktyczny dla ogrodnika. Skup się na diagnozie, leczeniu i zapobieganiu.",
+        }
+    return {
+        "finding": "Finding",
+        "cause": "Cause",
+        "treatment": "Treatment",
+        "prevention": "Prevention",
+        "healthy": "The plant looks rather healthy based on the photos.",
+        "instruction": "Write in English. Keep it concise and practical for a gardener. Focus on diagnosis, treatment, and prevention.",
+    }
+
+def flatten_treatment_items(treatment: dict) -> dict:
+    treatment = treatment or {}
+    return {
+        "chemical": [str(item).strip() for item in (treatment.get("chemical") or []) if str(item).strip()],
+        "biological": [str(item).strip() for item in (treatment.get("biological") or []) if str(item).strip()],
+        "prevention": [str(item).strip() for item in (treatment.get("prevention") or []) if str(item).strip()],
     }
 
 async def plantnet_identify(files: List[UploadFile], organs: List[str], language: str) -> dict:
@@ -571,6 +609,70 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
             f"Błąd żądania podczas rozpoznawania rośliny: {exc}"
         ))
 
+async def plant_health_assessment(files: List[UploadFile], language: str) -> dict:
+    if not PLANT_HEALTH_API_KEY:
+        raise HTTPException(503, tr_lang(
+            language,
+            "Plant disease service is not configured.",
+            "Služba pro choroby rostlin není nastavená.",
+            "Usługa chorób roślin nie jest skonfigurowana."
+        ))
+    encoded_images = []
+    for index, upload in enumerate(files):
+        content = await upload.read()
+        if not content:
+            raise HTTPException(400, tr_lang(
+                language,
+                f"Image {index + 1} is empty.",
+                f"Obrázek {index + 1} je prázdný.",
+                f"Obraz {index + 1} jest pusty."
+            ))
+        encoded_images.append(base64.b64encode(content).decode("ascii"))
+    lang_code = (language or "en").split("-")[0].lower()
+    params = {
+        "details": "description,treatment,common_names",
+        "language": lang_code,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(
+                "https://api.plant.id/v3/health_assessment",
+                params=params,
+                headers={"Api-Key": PLANT_HEALTH_API_KEY},
+                json={"images": encoded_images},
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500]
+        if exc.response.status_code in (401, 403):
+            raise HTTPException(502, tr_lang(
+                language,
+                "Plant disease service rejected the API key.",
+                "Služba pro choroby rostlin odmítla API klíč.",
+                "Usługa chorób roślin odrzuciła klucz API."
+            ))
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Plant disease assessment failed: {detail}",
+            f"Posouzení choroby rostliny selhalo: {detail}",
+            f"Ocena choroby rośliny nie powiodła się: {detail}"
+        ))
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Plant disease network error: {exc}",
+            f"Síťová chyba při zjišťování choroby rostliny: {exc}",
+            f"Błąd sieci podczas sprawdzania choroby rośliny: {exc}"
+        ))
+    except Exception as exc:
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Plant disease request error: {exc}",
+            f"Chyba požadavku při zjišťování choroby rostliny: {exc}",
+            f"Błąd żądania podczas sprawdzania choroby rośliny: {exc}"
+        ))
+
 def build_plant_guidance(language: str, display_name: str, scientific_name: str, family: str = "", genus: str = "") -> tuple[str, str]:
     labels = plant_guidance_labels(language)
     common_label = display_name or scientific_name or labels["subject_fallback"]
@@ -617,6 +719,66 @@ def build_plant_guidance(language: str, display_name: str, scientific_name: str,
         )
         return fallback, fallback
 
+def build_plant_health_guidance(language: str, issue_name: str, description: str, treatment: dict, is_healthy: bool) -> tuple[str, str]:
+    labels = plant_health_labels(language)
+    treatment = flatten_treatment_items(treatment)
+    if not issue_name and is_healthy:
+        summary = tr_lang(
+            language,
+            "The plant looks healthy in the supplied photos. Keep monitoring new symptoms and maintain regular care.",
+            "Rostlina na dodaných fotkách působí zdravě. Sleduj nové příznaky a pokračuj v běžné péči.",
+            "Roślina na przesłanych zdjęciach wygląda zdrowo. Obserwuj nowe objawy i kontynuuj zwykłą pielęgnację."
+        )
+        return summary, summary
+    treatment_payload = json.dumps(treatment, ensure_ascii=False)
+    if not ai_client:
+        fallback = tr_lang(
+            language,
+            f"Most likely issue: {issue_name}. Description: {description or 'No description available.'}",
+            f"Nejpravděpodobnější problém: {issue_name}. Popis: {description or 'Popis není k dispozici.'}",
+            f"Najbardziej prawdopodobny problem: {issue_name}. Opis: {description or 'Brak opisu.'}"
+        )
+        return fallback, fallback
+    prompt = (
+        f"Plant health assessment result.\n"
+        f"Top issue: {issue_name or labels['healthy']}\n"
+        f"Plant looks healthy: {'yes' if is_healthy else 'no'}\n"
+        f"Description: {description or 'n/a'}\n"
+        f"Treatment data JSON: {treatment_payload}\n"
+        f"{labels['instruction']}\n"
+        f"Return exactly 4 short lines:\n"
+        f"1. {labels['finding']}: ...\n"
+        f"2. {labels['cause']}: ...\n"
+        f"3. {labels['treatment']}: ...\n"
+        f"4. {labels['prevention']}: ...\n"
+        f"If the plant looks healthy, mention that clearly and give practical monitoring advice."
+    )
+    try:
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You write short practical plant disease summaries and treatment guidance."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=260,
+        )
+        guidance = (response.choices[0].message.content or "").strip()
+        spoken = tr_lang(
+            language,
+            f"Most likely issue: {issue_name}. {guidance.splitlines()[0] if guidance else ''}",
+            f"Nejpravděpodobnější problém: {issue_name}. {guidance.splitlines()[0] if guidance else ''}",
+            f"Najbardziej prawdopodobny problem: {issue_name}. {guidance.splitlines()[0] if guidance else ''}",
+        ).strip()
+        return guidance or issue_name or labels["healthy"], spoken
+    except Exception:
+        fallback = tr_lang(
+            language,
+            f"Most likely issue: {issue_name}. Description: {description or 'No description available.'}",
+            f"Nejpravděpodobnější problém: {issue_name}. Popis: {description or 'Popis není k dispozici.'}",
+            f"Najbardziej prawdopodobny problem: {issue_name}. Opis: {description or 'Brak opisu.'}"
+        )
+        return fallback, fallback
+
 def map_plantnet_result(raw: dict, language: str, requested_organs: List[str]) -> dict:
     results = raw.get("results") or []
     if not results:
@@ -655,6 +817,49 @@ def map_plantnet_result(raw: dict, language: str, requested_organs: List[str]) -
         "guidance": guidance,
         "spoken_summary": spoken,
         "suggestions": [suggestion(item) for item in results[:5]],
+    }
+
+def map_plant_health_result(raw: dict, language: str) -> dict:
+    result = raw.get("result") or {}
+    is_healthy = result.get("is_healthy") or {}
+    suggestions_raw = ((result.get("disease") or {}).get("suggestions")) or []
+
+    def health_suggestion(item: dict) -> dict:
+        details = item.get("details") or {}
+        treatment = flatten_treatment_items(details.get("treatment") or {})
+        common_names = details.get("common_names") or []
+        return {
+            "name": item.get("name") or details.get("local_name") or "",
+            "probability": float(item.get("probability") or 0.0),
+            "common_names": common_names,
+            "description": details.get("description"),
+            "treatment": treatment,
+            "classification": details.get("classification") or [],
+        }
+
+    suggestions = [health_suggestion(item) for item in suggestions_raw[:5]]
+    preferred = next((item for item in suggestions_raw if not item.get("redundant")), suggestions_raw[0] if suggestions_raw else None)
+    top = health_suggestion(preferred) if preferred else None
+    healthy_binary = bool(is_healthy.get("binary"))
+    healthy_probability = float(is_healthy.get("probability") or 0.0)
+    guidance, spoken = build_plant_health_guidance(
+        language,
+        top["name"] if top else "",
+        top.get("description") or "" if top else "",
+        top.get("treatment") or {} if top else {},
+        healthy_binary,
+    )
+    return {
+        "database": "Plant.id Health Assessment",
+        "is_healthy": healthy_binary,
+        "health_probability": healthy_probability,
+        "top_issue_name": top["name"] if top else None,
+        "top_issue_common_names": top["common_names"] if top else [],
+        "top_issue_probability": top["probability"] if top else 0.0,
+        "top_issue_description": top["description"] if top else None,
+        "guidance": guidance,
+        "spoken_summary": spoken,
+        "suggestions": suggestions,
     }
 
 def parse_database_config():
@@ -3730,6 +3935,46 @@ async def identify_plant(
             uuid.uuid4().hex[:12],
             "identify",
             f"Plant identified as {result['scientific_name'] or result['display_name']}",
+            tenant_id=tenant_id,
+            user_id=user.get("user_id"),
+        )
+        conn.commit()
+    finally:
+        release_conn(conn)
+    return result
+
+@app.post("/plants/health-assessment")
+async def assess_plant_health(
+    request: Request,
+    images: List[UploadFile] = File(...),
+    language: Optional[str] = Form("en"),
+):
+    user = ensure_request_permissions(request, "crm_read")
+    tenant_id = user["tenant_id"]
+    if not images:
+        raise HTTPException(400, tr_lang(
+            language,
+            "No plant images uploaded.",
+            "Nebyly nahrány žádné fotografie rostliny.",
+            "Nie przesłano żadnych zdjęć rośliny."
+        ))
+    if len(images) > 5:
+        raise HTTPException(400, tr_lang(
+            language,
+            "A maximum of 5 images is supported.",
+            "Podporováno je maximálně 5 fotografií.",
+            "Obsługiwanych jest maksymalnie 5 zdjęć."
+        ))
+    health_raw = await plant_health_assessment(images, language or "en")
+    result = map_plant_health_result(health_raw, language or "en")
+    conn = get_db_conn()
+    try:
+        log_activity(
+            conn,
+            "plant_health_assessment",
+            uuid.uuid4().hex[:12],
+            "assess",
+            f"Plant health assessed as {result.get('top_issue_name') or 'healthy'}",
             tenant_id=tenant_id,
             user_id=user.get("user_id"),
         )
