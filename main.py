@@ -469,6 +469,41 @@ def tr_lang(lang: str, en: str, cs: str, pl: str) -> str:
     code = (lang or "en").split("-")[0].lower()
     return cs if code == "cs" else pl if code == "pl" else en
 
+def plant_guidance_labels(language: str) -> dict:
+    code = (language or "en").split("-")[0].lower()
+    if code == "cs":
+        return {
+            "language_name": "Czech",
+            "subject_fallback": "rostlina",
+            "unknown": "neuvedeno",
+            "description": "Popis",
+            "needs": "Nároky",
+            "best_place": "Vhodné místo",
+            "note": "Poznámka",
+            "instruction": "Piš česky. Buď stručný a praktický pro zahradníka.",
+        }
+    if code == "pl":
+        return {
+            "language_name": "Polish",
+            "subject_fallback": "roślina",
+            "unknown": "nie podano",
+            "description": "Opis",
+            "needs": "Wymagania",
+            "best_place": "Najlepsze miejsce",
+            "note": "Uwaga",
+            "instruction": "Pisz po polsku. Bądź zwięzły i praktyczny dla ogrodnika.",
+        }
+    return {
+        "language_name": "English",
+        "subject_fallback": "the plant",
+        "unknown": "unknown",
+        "description": "Description",
+        "needs": "Needs",
+        "best_place": "Best place",
+        "note": "Note",
+        "instruction": "Write in English. Keep it concise and practical for a gardener.",
+    }
+
 async def plantnet_identify(files: List[UploadFile], organs: List[str], language: str) -> dict:
     if not PLANTNET_API_KEY:
         raise HTTPException(503, tr_lang(
@@ -481,7 +516,12 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
     for index, upload in enumerate(files):
         content = await upload.read()
         if not content:
-            raise HTTPException(400, f"Image {index + 1} is empty")
+            raise HTTPException(400, tr_lang(
+                language,
+                f"Image {index + 1} is empty.",
+                f"Obrázek {index + 1} je prázdný.",
+                f"Obraz {index + 1} jest pusty."
+            ))
         payload_files.append((
             "images",
             (
@@ -510,31 +550,46 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
                 "Služba pro rozpoznání rostlin odmítla API klíč.",
                 "Usługa rozpoznawania roślin odrzuciła klucz API."
             ))
-        raise HTTPException(502, f"Plant identification failed: {detail}")
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Plant identification failed: {detail}",
+            f"Rozpoznání rostliny selhalo: {detail}",
+            f"Rozpoznanie rośliny nie powiodło się: {detail}"
+        ))
     except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Plant identification network error: {exc}")
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Plant identification network error: {exc}",
+            f"Síťová chyba při rozpoznání rostliny: {exc}",
+            f"Błąd sieci podczas rozpoznawania rośliny: {exc}"
+        ))
     except Exception as exc:
-        raise HTTPException(502, f"Plant identification request error: {exc}")
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Plant identification request error: {exc}",
+            f"Chyba požadavku při rozpoznání rostliny: {exc}",
+            f"Błąd żądania podczas rozpoznawania rośliny: {exc}"
+        ))
 
 def build_plant_guidance(language: str, display_name: str, scientific_name: str, family: str = "", genus: str = "") -> tuple[str, str]:
-    common_label = display_name or scientific_name or "the plant"
+    labels = plant_guidance_labels(language)
+    common_label = display_name or scientific_name or labels["subject_fallback"]
     if not ai_client:
         summary = tr_lang(
             language,
-            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Family: {family or 'unknown'}.",
-            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Čeleď: {family or 'neuvedena'}.",
-            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Rodzina: {family or 'nie podano'}."
+            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Family: {family or labels['unknown']}.",
+            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Čeleď: {family or labels['unknown']}.",
+            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Rodzina: {family or labels['unknown']}."
         )
         return summary, summary
-    language_name = "Czech" if language.startswith("cs") else "Polish" if language.startswith("pl") else "English"
     prompt = (
-        f"Plant identified as {common_label} ({scientific_name}). Family: {family or 'unknown'}. Genus: {genus or 'unknown'}.\n"
-        f"Write in {language_name}. Keep it concise and practical for a gardener.\n"
+        f"Plant identified as {common_label} ({scientific_name}). Family: {family or labels['unknown']}. Genus: {genus or labels['unknown']}.\n"
+        f"{labels['instruction']}\n"
         f"Return exactly 4 short lines:\n"
-        f"1. Description: ...\n"
-        f"2. Needs: ...\n"
-        f"3. Best place: ...\n"
-        f"4. Note: mention uncertainty if species can vary."
+        f"1. {labels['description']}: ...\n"
+        f"2. {labels['needs']}: ...\n"
+        f"3. {labels['best_place']}: ...\n"
+        f"4. {labels['note']}: mention uncertainty if species can vary."
     )
     try:
         response = ai_client.chat.completions.create(
@@ -556,9 +611,9 @@ def build_plant_guidance(language: str, display_name: str, scientific_name: str,
     except Exception:
         fallback = tr_lang(
             language,
-            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Family: {family or 'unknown'}.",
-            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Čeleď: {family or 'neuvedena'}.",
-            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Rodzina: {family or 'nie podano'}."
+            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Family: {family or labels['unknown']}.",
+            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Čeleď: {family or labels['unknown']}.",
+            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Rodzina: {family or labels['unknown']}."
         )
         return fallback, fallback
 
@@ -3639,13 +3694,28 @@ async def identify_plant(
     user = ensure_request_permissions(request, "crm_read")
     tenant_id = user["tenant_id"]
     if not images:
-        raise HTTPException(400, "No plant images uploaded")
+        raise HTTPException(400, tr_lang(
+            language,
+            "No plant images uploaded.",
+            "Nebyly nahrány žádné fotografie rostliny.",
+            "Nie przesłano żadnych zdjęć rośliny."
+        ))
     if len(images) > 5:
-        raise HTTPException(400, "A maximum of 5 images is supported")
+        raise HTTPException(400, tr_lang(
+            language,
+            "A maximum of 5 images is supported.",
+            "Podporováno je maximálně 5 fotografií.",
+            "Obsługiwanych jest maksymalnie 5 zdjęć."
+        ))
     try:
         raw_organs = json.loads(organs_json) if organs_json else []
     except Exception:
-        raise HTTPException(400, "Invalid organs_json payload")
+        raise HTTPException(400, tr_lang(
+            language,
+            "Invalid photo type payload.",
+            "Neplatná data typů fotografií.",
+            "Nieprawidłowe dane typów zdjęć."
+        ))
     organs = []
     for index in range(len(images)):
         organ = (raw_organs[index] if index < len(raw_organs) else "auto") or "auto"
