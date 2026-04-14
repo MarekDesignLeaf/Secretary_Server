@@ -14,6 +14,7 @@ import base64
 import jwt as pyjwt
 import json
 import urllib.request
+from contextlib import contextmanager, asynccontextmanager
 
 app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
 
@@ -323,6 +324,17 @@ CREATE TABLE IF NOT EXISTS pricing_rules (
     rule_key TEXT, rate DECIMAL NOT NULL,
     currency TEXT DEFAULT 'GBP', created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS tenant_default_rates (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT NOT NULL DEFAULT 1,
+    rate_type TEXT NOT NULL,
+    rate DECIMAL NOT NULL DEFAULT 0,
+    currency TEXT DEFAULT 'GBP',
+    description TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    CONSTRAINT uq_tenant_default_rates UNIQUE (tenant_id, rate_type)
+);
 CREATE TABLE IF NOT EXISTS user_contact_sync (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id INT NOT NULL DEFAULT 1,
@@ -494,8 +506,12 @@ def init_pool():
                     ("garden_waste_bulkbag", 55, "Garden waste bulk bag"),
                     ("minimum_charge", 150, "Minimum charge per job"),
                 ]:
-                    cur.execute("""INSERT INTO default_rates (tenant_id, rate_type, rate, description)
-                        VALUES (1, %s, %s, %s) ON CONFLICT (tenant_id, rate_type) DO NOTHING""", (rt, rate, desc))
+                    cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, description, updated_at)
+                        VALUES (1, %s, %s, %s, now())
+                        ON CONFLICT (tenant_id, rate_type) DO UPDATE SET
+                            rate = EXCLUDED.rate,
+                            description = EXCLUDED.description,
+                            updated_at = now()""", (rt, rate, desc))
                 conn3.commit()
             db_pool.putconn(conn3)
             print("Service rates seeded")
@@ -545,7 +561,6 @@ def release_conn(conn):
         try: conn.close()
         except: pass
 
-from contextlib import contextmanager
 @contextmanager
 def db_conn():
     """Context manager that auto-releases connection back to pool."""
@@ -611,7 +626,7 @@ def ensure_permission_tables(conn):
 
 def seed_permissions(conn):
     ensure_permission_tables(conn)
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         for permission in PERMISSION_DEFINITIONS:
             cur.execute("""
                 INSERT INTO permissions (permission_code, module_name, name, description, updated_at)
@@ -649,7 +664,7 @@ def seed_permissions(conn):
 
 def load_permission_catalog(conn) -> List[Dict[str, Any]]:
     ensure_permission_tables(conn)
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT permission_code, module_name, name, description
             FROM permissions
@@ -660,7 +675,7 @@ def load_permission_catalog(conn) -> List[Dict[str, Any]]:
 def load_role_permission_maps(conn) -> Dict[str, Dict[str, bool]]:
     ensure_permission_tables(conn)
     role_maps: Dict[str, Dict[str, bool]] = {}
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT r.role_name, p.permission_code, rp.allowed
             FROM role_permissions rp
@@ -684,7 +699,7 @@ def load_user_permission_overrides(conn, tenant_id: int, user_ids: Optional[List
         user_filter = " AND u.id = ANY(%s)"
         params.append(user_ids)
     overrides: Dict[int, Dict[str, bool]] = {}
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(f"""
             SELECT u.id AS user_id, p.permission_code, upo.allowed
             FROM user_permission_overrides upo
@@ -699,7 +714,7 @@ def load_user_permission_overrides(conn, tenant_id: int, user_ids: Optional[List
 def get_effective_permissions(conn, tenant_id: int, user_id: int, role_name: Optional[str] = None) -> Dict[str, bool]:
     resolved_role = role_name
     if not resolved_role:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT r.role_name
                 FROM users u
@@ -719,7 +734,7 @@ def save_user_permission_overrides(conn, tenant_id: int, user_id: int, role_name
     if not normalized:
         return
     role_defaults = load_role_permission_maps(conn).get((role_name or "viewer").lower(), default_permissions_for_role(role_name))
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT p.id, p.permission_code
             FROM permissions p
@@ -1218,8 +1233,7 @@ def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict
          normalized_phone or None, normalized_email or None, user_id, user_id))
     return dict(cur.fetchone()), True
 
-@app.on_event("startup")
-async def startup():
+def run_startup_bootstrap():
     init_pool()
     try:
         conn = get_db_conn()
@@ -1234,9 +1248,17 @@ async def startup():
         release_conn(conn)
     except Exception as e: print(f"Schema check: {e}")
 
-@app.on_event("shutdown")
-async def shutdown():
+def close_db_pool():
     if db_pool: db_pool.closeall()
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    run_startup_bootstrap()
+    ensure_quote_items_table()
+    yield
+    close_db_pool()
+
+app.router.lifespan_context = app_lifespan
 
 # === MODELS ===
 class ChatMessage(BaseModel):
@@ -3232,8 +3254,7 @@ async def test_voice():
         except: pass
 
 # ========== QUOTES (Nabídky) ==========
-@app.on_event("startup")
-async def ensure_quote_items():
+def ensure_quote_items_table():
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
