@@ -492,11 +492,13 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
         ))
     lang_code = (language or "en").split("-")[0].lower()
     params = {"api-key": PLANTNET_API_KEY, "lang": lang_code, "include-related-images": "false", "nb-results": "5"}
-    data = [("organs", organ or "auto") for organ in organs]
+    multipart_parts = list(payload_files)
+    for organ in organs:
+        multipart_parts.append(("organs", (None, organ or "auto")))
     url = f"https://my-api.plantnet.org/v2/identify/{PLANTNET_PROJECT}"
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
-            response = await client.post(url, params=params, data=data, files=payload_files)
+            response = await client.post(url, params=params, files=multipart_parts)
             response.raise_for_status()
             return response.json()
     except httpx.HTTPStatusError as exc:
@@ -511,6 +513,8 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
         raise HTTPException(502, f"Plant identification failed: {detail}")
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Plant identification network error: {exc}")
+    except Exception as exc:
+        raise HTTPException(502, f"Plant identification request error: {exc}")
 
 def build_plant_guidance(language: str, display_name: str, scientific_name: str, family: str = "", genus: str = "") -> tuple[str, str]:
     common_label = display_name or scientific_name or "the plant"
