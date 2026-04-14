@@ -3624,25 +3624,25 @@ async def upload_job_photo(
 @app.post("/plants/identify")
 async def identify_plant(
     request: Request,
-    files: List[UploadFile] = File(...),
+    images: List[UploadFile] = File(...),
     organs_json: Optional[str] = Form(None),
     language: Optional[str] = Form("en"),
 ):
     user = ensure_request_permissions(request, "crm_read")
     tenant_id = user["tenant_id"]
-    if not files:
+    if not images:
         raise HTTPException(400, "No plant images uploaded")
-    if len(files) > 5:
+    if len(images) > 5:
         raise HTTPException(400, "A maximum of 5 images is supported")
     try:
         raw_organs = json.loads(organs_json) if organs_json else []
     except Exception:
         raise HTTPException(400, "Invalid organs_json payload")
     organs = []
-    for index in range(len(files)):
+    for index in range(len(images)):
         organ = (raw_organs[index] if index < len(raw_organs) else "auto") or "auto"
         organs.append(str(organ).strip().lower() or "auto")
-    plantnet_raw = await plantnet_identify(files, organs, language or "en")
+    plantnet_raw = await plantnet_identify(images, organs, language or "en")
     result = map_plantnet_result(plantnet_raw, language or "en", organs)
     conn = get_db_conn()
     try:
