@@ -1153,11 +1153,19 @@ def normalize_phone(phone: Optional[str]) -> str:
     raw = (phone or "").strip()
     return "".join(ch for ch in raw if ch.isdigit())
 
+def normalize_contact_phone(phone: Optional[str]) -> str:
+    digits = normalize_phone(phone)
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("44") and len(digits) >= 11:
+        digits = "0" + digits[2:]
+    return digits
+
 def normalize_email(email: Optional[str]) -> str:
     return (email or "").strip().lower()
 
 def build_contact_key(name: Optional[str], phone: Optional[str], email: Optional[str]) -> str:
-    normalized_phone = normalize_phone(phone)
+    normalized_phone = normalize_contact_phone(phone)
     normalized_email = normalize_email(email)
     normalized_name = (name or "").strip().lower()
     return normalized_phone or normalized_email or normalized_name
@@ -1195,17 +1203,15 @@ def client_info_score(row: Dict[str, Any]) -> int:
 def find_matching_clients(cur, tenant_id: int, normalized_phone: str, normalized_email: str):
     if not normalized_phone and not normalized_email:
         return []
-    clauses = []
-    params: List[Any] = [tenant_id]
-    if normalized_phone:
-        clauses.append("REPLACE(REPLACE(REPLACE(COALESCE(phone_primary,''),'+',''),' ',''),'-','') = %s")
-        params.append(normalized_phone)
-    if normalized_email:
-        clauses.append("LOWER(COALESCE(email_primary,'')) = %s")
-        params.append(normalized_email)
-    sql = f"SELECT * FROM clients WHERE tenant_id=%s AND deleted_at IS NULL AND ({' OR '.join(clauses)})"
-    cur.execute(sql, params)
-    return [dict(row) for row in cur.fetchall()]
+    cur.execute("SELECT * FROM clients WHERE tenant_id=%s AND deleted_at IS NULL", (tenant_id,))
+    rows = [dict(row) for row in cur.fetchall()]
+    matches = []
+    for row in rows:
+        client_phone = normalize_contact_phone(row.get("phone_primary"))
+        client_email = normalize_email(row.get("email_primary"))
+        if (normalized_phone and client_phone == normalized_phone) or (normalized_email and client_email == normalized_email):
+            matches.append(row)
+    return matches
 
 def load_selected_contact_rows(cur, tenant_id: int, normalized_phone: str, normalized_email: str, linked_client_id: Optional[int] = None):
     clauses = []
@@ -2137,9 +2143,7 @@ async def sync_contacts(data: dict, request: Request):
         raise HTTPException(400, "No contacts provided")
 
     def is_uk_number(phone: str) -> bool:
-        clean = normalize_phone(phone)
-        if clean.startswith("44"):
-            clean = "0" + clean[2:]
+        clean = normalize_contact_phone(phone)
         return clean.startswith(("07", "01", "02"))
 
     conn = get_db_conn()
@@ -2179,7 +2183,7 @@ async def sync_contacts(data: dict, request: Request):
                         name or phone or email or "Contact",
                         phone or None,
                         email or None,
-                        normalize_phone(phone) or None,
+                        normalize_contact_phone(phone) or None,
                         normalize_email(email) or None,
                         selected_flag,
                         selected_flag,
