@@ -3,13 +3,14 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
 from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import uvicorn
 from openai import OpenAI
 from datetime import datetime, timedelta
+import base64
 import jwt as pyjwt
 import json
 import urllib.request
@@ -254,7 +255,8 @@ CREATE TABLE IF NOT EXISTS client_notes (
 CREATE TABLE IF NOT EXISTS job_notes (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     job_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'Marek',
-    created_at TIMESTAMPTZ DEFAULT now()
+    note_type TEXT DEFAULT 'general', tenant_id INT NOT NULL DEFAULT 1,
+    updated_at TIMESTAMPTZ DEFAULT now(), created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS task_history (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -270,8 +272,8 @@ CREATE TABLE IF NOT EXISTS activity_timeline (
 CREATE TABLE IF NOT EXISTS photos (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
-    filename TEXT NOT NULL, description TEXT,
-    file_path TEXT, thumbnail_base64 TEXT,
+    filename TEXT NOT NULL, description TEXT, photo_type TEXT DEFAULT 'general',
+    file_path TEXT, thumbnail_base64 TEXT, tenant_id INT NOT NULL DEFAULT 1,
     created_by TEXT DEFAULT 'Marek', created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS work_reports (
@@ -386,6 +388,11 @@ DO $$ BEGIN
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS user_id_ref TEXT;
+    ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS note_type TEXT DEFAULT 'general';
+    ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS tenant_id INT NOT NULL DEFAULT 1;
+    ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+    ALTER TABLE photos ADD COLUMN IF NOT EXISTS photo_type TEXT DEFAULT 'general';
+    ALTER TABLE photos ADD COLUMN IF NOT EXISTS tenant_id INT NOT NULL DEFAULT 1;
     ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_user_id BIGINT;
     ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_to TEXT;
     ALTER TABLE jobs ADD COLUMN IF NOT EXISTS planned_start_at TIMESTAMPTZ;
@@ -428,7 +435,7 @@ ai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 # === WHATSAPP CONFIG ===
 WA_PHONE_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WA_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
-WA_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+WA_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "EAAYNy9s0WWIBRP99Px2xSPuJNmFWpGpyn74NmQ4WjGnMldVwt0mmuOK8A9bzvDTW6vE3UZCKXda3PZBVSZBPiGPuoBkee6LjowBYSXdRwM5oqrCoxzVeRDLfMyDCr7mxwmuNX4q3XIbIqWpkINw8WFnv4v2pUtkNzBidVMwqYr1zQr1SrvCfykko2em8XjeliIqDqRfPSAJ")
 WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "designleaf_webhook_2026")
 WA_API_URL = f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
 
@@ -918,6 +925,39 @@ def build_calendar_entry(
         "calendar_sync_enabled": bool(source.get("calendar_sync_enabled", True)),
         "reminder_for_assignee_only": bool(source.get("reminder_for_assignee_only", True)),
         "status": source.get("status") or source.get("job_status"),
+    }
+
+def encode_photo_data_url(content: bytes, filename: str, content_type: Optional[str] = None) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    mime = content_type or {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(ext, "image/jpeg")
+    encoded = base64.b64encode(content).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+def map_photo_row_to_job_photo(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "job_id": int(row["entity_id"]),
+        "url": row.get("file_path") or row.get("thumbnail_base64") or "",
+        "description": row.get("description"),
+        "photo_type": row.get("photo_type") or "general",
+        "uploaded_by": row.get("created_by"),
+        "uploaded_at": row.get("created_at"),
+    }
+
+def map_audit_row_to_job_audit(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "job_id": int(row["entity_id"]),
+        "action_type": row.get("action"),
+        "description": row.get("description") or "",
+        "user_name": row.get("user_name"),
+        "created_at": row.get("created_at"),
     }
 
 # ========== TENANT GUARD ==========
@@ -2073,9 +2113,27 @@ async def get_job_detail(job_id: int, request: Request):
             cur.execute("""SELECT *
                 FROM tasks WHERE job_id=%s AND tenant_id=%s ORDER BY created_at DESC""",(job_id, tid))
             tasks = cur.fetchall()
-            cur.execute("SELECT id,note,created_by,created_at::text FROM job_notes WHERE job_id=%s ORDER BY created_at DESC",(job_id,))
+            cur.execute("""SELECT id,job_id,note,note_type,created_by,created_at::text,updated_at::text
+                FROM job_notes WHERE job_id=%s AND tenant_id=%s ORDER BY created_at DESC""",(job_id, tid))
             notes = cur.fetchall()
-            return {"job":dict(job),"tasks":[dict(t) for t in tasks],"notes":[dict(n) for n in notes]}
+            cur.execute("""SELECT id,entity_type,entity_id,filename,description,photo_type,file_path,thumbnail_base64,
+                    created_by,created_at::text
+                FROM photos
+                WHERE tenant_id=%s AND entity_type='job' AND entity_id=%s
+                ORDER BY created_at DESC""", (tid, str(job_id)))
+            photos = [map_photo_row_to_job_photo(dict(r)) for r in cur.fetchall()]
+            cur.execute("""SELECT id,entity_id,action,description,user_name,created_at::text
+                FROM activity_timeline
+                WHERE tenant_id=%s AND entity_type='job' AND entity_id=%s
+                ORDER BY created_at DESC""", (tid, str(job_id)))
+            audit_rows = [map_audit_row_to_job_audit(dict(r)) for r in cur.fetchall()]
+            return {
+                "job":dict(job),
+                "tasks":[dict(t) for t in tasks],
+                "notes":[dict(n) for n in notes],
+                "photos": photos,
+                "audit_log": audit_rows,
+            }
     finally: release_conn(conn)
 
 @app.post("/crm/jobs")
@@ -3324,12 +3382,103 @@ async def add_job_note(job_id: int, data: dict, request: Request):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO job_notes (job_id,note,created_by,tenant_id) VALUES (%s,%s,%s,%s) RETURNING id",
-                (job_id, data.get("note",""), data.get("created_by","system"), tid))
-            nid = cur.fetchone()['id']; conn.commit()
-        return {"id":nid,"status":"created"}
+            note_type = (data.get("note_type") or "general").strip() or "general"
+            created_by = data.get("created_by") or get_user_display_name(conn, tid, request.state.user.get("user_id")) or "system"
+            cur.execute("""INSERT INTO job_notes (job_id,note,note_type,created_by,tenant_id)
+                VALUES (%s,%s,%s,%s,%s)
+                RETURNING id,job_id,note,note_type,created_by,created_at::text,updated_at::text""",
+                (job_id, data.get("note",""), note_type, created_by, tid))
+            note = dict(cur.fetchone())
+            log_activity(conn, "job", job_id, "note", f"{note_type}: {(data.get('note','') or '')[:120]}", tenant_id=tid, user_id=request.state.user.get("user_id"))
+            conn.commit()
+        return note
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
+
+@app.get("/crm/jobs/{job_id}/photos")
+async def get_job_photos(job_id: int, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,entity_type,entity_id,filename,description,photo_type,file_path,thumbnail_base64,
+                    created_by,created_at::text
+                FROM photos
+                WHERE tenant_id=%s AND entity_type='job' AND entity_id=%s
+                ORDER BY created_at DESC""", (tid, str(job_id)))
+            return [map_photo_row_to_job_photo(dict(r)) for r in cur.fetchall()]
+    finally:
+        release_conn(conn)
+
+@app.post("/crm/jobs/{job_id}/photos")
+async def upload_job_photo(
+    job_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    description: Optional[str] = Form(None),
+    photo_type: Optional[str] = Form(None),
+):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        content = await file.read()
+        if not content:
+            raise HTTPException(400, "Photo file is empty")
+        data_url = encode_photo_data_url(content, file.filename or "photo.jpg", file.content_type)
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO photos
+                (entity_type,entity_id,filename,description,photo_type,file_path,thumbnail_base64,created_by,tenant_id)
+                VALUES ('job',%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id,entity_type,entity_id,filename,description,photo_type,file_path,thumbnail_base64,created_by,created_at::text""",
+                (
+                    str(job_id),
+                    file.filename or f"job_{job_id}_{uuid.uuid4().hex[:8]}.jpg",
+                    description,
+                    (photo_type or "general").strip() or "general",
+                    data_url,
+                    data_url,
+                    get_user_display_name(conn, tid, request.state.user.get("user_id")) or "system",
+                    tid,
+                ))
+            photo = map_photo_row_to_job_photo(dict(cur.fetchone()))
+            log_activity(conn, "job", job_id, "photo_upload", f"Photo uploaded: {photo['photo_type']}", tenant_id=tid, user_id=request.state.user.get("user_id"))
+            conn.commit()
+        return photo
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+@app.post("/crm/jobs/{job_id}/audit")
+async def add_job_audit(job_id: int, data: dict, request: Request):
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            user_name = get_user_display_name(conn, tid, request.state.user.get("user_id")) or "system"
+            cur.execute("""INSERT INTO activity_timeline
+                (entity_type, entity_id, action, description, user_name, tenant_id, user_id_ref, created_at)
+                VALUES ('job', %s, %s, %s, %s, %s, %s, now())
+                RETURNING id,entity_id,action,description,user_name,created_at::text""",
+                (
+                    str(job_id),
+                    data.get("action_type", "update"),
+                    data.get("description", ""),
+                    user_name,
+                    tid,
+                    str(request.state.user.get("user_id") or ""),
+                ))
+            row = map_audit_row_to_job_audit(dict(cur.fetchone()))
+            conn.commit()
+        return row
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
 
 # ========== INVOICE ITEMS ==========
 @app.get("/crm/invoices/{invoice_id}/items")
