@@ -4774,10 +4774,12 @@ async def get_nature_services_status(request: Request):
 
 @app.get("/admin/activity-log")
 async def get_admin_activity_log(
-    admin: dict = Depends(require_permission("manage_users")),
+    request: Request,
     limit: int = 200,
     actor_user_id: Optional[int] = None,
 ):
+    ensure_request_permissions(request, "manage_users")
+    admin = request.state.user
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
