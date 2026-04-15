@@ -483,14 +483,63 @@ WA_PHONE_ID = env_first("WHATSAPP_PHONE_NUMBER_ID", "WA_PHONE_ID", "META_WHATSAP
 WA_ACCOUNT_ID = env_first("WHATSAPP_BUSINESS_ACCOUNT_ID", "WA_ACCOUNT_ID", "META_WHATSAPP_BUSINESS_ACCOUNT_ID")
 WA_TOKEN = env_first("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOKEN")
 WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="designleaf_webhook_2026")
-PLANTNET_API_KEY = env_first("PLANTNET_API_KEY", "PLANT_ID_API_KEY", "PLANTNET_PRIVATE_API_KEY")
+PLANTNET_API_KEY = env_first(
+    "PLANTNET_API_KEY",
+    "PLANTNET_KEY",
+    "PLANT_RECOGNITION_API_KEY",
+    "PLANT_ID_API_KEY",
+    "PLANTNET_PRIVATE_API_KEY",
+)
 PLANTNET_PROJECT = env_first("PLANTNET_PROJECT", default="all")
-PLANT_HEALTH_API_KEY = env_first("PLANT_HEALTH_API_KEY", "PLANT_ID_API_KEY")
-MUSHROOM_ID_API_KEY = env_first("MUSHROOM_ID_API_KEY", "KINDWISE_MUSHROOM_API_KEY")
-MUSHROOM_ID_API_URL = env_first("MUSHROOM_ID_API_URL", default="https://mushroom.kindwise.com/api/v1/identification")
+PLANT_HEALTH_API_KEY = env_first(
+    "PLANT_HEALTH_API_KEY",
+    "KINDWISE_PLANT_HEALTH_API_KEY",
+    "PLANT_DISEASE_API_KEY",
+    "PLANT_ID_API_KEY",
+)
+PLANT_HEALTH_API_URL = env_first(
+    "PLANT_HEALTH_API_URL",
+    default="https://api.plant.id/v3/health_assessment",
+)
+MUSHROOM_ID_API_KEY = env_first(
+    "MUSHROOM_ID_API_KEY",
+    "MUSHROOM_API_KEY",
+    "MUSHROOMID_API_KEY",
+    "MUSHROOM_RECOGNITION_API_KEY",
+    "KINDWISE_MUSHROOM_API_KEY",
+    "KINDWISE_API_KEY",
+)
+MUSHROOM_ID_API_URL = env_first(
+    "MUSHROOM_ID_API_URL",
+    "MUSHROOM_API_URL",
+    "KINDWISE_MUSHROOM_API_URL",
+    default="https://mushroom.kindwise.com/api/v1/identification",
+)
+
+def normalize_kindwise_endpoint(configured_url: str, suffix: str) -> str:
+    base = (configured_url or "").strip().rstrip("/")
+    if not base:
+        return suffix
+    if base.lower().endswith(suffix.lower()):
+        return base
+    if base.lower().endswith("/api/v1") or base.lower().endswith("/v3"):
+        return f"{base}{suffix}"
+    return base
+
+PLANT_HEALTH_API_URL = normalize_kindwise_endpoint(PLANT_HEALTH_API_URL, "/health_assessment")
+MUSHROOM_ID_API_URL = normalize_kindwise_endpoint(MUSHROOM_ID_API_URL, "/identification")
 
 def get_wa_api_url() -> str:
     return f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
+
+def get_nature_service_status() -> dict:
+    return {
+        "plant_recognition_configured": bool(PLANTNET_API_KEY),
+        "plant_health_configured": bool(PLANT_HEALTH_API_KEY),
+        "mushroom_recognition_configured": bool(MUSHROOM_ID_API_KEY),
+        "plant_health_api_url": PLANT_HEALTH_API_URL,
+        "mushroom_api_url": MUSHROOM_ID_API_URL,
+    }
 
 def tr_lang(lang: str, en: str, cs: str, pl: str) -> str:
     code = (lang or "en").split("-")[0].lower()
@@ -714,7 +763,7 @@ async def plant_health_assessment(files: List[UploadFile], language: str) -> dic
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             response = await client.post(
-                "https://api.plant.id/v3/health_assessment",
+                PLANT_HEALTH_API_URL,
                 params=params,
                 headers={"Api-Key": PLANT_HEALTH_API_KEY},
                 json={"images": encoded_images},
@@ -4535,6 +4584,11 @@ async def get_nature_history(
             return [map_nature_history_entry(dict(row), language or "en") for row in cur.fetchall()]
     finally:
         release_conn(conn)
+
+@app.get("/nature/services/status")
+async def get_nature_services_status(request: Request):
+    ensure_request_permissions(request, "crm_read")
+    return get_nature_service_status()
 
 @app.post("/crm/jobs/{job_id}/audit")
 async def add_job_audit(job_id: int, data: dict, request: Request):
