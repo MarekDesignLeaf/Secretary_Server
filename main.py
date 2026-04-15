@@ -34,7 +34,7 @@ WEATHER_CACHE_TTL_SECONDS = 600
 WEATHER_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
-PROTECTED_PREFIXES = ["/crm/", "/plants/", "/process", "/voice/", "/work-reports"]
+PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/process", "/voice/", "/work-reports"]
 PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
 
 PERMISSION_DEFINITIONS = [
@@ -466,6 +466,8 @@ WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="designleaf_webhook
 PLANTNET_API_KEY = env_first("PLANTNET_API_KEY", "PLANT_ID_API_KEY", "PLANTNET_PRIVATE_API_KEY")
 PLANTNET_PROJECT = env_first("PLANTNET_PROJECT", default="all")
 PLANT_HEALTH_API_KEY = env_first("PLANT_HEALTH_API_KEY", "PLANT_ID_API_KEY")
+MUSHROOM_ID_API_KEY = env_first("MUSHROOM_ID_API_KEY", "KINDWISE_MUSHROOM_API_KEY")
+MUSHROOM_ID_API_URL = env_first("MUSHROOM_ID_API_URL", default="https://mushroom.kindwise.com/api/v1/identification")
 
 def get_wa_api_url() -> str:
     return f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
@@ -537,6 +539,56 @@ def plant_health_labels(language: str) -> dict:
         "healthy": "The plant looks rather healthy based on the photos.",
         "instruction": "Write in English. Keep it concise and practical for a gardener. Focus on diagnosis, treatment, and prevention.",
     }
+
+def mushroom_guidance_labels(language: str) -> dict:
+    code = (language or "en").split("-")[0].lower()
+    if code == "cs":
+        return {
+            "subject_fallback": "houba",
+            "unknown": "neuvedeno",
+            "description": "Popis",
+            "edibility": "Jedlost",
+            "habitat": "Stanoviště",
+            "warning": "Varování",
+            "instruction": "Piš česky. Buď stručný a praktický. Vždy zdůrazni, že jedlost se nesmí potvrzovat jen podle fotografie.",
+        }
+    if code == "pl":
+        return {
+            "subject_fallback": "grzyb",
+            "unknown": "nie podano",
+            "description": "Opis",
+            "edibility": "Jadalność",
+            "habitat": "Siedlisko",
+            "warning": "Ostrzeżenie",
+            "instruction": "Pisz po polsku. Bądź zwięzły i praktyczny. Zawsze podkreślaj, że nie wolno potwierdzać jadalności wyłącznie na podstawie zdjęcia.",
+        }
+    return {
+        "subject_fallback": "the mushroom",
+        "unknown": "unknown",
+        "description": "Description",
+        "edibility": "Edibility",
+        "habitat": "Habitat",
+        "warning": "Warning",
+        "instruction": "Write in English. Keep it concise and practical. Always stress that edibility must not be confirmed from a photo alone.",
+    }
+
+def flatten_mushroom_list(value) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("name") or item.get("label") or item.get("title") or item.get("value")
+            else:
+                text = item
+            text = str(text or "").strip()
+            if text:
+                items.append(text)
+        return items
+    return []
 
 def flatten_treatment_items(treatment: dict) -> dict:
     treatment = treatment or {}
@@ -677,6 +729,73 @@ async def plant_health_assessment(files: List[UploadFile], language: str) -> dic
             f"Błąd żądania podczas sprawdzania choroby rośliny: {exc}"
         ))
 
+async def mushroom_identify(files: List[UploadFile], language: str) -> dict:
+    if not MUSHROOM_ID_API_KEY:
+        raise HTTPException(503, tr_lang(
+            language,
+            "Mushroom recognition service is not configured.",
+            "Služba pro rozpoznávání hub není nastavená.",
+            "Usługa rozpoznawania grzybów nie jest skonfigurowana."
+        ))
+    encoded_images = []
+    for index, upload in enumerate(files):
+        content = await upload.read()
+        if not content:
+            raise HTTPException(400, tr_lang(
+                language,
+                f"Image {index + 1} is empty.",
+                f"Obrázek {index + 1} je prázdný.",
+                f"Obraz {index + 1} jest pusty."
+            ))
+        encoded_images.append(base64.b64encode(content).decode("ascii"))
+    params = {
+        "details": "common_names,url,description,edibility,psychoactive,look_alikes,taxonomy,characteristics",
+        "language": (language or "en").split("-")[0].lower(),
+    }
+    payload = {
+        "images": encoded_images,
+        "similar_images": True,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(
+                MUSHROOM_ID_API_URL,
+                params=params,
+                headers={"Api-Key": MUSHROOM_ID_API_KEY},
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500]
+        if exc.response.status_code in (401, 403):
+            raise HTTPException(502, tr_lang(
+                language,
+                "Mushroom recognition service rejected the API key.",
+                "Služba pro rozpoznávání hub odmítla API klíč.",
+                "Usługa rozpoznawania grzybów odrzuciła klucz API."
+            ))
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Mushroom recognition failed: {detail}",
+            f"Rozpoznání houby selhalo: {detail}",
+            f"Rozpoznanie grzyba nie powiodło się: {detail}"
+        ))
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Mushroom recognition network error: {exc}",
+            f"Síťová chyba při rozpoznání houby: {exc}",
+            f"Błąd sieci podczas rozpoznawania grzyba: {exc}"
+        ))
+    except Exception as exc:
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Mushroom recognition request error: {exc}",
+            f"Chyba požadavku při rozpoznání houby: {exc}",
+            f"Błąd żądania podczas rozpoznawania grzyba: {exc}"
+        ))
+
 def build_plant_guidance(language: str, display_name: str, scientific_name: str, family: str = "", genus: str = "") -> tuple[str, str]:
     labels = plant_guidance_labels(language)
     common_label = display_name or scientific_name or labels["subject_fallback"]
@@ -783,6 +902,75 @@ def build_plant_health_guidance(language: str, issue_name: str, description: str
         )
         return fallback, fallback
 
+def build_mushroom_guidance(
+    language: str,
+    display_name: str,
+    scientific_name: str,
+    description: str,
+    edibility: str,
+    family: str,
+    genus: str,
+    look_alikes: List[str],
+    psychoactive: Optional[bool],
+) -> tuple[str, str]:
+    labels = mushroom_guidance_labels(language)
+    common_label = display_name or scientific_name or labels["subject_fallback"]
+    lookalikes_text = ", ".join(look_alikes[:3]) if look_alikes else labels["unknown"]
+    psychoactive_text = (
+        tr_lang(language, "yes", "ano", "tak")
+        if psychoactive is True else
+        tr_lang(language, "no", "ne", "nie")
+        if psychoactive is False else labels["unknown"]
+    )
+    if not ai_client:
+        fallback = tr_lang(
+            language,
+            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Edibility: {edibility or labels['unknown']}. Never confirm edibility from a photo alone.",
+            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Jedlost: {edibility or labels['unknown']}. Jedlost nikdy nepotvrzuj jen podle fotografie.",
+            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Jadalność: {edibility or labels['unknown']}. Nigdy nie potwierdzaj jadalności wyłącznie na podstawie zdjęcia."
+        )
+        return fallback, fallback
+    prompt = (
+        f"Mushroom identified as {common_label} ({scientific_name}).\n"
+        f"Description: {description or labels['unknown']}\n"
+        f"Edibility: {edibility or labels['unknown']}\n"
+        f"Family: {family or labels['unknown']}\n"
+        f"Genus: {genus or labels['unknown']}\n"
+        f"Look-alikes: {lookalikes_text}\n"
+        f"Psychoactive: {psychoactive_text}\n"
+        f"{labels['instruction']}\n"
+        f"Return exactly 4 short lines:\n"
+        f"1. {labels['description']}: ...\n"
+        f"2. {labels['edibility']}: ...\n"
+        f"3. {labels['habitat']}: infer likely habitat if possible from taxonomy, otherwise say unknown.\n"
+        f"4. {labels['warning']}: clearly state that photo recognition is not enough to confirm edibility and mention look-alikes if relevant."
+    )
+    try:
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You write short practical mushroom identification summaries with safety warnings."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=260,
+        )
+        guidance = (response.choices[0].message.content or "").strip()
+        spoken = tr_lang(
+            language,
+            f"It is most likely {common_label}. Never confirm edibility from a photo alone.",
+            f"Nejspíš je to {common_label}. Jedlost nikdy nepotvrzuj jen podle fotografie.",
+            f"Najprawdopodobniej to {common_label}. Nigdy nie potwierdzaj jadalności wyłącznie na podstawie zdjęcia.",
+        ).strip()
+        return guidance or common_label, spoken
+    except Exception:
+        fallback = tr_lang(
+            language,
+            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Edibility: {edibility or labels['unknown']}. Never confirm edibility from a photo alone.",
+            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Jedlost: {edibility or labels['unknown']}. Jedlost nikdy nepotvrzuj jen podle fotografie.",
+            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Jadalność: {edibility or labels['unknown']}. Nigdy nie potwierdzaj jadalności wyłącznie na podstawie zdjęcia."
+        )
+        return fallback, fallback
+
 def map_plantnet_result(raw: dict, language: str, requested_organs: List[str]) -> dict:
     results = raw.get("results") or []
     if not results:
@@ -864,6 +1052,86 @@ def map_plant_health_result(raw: dict, language: str) -> dict:
         "guidance": guidance,
         "spoken_summary": spoken,
         "suggestions": suggestions,
+    }
+
+def map_mushroom_result(raw: dict, language: str) -> dict:
+    suggestions_raw = (((raw.get("result") or {}).get("classification") or {}).get("suggestions")) or []
+    if not suggestions_raw:
+        raise HTTPException(404, tr_lang(
+            language,
+            "No matching mushroom was found. Try clearer photos of the whole mushroom, underside, and stem or base.",
+            "Nebyla nalezena shoda. Zkus jasnější fotky celé houby, spodní strany a třeně nebo báze.",
+            "Nie znaleziono dopasowania. Spróbuj wyraźniejszych zdjęć całego grzyba, spodu oraz trzonu lub podstawy."
+        ))
+
+    def mushroom_suggestion(item: dict) -> dict:
+        details = item.get("details") or {}
+        taxonomy = details.get("taxonomy") or {}
+        common_names = flatten_mushroom_list(details.get("common_names"))
+        look_alikes = flatten_mushroom_list(details.get("look_alikes"))
+        characteristics = flatten_mushroom_list(details.get("characteristics"))
+        name = item.get("name") or ""
+        display_name = common_names[0] if common_names else name
+        return {
+            "name": name,
+            "display_name": display_name,
+            "common_names": common_names,
+            "probability": float(item.get("probability") or 0.0),
+            "description": details.get("description"),
+            "url": details.get("url"),
+            "edibility": details.get("edibility"),
+            "psychoactive": details.get("psychoactive"),
+            "family": taxonomy.get("family"),
+            "genus": taxonomy.get("genus"),
+            "look_alikes": look_alikes,
+            "characteristics": characteristics,
+        }
+
+    suggestions = [mushroom_suggestion(item) for item in suggestions_raw[:5]]
+    top = suggestions[0]
+    guidance, spoken = build_mushroom_guidance(
+        language,
+        top["display_name"],
+        top["name"],
+        top.get("description") or "",
+        top.get("edibility") or "",
+        top.get("family") or "",
+        top.get("genus") or "",
+        top.get("look_alikes") or [],
+        top.get("psychoactive"),
+    )
+    return {
+        "database": "mushroom.id",
+        "display_name": top["display_name"],
+        "scientific_name": top["name"],
+        "common_names": top["common_names"],
+        "probability": top["probability"],
+        "description": top["description"],
+        "url": top["url"],
+        "edibility": top["edibility"],
+        "psychoactive": top["psychoactive"],
+        "family": top["family"],
+        "genus": top["genus"],
+        "look_alikes": top["look_alikes"],
+        "characteristics": top["characteristics"],
+        "guidance": guidance,
+        "spoken_summary": spoken,
+        "suggestions": [
+            {
+                "name": item["name"],
+                "common_names": item["common_names"],
+                "probability": item["probability"],
+                "description": item["description"],
+                "url": item["url"],
+                "edibility": item["edibility"],
+                "psychoactive": item["psychoactive"],
+                "family": item["family"],
+                "genus": item["genus"],
+                "look_alikes": item["look_alikes"],
+                "characteristics": item["characteristics"],
+            }
+            for item in suggestions
+        ],
     }
 
 def parse_database_config():
@@ -4021,6 +4289,46 @@ async def assess_plant_health(
             uuid.uuid4().hex[:12],
             "assess",
             f"Plant health assessed as {result.get('top_issue_name') or 'healthy'}",
+            tenant_id=tenant_id,
+            user_id=user.get("user_id"),
+        )
+        conn.commit()
+    finally:
+        release_conn(conn)
+    return result
+
+@app.post("/mushrooms/identify")
+async def identify_mushroom(
+    request: Request,
+    images: List[UploadFile] = File(...),
+    language: Optional[str] = Form("en"),
+):
+    user = ensure_request_permissions(request, "crm_read")
+    tenant_id = user["tenant_id"]
+    if not images:
+        raise HTTPException(400, tr_lang(
+            language,
+            "No mushroom images uploaded.",
+            "Nebyly nahrány žádné fotografie houby.",
+            "Nie przesłano żadnych zdjęć grzyba."
+        ))
+    if len(images) > 5:
+        raise HTTPException(400, tr_lang(
+            language,
+            "A maximum of 5 images is supported.",
+            "Podporováno je maximálně 5 fotografií.",
+            "Obsługiwanych jest maksymalnie 5 zdjęć."
+        ))
+    mushroom_raw = await mushroom_identify(images, language or "en")
+    result = map_mushroom_result(mushroom_raw, language or "en")
+    conn = get_db_conn()
+    try:
+        log_activity(
+            conn,
+            "mushroom_identification",
+            uuid.uuid4().hex[:12],
+            "identify",
+            f"Mushroom identified as {result['scientific_name'] or result['display_name']}",
             tenant_id=tenant_id,
             user_id=user.get("user_id"),
         )
