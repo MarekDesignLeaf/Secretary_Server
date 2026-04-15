@@ -29,6 +29,7 @@ print("JWT auth initialized — using environment secret")
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
+DEFAULT_TEMP_PASSWORD = "12345"
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
 PROTECTED_PREFIXES = ["/crm/", "/plants/", "/process", "/voice/", "/work-reports"]
@@ -397,6 +398,7 @@ DO $$ BEGIN
     ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE;
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
@@ -3608,7 +3610,7 @@ async def repair_schema():
                 except Exception as e:
                     results.append({"sql": sql[:60], "ok": False, "err": str(e)})
                     conn.rollback()
-            for sql in ["CREATE TABLE IF NOT EXISTS roles (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, role_name TEXT NOT NULL UNIQUE, description TEXT, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS users (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, role_id BIGINT, first_name TEXT NOT NULL, last_name TEXT NOT NULL, display_name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, phone TEXT, status TEXT DEFAULT 'active', password_hash TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ)","CREATE TABLE IF NOT EXISTS audit_log (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, user_id BIGINT, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT, old_values JSONB, new_values JSONB, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS quotes (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, quote_number TEXT UNIQUE, client_id BIGINT, status TEXT DEFAULT 'draft', total NUMERIC(12,2) DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS tenants (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, status TEXT DEFAULT 'active', created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS migration_log (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, filename TEXT NOT NULL UNIQUE, applied_at TIMESTAMPTZ DEFAULT now())"]:
+            for sql in ["CREATE TABLE IF NOT EXISTS roles (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, role_name TEXT NOT NULL UNIQUE, description TEXT, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS users (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, role_id BIGINT, first_name TEXT NOT NULL, last_name TEXT NOT NULL, display_name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, phone TEXT, status TEXT DEFAULT 'active', password_hash TEXT DEFAULT '', must_change_password BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ)","CREATE TABLE IF NOT EXISTS audit_log (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, user_id BIGINT, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT, old_values JSONB, new_values JSONB, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS quotes (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, quote_number TEXT UNIQUE, client_id BIGINT, status TEXT DEFAULT 'draft', total NUMERIC(12,2) DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS tenants (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, status TEXT DEFAULT 'active', created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS migration_log (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, filename TEXT NOT NULL UNIQUE, applied_at TIMESTAMPTZ DEFAULT now())"]:
                 try:
                     cur.execute(sql)
                     results.append({"sql": "CREATE TABLE OK", "ok": True})
@@ -4274,6 +4276,7 @@ async def auth_login(data: dict):
     try:
         with conn.cursor() as cur:
             cur.execute("""SELECT u.id, u.tenant_id, u.display_name, u.email, u.password_hash, u.status, u.is_owner, u.is_assistant,
+                COALESCE(u.must_change_password, FALSE) AS must_change_password,
                 r.role_name FROM users u LEFT JOIN roles r ON u.role_id=r.id
                 WHERE LOWER(u.email)=%s AND u.deleted_at IS NULL""", (email,))
             user = cur.fetchone()
@@ -4290,8 +4293,10 @@ async def auth_login(data: dict):
             conn.commit()
         return {
             "access_token": access, "refresh_token": refresh, "token_type": "bearer",
+            "must_change_password": bool(user["must_change_password"]),
             "user": {"id": user["id"], "display_name": user["display_name"], "email": user["email"],
-                     "role": role, "tenant_id": user["tenant_id"], "is_owner": user["is_owner"], "permissions": permissions}
+                     "role": role, "tenant_id": user["tenant_id"], "is_owner": user["is_owner"], "permissions": permissions,
+                     "must_change_password": bool(user["must_change_password"])}
         }
     finally: release_conn(conn)
 
@@ -4310,6 +4315,7 @@ async def auth_me(user: dict = Depends(require_auth)):
     try:
         with conn.cursor() as cur:
             cur.execute("""SELECT u.id, u.tenant_id, u.display_name, u.email, u.phone, u.status, u.is_owner, u.is_assistant,
+                COALESCE(u.must_change_password, FALSE) AS must_change_password,
                 u.preferred_language_code, r.role_name FROM users u LEFT JOIN roles r ON u.role_id=r.id WHERE u.id=%s""", (user["user_id"],))
             u = cur.fetchone()
             if not u: raise HTTPException(404, "User not found")
@@ -4349,6 +4355,7 @@ async def auth_list_users(admin: dict = Depends(require_permission("manage_users
         user_overrides = load_user_permission_overrides(conn, admin["tenant_id"])
         with conn.cursor() as cur:
             cur.execute("""SELECT u.id, u.display_name, u.email, u.phone, u.status,
+                COALESCE(u.must_change_password, FALSE) AS must_change_password,
                 r.role_name, u.created_at
                 FROM users u LEFT JOIN roles r ON u.role_id=r.id
                 WHERE u.tenant_id=%s AND u.deleted_at IS NULL
@@ -4366,6 +4373,24 @@ async def auth_list_users(admin: dict = Depends(require_permission("manage_users
             row["permissions"] = complete_permission_map(effective)
         return rows
     finally: release_conn(conn)
+
+@app.get("/auth/first-login-users")
+async def auth_first_login_users(tenant_id: int = 1):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT u.id, u.display_name, u.email
+                FROM users u
+                WHERE u.tenant_id=%s
+                  AND u.deleted_at IS NULL
+                  AND COALESCE(u.must_change_password, FALSE)=TRUE
+                  AND COALESCE(u.status, 'active') IN ('active','setup')
+                ORDER BY LOWER(COALESCE(u.display_name, u.email)), u.id
+            """, (tenant_id,))
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        release_conn(conn)
 
 @app.put("/auth/users/{user_id}")
 async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(require_permission("manage_users"))):
@@ -4393,6 +4418,9 @@ async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(requi
                 if not row: raise HTTPException(400, f"Unknown role: {data['role']}")
                 updates.append("role_id=%s"); params.append(row["id"])
                 resolved_role = data["role"]
+            if data.get("reset_password_to_default") is True:
+                updates.append("password_hash=%s"); params.append(hash_password(DEFAULT_TEMP_PASSWORD))
+                updates.append("must_change_password=TRUE")
             if updates:
                 updates.append("updated_at=now()")
                 params += [user_id, admin["tenant_id"]]
@@ -4430,10 +4458,10 @@ async def auth_delete_user(user_id: int, admin: dict = Depends(require_permissio
 async def auth_register(data: dict, admin: dict = Depends(require_permission("manage_users"))):
     """Admin-only: register new user."""
     email = data.get("email","").strip().lower()
-    password = data.get("password","").strip()
+    password = data.get("password","").strip() or DEFAULT_TEMP_PASSWORD
     display_name = data.get("display_name","").strip()
-    if not email or not password or not display_name:
-        raise HTTPException(400, "email, password, display_name required")
+    if not email or not display_name:
+        raise HTTPException(400, "email and display_name required")
     conn = get_db_conn()
     try:
         ok, msg = check_subscription_limit(conn, admin["tenant_id"], "users")
@@ -4445,8 +4473,8 @@ async def auth_register(data: dict, admin: dict = Depends(require_permission("ma
             cur.execute("SELECT id FROM roles WHERE role_name=%s", (role_name,))
             role_row = cur.fetchone()
             role_id = role_row["id"] if role_row else None
-            cur.execute("""INSERT INTO users (tenant_id, role_id, first_name, last_name, display_name, email, phone, password_hash, status)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active') RETURNING id""",
+            cur.execute("""INSERT INTO users (tenant_id, role_id, first_name, last_name, display_name, email, phone, password_hash, must_change_password, status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,'active') RETURNING id""",
                 (admin["tenant_id"], role_id, data.get("first_name",""), data.get("last_name",""),
                  display_name, email, data.get("phone",""), hash_password(password)))
             uid = cur.fetchone()["id"]
@@ -4460,6 +4488,8 @@ async def auth_register(data: dict, admin: dict = Depends(require_permission("ma
             "email": email,
             "display_name": display_name,
             "role": role_name,
+            "must_change_password": True,
+            "temporary_password": DEFAULT_TEMP_PASSWORD,
             "permissions": get_effective_permissions(conn, admin["tenant_id"], uid, role_name)
         }
     except HTTPException: raise
@@ -4472,6 +4502,7 @@ async def auth_change_password(data: dict, user: dict = Depends(require_auth)):
     new_pw = data.get("new_password","")
     if not old_pw or not new_pw: raise HTTPException(400, "old_password and new_password required")
     if len(new_pw) < 6: raise HTTPException(400, "Password must be at least 6 characters")
+    if new_pw == DEFAULT_TEMP_PASSWORD: raise HTTPException(400, "Choose a new password different from the default password")
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -4479,7 +4510,7 @@ async def auth_change_password(data: dict, user: dict = Depends(require_auth)):
             u = cur.fetchone()
             if not u or not verify_password(old_pw, u["password_hash"]):
                 raise HTTPException(401, "Old password incorrect")
-            cur.execute("UPDATE users SET password_hash=%s, updated_at=now() WHERE id=%s", (hash_password(new_pw), user["user_id"]))
+            cur.execute("UPDATE users SET password_hash=%s, must_change_password=FALSE, updated_at=now() WHERE id=%s", (hash_password(new_pw), user["user_id"]))
             conn.commit()
         return {"status": "password_changed"}
     except HTTPException: raise
