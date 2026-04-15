@@ -642,22 +642,75 @@ def mushroom_guidance_labels(language: str) -> dict:
     }
 
 def flatten_mushroom_list(value) -> List[str]:
-    if not value:
-        return []
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
-    if isinstance(value, list):
-        items = []
-        for item in value:
-            if isinstance(item, dict):
-                text = item.get("name") or item.get("label") or item.get("title") or item.get("value")
-            else:
-                text = item
-            text = str(text or "").strip()
+    items: List[str] = []
+
+    def append(candidate) -> None:
+        if candidate is None:
+            return
+        if isinstance(candidate, str):
+            text = candidate.strip()
             if text:
                 items.append(text)
-        return items
-    return []
+            return
+        if isinstance(candidate, (int, float)):
+            items.append(str(candidate))
+            return
+        if isinstance(candidate, dict):
+            primary = (
+                candidate.get("name")
+                or candidate.get("label")
+                or candidate.get("title")
+                or candidate.get("value")
+                or candidate.get("common_name")
+                or candidate.get("scientific_name")
+                or candidate.get("text")
+            )
+            if isinstance(primary, (str, int, float)):
+                append(primary)
+                return
+            for nested in candidate.values():
+                append(nested)
+            return
+        if isinstance(candidate, list):
+            for nested in candidate:
+                append(nested)
+
+    append(value)
+    return list(dict.fromkeys(items))
+
+def flatten_mushroom_text(value) -> Optional[str]:
+    items = flatten_mushroom_list(value)
+    if not items:
+        return None
+    return ", ".join(items)
+
+def flatten_mushroom_bool(value) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "y", "1", "psychoactive"}:
+            return True
+        if normalized in {"false", "no", "n", "0", "non-psychoactive", "not psychoactive"}:
+            return False
+        return None
+    if isinstance(value, dict):
+        for key in ("binary", "value", "is_psychoactive", "psychoactive"):
+            parsed = flatten_mushroom_bool(value.get(key))
+            if parsed is not None:
+                return parsed
+        for nested in value.values():
+            parsed = flatten_mushroom_bool(nested)
+            if parsed is not None:
+                return parsed
+    if isinstance(value, list):
+        for nested in value:
+            parsed = flatten_mushroom_bool(nested)
+            if parsed is not None:
+                return parsed
+    return None
 
 def flatten_treatment_items(treatment: dict) -> dict:
     treatment = treatment or {}
@@ -1149,12 +1202,12 @@ def map_mushroom_result(raw: dict, language: str) -> dict:
             "display_name": display_name,
             "common_names": common_names,
             "probability": float(item.get("probability") or 0.0),
-            "description": details.get("description"),
-            "url": details.get("url"),
-            "edibility": details.get("edibility"),
-            "psychoactive": details.get("psychoactive"),
-            "family": taxonomy.get("family"),
-            "genus": taxonomy.get("genus"),
+            "description": flatten_mushroom_text(details.get("description")),
+            "url": flatten_mushroom_text(details.get("url")),
+            "edibility": flatten_mushroom_text(details.get("edibility")),
+            "psychoactive": flatten_mushroom_bool(details.get("psychoactive")),
+            "family": flatten_mushroom_text(taxonomy.get("family")),
+            "genus": flatten_mushroom_text(taxonomy.get("genus")),
             "look_alikes": look_alikes,
             "characteristics": characteristics,
         }
