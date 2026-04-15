@@ -34,7 +34,7 @@ WEATHER_CACHE_TTL_SECONDS = 600
 WEATHER_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
-PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/process", "/voice/", "/work-reports"]
+PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/nature/", "/process", "/voice/", "/work-reports"]
 PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
 
 PERMISSION_DEFINITIONS = [
@@ -385,6 +385,26 @@ CREATE TABLE IF NOT EXISTS shared_contacts (
     updated_at TIMESTAMPTZ DEFAULT now(),
     deleted_at TIMESTAMPTZ
 );
+CREATE TABLE IF NOT EXISTS nature_recognition_history (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT NOT NULL DEFAULT 1,
+    user_id BIGINT,
+    recognition_type TEXT NOT NULL,
+    language TEXT DEFAULT 'en',
+    display_name TEXT,
+    scientific_name TEXT,
+    confidence NUMERIC(8,6),
+    guidance TEXT,
+    database_name TEXT,
+    result_json JSONB DEFAULT '{}'::jsonb,
+    photos_json JSONB DEFAULT '[]'::jsonb,
+    captured_at TIMESTAMPTZ,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    accuracy_meters DOUBLE PRECISION,
+    location_source TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
 DO $$ BEGIN
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name TEXT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email TEXT;
@@ -624,6 +644,7 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
                 upload.content_type or "image/jpeg",
             ),
         ))
+        await upload.seek(0)
     lang_code = (language or "en").split("-")[0].lower()
     params = {"api-key": PLANTNET_API_KEY, "lang": lang_code, "include-related-images": "false", "nb-results": "5"}
     multipart_parts = list(payload_files)
@@ -684,6 +705,7 @@ async def plant_health_assessment(files: List[UploadFile], language: str) -> dic
                 f"Obraz {index + 1} jest pusty."
             ))
         encoded_images.append(base64.b64encode(content).decode("ascii"))
+        await upload.seek(0)
     lang_code = (language or "en").split("-")[0].lower()
     params = {
         "details": "description,treatment,common_names",
@@ -748,6 +770,7 @@ async def mushroom_identify(files: List[UploadFile], language: str) -> dict:
                 f"Obraz {index + 1} jest pusty."
             ))
         encoded_images.append(base64.b64encode(content).decode("ascii"))
+        await upload.seek(0)
     params = {
         "details": "common_names,url,description,edibility,psychoactive,look_alikes,taxonomy,characteristics",
         "language": (language or "en").split("-")[0].lower(),
@@ -1647,6 +1670,94 @@ def map_photo_row_to_job_photo(row: dict) -> dict:
         "uploaded_by": row.get("created_by"),
         "uploaded_at": row.get("created_at"),
     }
+
+def history_type_label(language: str, recognition_type: str) -> str:
+    key = (recognition_type or "").lower()
+    return {
+        "plant_identification": tr_lang(language, "Plant", "Rostlina", "Roślina"),
+        "plant_health_assessment": tr_lang(language, "Plant disease", "Choroba rostliny", "Choroba rośliny"),
+        "mushroom_identification": tr_lang(language, "Mushroom", "Houba", "Grzyb"),
+    }.get(key, recognition_type)
+
+def map_nature_history_entry(row: dict, language: str) -> dict:
+    result_json = row.get("result_json") or {}
+    photos = row.get("photos_json") or []
+    return {
+        "id": row["id"],
+        "recognition_type": row.get("recognition_type"),
+        "recognition_label": history_type_label(language, row.get("recognition_type") or ""),
+        "display_name": row.get("display_name") or "",
+        "scientific_name": row.get("scientific_name") or "",
+        "confidence": float(row.get("confidence") or 0.0),
+        "guidance": row.get("guidance"),
+        "database": row.get("database_name"),
+        "captured_at": row.get("captured_at"),
+        "created_at": row.get("created_at"),
+        "latitude": row.get("latitude"),
+        "longitude": row.get("longitude"),
+        "accuracy_meters": row.get("accuracy_meters"),
+        "location_source": row.get("location_source"),
+        "photos": photos if isinstance(photos, list) else [],
+        "result": result_json if isinstance(result_json, dict) else {},
+    }
+
+async def build_history_photos(
+    uploads: List[UploadFile],
+    photo_types: Optional[List[str]] = None,
+) -> List[dict]:
+    photos = []
+    for index, upload in enumerate(uploads):
+        content = await upload.read()
+        if content:
+            filename = upload.filename or f"capture_{index + 1}.jpg"
+            photos.append({
+                "filename": filename,
+                "photo_type": (photo_types[index] if photo_types and index < len(photo_types) else "capture") or "capture",
+                "url": encode_photo_data_url(content, filename, upload.content_type),
+            })
+        await upload.seek(0)
+    return photos
+
+def store_nature_history(
+    conn,
+    tenant_id: int,
+    user_id: Optional[int],
+    recognition_type: str,
+    language: str,
+    result: dict,
+    photos: List[dict],
+    captured_at: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    accuracy_meters: Optional[float] = None,
+    location_source: Optional[str] = None,
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO nature_recognition_history
+                (tenant_id, user_id, recognition_type, language, display_name, scientific_name,
+                 confidence, guidance, database_name, result_json, photos_json, captured_at,
+                 latitude, longitude, accuracy_meters, location_source)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s)""",
+            (
+                tenant_id,
+                user_id,
+                recognition_type,
+                language,
+                result.get("display_name") or result.get("top_issue_name") or "",
+                result.get("scientific_name") or "",
+                result.get("score") or result.get("probability") or result.get("top_issue_probability") or result.get("health_probability") or 0.0,
+                result.get("guidance"),
+                result.get("database"),
+                json.dumps(result, ensure_ascii=False),
+                json.dumps(photos, ensure_ascii=False),
+                captured_at,
+                latitude,
+                longitude,
+                accuracy_meters,
+                location_source,
+            ),
+        )
 
 def map_audit_row_to_job_audit(row: dict) -> dict:
     return {
@@ -4209,6 +4320,11 @@ async def identify_plant(
     images: List[UploadFile] = File(...),
     organs_json: Optional[str] = Form(None),
     language: Optional[str] = Form("en"),
+    captured_at: Optional[str] = Form(None),
+    latitude: Optional[float] = Form(None),
+    longitude: Optional[float] = Form(None),
+    accuracy_meters: Optional[float] = Form(None),
+    location_source: Optional[str] = Form(None),
 ):
     user = ensure_request_permissions(request, "crm_read")
     tenant_id = user["tenant_id"]
@@ -4241,8 +4357,23 @@ async def identify_plant(
         organs.append(str(organ).strip().lower() or "auto")
     plantnet_raw = await plantnet_identify(images, organs, language or "en")
     result = map_plantnet_result(plantnet_raw, language or "en", organs)
+    history_photos = await build_history_photos(images, organs)
     conn = get_db_conn()
     try:
+        store_nature_history(
+            conn,
+            tenant_id,
+            user.get("user_id"),
+            "plant_identification",
+            language or "en",
+            result,
+            history_photos,
+            captured_at=captured_at,
+            latitude=latitude,
+            longitude=longitude,
+            accuracy_meters=accuracy_meters,
+            location_source=location_source,
+        )
         log_activity(
             conn,
             "plant_identification",
@@ -4262,6 +4393,11 @@ async def assess_plant_health(
     request: Request,
     images: List[UploadFile] = File(...),
     language: Optional[str] = Form("en"),
+    captured_at: Optional[str] = Form(None),
+    latitude: Optional[float] = Form(None),
+    longitude: Optional[float] = Form(None),
+    accuracy_meters: Optional[float] = Form(None),
+    location_source: Optional[str] = Form(None),
 ):
     user = ensure_request_permissions(request, "crm_read")
     tenant_id = user["tenant_id"]
@@ -4281,8 +4417,23 @@ async def assess_plant_health(
         ))
     health_raw = await plant_health_assessment(images, language or "en")
     result = map_plant_health_result(health_raw, language or "en")
+    history_photos = await build_history_photos(images)
     conn = get_db_conn()
     try:
+        store_nature_history(
+            conn,
+            tenant_id,
+            user.get("user_id"),
+            "plant_health_assessment",
+            language or "en",
+            result,
+            history_photos,
+            captured_at=captured_at,
+            latitude=latitude,
+            longitude=longitude,
+            accuracy_meters=accuracy_meters,
+            location_source=location_source,
+        )
         log_activity(
             conn,
             "plant_health_assessment",
@@ -4302,6 +4453,11 @@ async def identify_mushroom(
     request: Request,
     images: List[UploadFile] = File(...),
     language: Optional[str] = Form("en"),
+    captured_at: Optional[str] = Form(None),
+    latitude: Optional[float] = Form(None),
+    longitude: Optional[float] = Form(None),
+    accuracy_meters: Optional[float] = Form(None),
+    location_source: Optional[str] = Form(None),
 ):
     user = ensure_request_permissions(request, "crm_read")
     tenant_id = user["tenant_id"]
@@ -4321,8 +4477,23 @@ async def identify_mushroom(
         ))
     mushroom_raw = await mushroom_identify(images, language or "en")
     result = map_mushroom_result(mushroom_raw, language or "en")
+    history_photos = await build_history_photos(images)
     conn = get_db_conn()
     try:
+        store_nature_history(
+            conn,
+            tenant_id,
+            user.get("user_id"),
+            "mushroom_identification",
+            language or "en",
+            result,
+            history_photos,
+            captured_at=captured_at,
+            latitude=latitude,
+            longitude=longitude,
+            accuracy_meters=accuracy_meters,
+            location_source=location_source,
+        )
         log_activity(
             conn,
             "mushroom_identification",
@@ -4336,6 +4507,34 @@ async def identify_mushroom(
     finally:
         release_conn(conn)
     return result
+
+@app.get("/nature/history")
+async def get_nature_history(
+    request: Request,
+    limit: int = 30,
+    recognition_type: Optional[str] = None,
+    language: Optional[str] = None,
+):
+    user = ensure_request_permissions(request, "crm_read")
+    tenant_id = user["tenant_id"]
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = """SELECT id, recognition_type, display_name, scientific_name, confidence, guidance,
+                            database_name, result_json, photos_json, captured_at::text, created_at::text,
+                            latitude, longitude, accuracy_meters, location_source
+                     FROM nature_recognition_history
+                     WHERE tenant_id=%s"""
+            params = [tenant_id]
+            if recognition_type:
+                sql += " AND recognition_type=%s"
+                params.append(recognition_type)
+            sql += " ORDER BY COALESCE(captured_at, created_at) DESC LIMIT %s"
+            params.append(max(1, min(limit, 100)))
+            cur.execute(sql, params)
+            return [map_nature_history_entry(dict(row), language or "en") for row in cur.fetchall()]
+    finally:
+        release_conn(conn)
 
 @app.post("/crm/jobs/{job_id}/audit")
 async def add_job_audit(job_id: int, data: dict, request: Request):
