@@ -34,7 +34,7 @@ WEATHER_CACHE_TTL_SECONDS = 600
 WEATHER_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
-PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/nature/", "/process", "/voice/", "/work-reports"]
+PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/nature/", "/admin/", "/process", "/voice/", "/work-reports"]
 PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
 
 PERMISSION_DEFINITIONS = [
@@ -272,6 +272,8 @@ CREATE TABLE IF NOT EXISTS activity_timeline (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL,
     description TEXT NOT NULL, user_name TEXT DEFAULT 'Marek',
+    source_channel TEXT,
+    details_json JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS photos (
@@ -405,6 +407,20 @@ CREATE TABLE IF NOT EXISTS nature_recognition_history (
     location_source TEXT,
     created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS nature_recognition_photos (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    history_id BIGINT NOT NULL REFERENCES nature_recognition_history(id) ON DELETE CASCADE,
+    tenant_id INT NOT NULL DEFAULT 1,
+    sort_order INT NOT NULL DEFAULT 0,
+    filename TEXT,
+    photo_type TEXT DEFAULT 'capture',
+    content_type TEXT,
+    size_bytes INT,
+    photo_data_url TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_nature_recognition_photos_history_id
+    ON nature_recognition_photos(history_id, sort_order);
 DO $$ BEGIN
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name TEXT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email TEXT;
@@ -425,6 +441,8 @@ DO $$ BEGIN
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS user_id_ref TEXT;
+    ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS source_channel TEXT;
+    ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS details_json JSONB DEFAULT '{}'::jsonb;
     ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS note_type TEXT DEFAULT 'general';
     ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS tenant_id INT NOT NULL DEFAULT 1;
     ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
@@ -1571,16 +1589,51 @@ def clear_user_permission_overrides(conn, user_id: int):
     with conn.cursor() as cur:
         cur.execute("DELETE FROM user_permission_overrides WHERE user_id=%s", (user_id,))
 
-def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1, user_id=None, details=None):
+def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1, user_id=None, details=None, source_channel=None, user_name=None):
+    resolved_user_name = user_name
+    if not resolved_user_name:
+        try:
+            resolved_user_name = get_user_display_name(conn, tenant_id, user_id) if user_id else None
+        except Exception:
+            resolved_user_name = None
+    if not resolved_user_name:
+        resolved_user_name = str(user_id) if user_id else "system"
     with conn.cursor() as cur:
         cur.execute("""INSERT INTO activity_timeline
-            (entity_type, entity_id, action, description, user_name, tenant_id, user_id_ref, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, now())""",
+            (entity_type, entity_id, action, description, user_name, tenant_id, user_id_ref, source_channel, details_json, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())""",
             (entity_type, str(entity_id), action,
              description[:500] if description else "",
-             str(user_id) if user_id else "system",
+             resolved_user_name,
              tenant_id,
-             str(user_id) if user_id else None))
+             str(user_id) if user_id else None,
+             source_channel,
+             json.dumps(details or {}, ensure_ascii=False)))
+
+def audit_request_event(request: Request, action: str, description: str, entity_type: str = "app_usage", entity_id: Any = "", details: Optional[dict] = None, source_channel: Optional[str] = None):
+    try:
+        user = get_request_user_payload(request)
+        conn = get_db_conn()
+        try:
+            log_activity(
+                conn,
+                entity_type,
+                entity_id or action,
+                action,
+                description,
+                tenant_id=user["tenant_id"],
+                user_id=user["user_id"],
+                details=details,
+                source_channel=source_channel,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            release_conn(conn)
+    except Exception as e:
+        print(f"audit_request_event failed: {e}")
 
 # ========== TENANT CONFIG LOADER ==========
 _tenant_config_cache = {}
@@ -1762,6 +1815,16 @@ def encode_photo_data_url(content: bytes, filename: str, content_type: Optional[
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 
+def guess_mime_type(filename: str) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(ext, "image/jpeg")
+
 def map_photo_row_to_job_photo(row: dict) -> dict:
     return {
         "id": row["id"],
@@ -1799,8 +1862,27 @@ def map_nature_history_entry(row: dict, language: str) -> dict:
         "longitude": row.get("longitude"),
         "accuracy_meters": row.get("accuracy_meters"),
         "location_source": row.get("location_source"),
+        "owner_user_id": row.get("owner_user_id"),
+        "owner_display_name": row.get("owner_display_name") or "",
+        "owner_email": row.get("owner_email") or "",
         "photos": photos if isinstance(photos, list) else [],
         "result": result_json if isinstance(result_json, dict) else {},
+    }
+
+def map_admin_activity_entry(row: dict) -> dict:
+    details = row.get("details_json") or {}
+    return {
+        "id": row["id"],
+        "entity_type": row.get("entity_type") or "",
+        "entity_id": row.get("entity_id") or "",
+        "action": row.get("action") or "",
+        "description": row.get("description") or "",
+        "source_channel": row.get("source_channel") or "",
+        "created_at": row.get("created_at"),
+        "actor_user_id": int(row["actor_user_id"]) if row.get("actor_user_id") not in (None, "") else None,
+        "actor_display_name": row.get("actor_display_name") or row.get("user_name") or "",
+        "actor_email": row.get("actor_email") or "",
+        "details": details if isinstance(details, dict) else {},
     }
 
 async def build_history_photos(
@@ -1815,6 +1897,8 @@ async def build_history_photos(
             photos.append({
                 "filename": filename,
                 "photo_type": (photo_types[index] if photo_types and index < len(photo_types) else "capture") or "capture",
+                "content_type": upload.content_type or guess_mime_type(filename),
+                "size_bytes": len(content),
                 "url": encode_photo_data_url(content, filename, upload.content_type),
             })
         await upload.seek(0)
@@ -1837,10 +1921,11 @@ def store_nature_history(
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO nature_recognition_history
-                (tenant_id, user_id, recognition_type, language, display_name, scientific_name,
-                 confidence, guidance, database_name, result_json, photos_json, captured_at,
-                 latitude, longitude, accuracy_meters, location_source)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s)""",
+              (tenant_id, user_id, recognition_type, language, display_name, scientific_name,
+               confidence, guidance, database_name, result_json, photos_json, captured_at,
+               latitude, longitude, accuracy_meters, location_source)
+             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s)
+             RETURNING id""",
             (
                 tenant_id,
                 user_id,
@@ -1860,6 +1945,23 @@ def store_nature_history(
                 location_source,
             ),
         )
+        history_id = cur.fetchone()[0]
+        for index, photo in enumerate(photos or []):
+            cur.execute(
+                """INSERT INTO nature_recognition_photos
+                  (history_id, tenant_id, sort_order, filename, photo_type, content_type, size_bytes, photo_data_url)
+                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    history_id,
+                    tenant_id,
+                    index,
+                    photo.get("filename"),
+                    photo.get("photo_type") or "capture",
+                    photo.get("content_type"),
+                    photo.get("size_bytes"),
+                    photo.get("url") or "",
+                ),
+            )
 
 def map_audit_row_to_job_audit(row: dict) -> dict:
     return {
@@ -2177,6 +2279,20 @@ class MessageRequest(BaseModel):
 async def process_message(msg: MessageRequest, request: Request):
     try:
         now = msg.current_datetime or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        audit_request_event(
+            request,
+            action="assistant_query",
+            description=msg.text,
+            entity_type="assistant",
+            entity_id=msg.context_entity_id or "general",
+            details={
+                "context_type": msg.context_type,
+                "context_entity_id": msg.context_entity_id,
+                "internal_language": msg.internal_language,
+                "external_language": msg.external_language,
+            },
+            source_channel="text",
+        )
         entity_ctx = ""
         if msg.context_entity_id and msg.context_type == "client":
             conn = get_db_conn()
@@ -4621,17 +4737,25 @@ async def get_nature_history(
     tenant_id = user["tenant_id"]
     conn = get_db_conn()
     try:
+        permissions = get_effective_permissions(conn, tenant_id, user["user_id"], user.get("role"))
+        can_view_all = permissions.get("manage_users", False)
         with conn.cursor() as cur:
-            sql = """SELECT id, recognition_type, display_name, scientific_name, confidence, guidance,
-                            database_name, result_json, photos_json, captured_at::text, created_at::text,
-                            latitude, longitude, accuracy_meters, location_source
-                     FROM nature_recognition_history
-                     WHERE tenant_id=%s"""
+            sql = """SELECT h.id, h.recognition_type, h.display_name, h.scientific_name, h.confidence, h.guidance,
+                            h.database_name, h.result_json, h.photos_json, h.captured_at::text, h.created_at::text,
+                            h.latitude, h.longitude, h.accuracy_meters, h.location_source,
+                            h.user_id AS owner_user_id, COALESCE(u.display_name, '') AS owner_display_name,
+                            COALESCE(u.email, '') AS owner_email
+                     FROM nature_recognition_history h
+                     LEFT JOIN users u ON u.id = h.user_id AND u.tenant_id = h.tenant_id
+                     WHERE h.tenant_id=%s"""
             params = [tenant_id]
+            if not can_view_all:
+                sql += " AND h.user_id=%s"
+                params.append(user["user_id"])
             if recognition_type:
-                sql += " AND recognition_type=%s"
+                sql += " AND h.recognition_type=%s"
                 params.append(recognition_type)
-            sql += " ORDER BY COALESCE(captured_at, created_at) DESC LIMIT %s"
+            sql += " ORDER BY COALESCE(h.captured_at, h.created_at) DESC LIMIT %s"
             params.append(max(1, min(limit, 100)))
             cur.execute(sql, params)
             return [map_nature_history_entry(dict(row), language or "en") for row in cur.fetchall()]
@@ -4642,6 +4766,36 @@ async def get_nature_history(
 async def get_nature_services_status(request: Request):
     ensure_request_permissions(request, "crm_read")
     return get_nature_service_status()
+
+@app.get("/admin/activity-log")
+async def get_admin_activity_log(
+    admin: dict = Depends(require_permission("manage_users")),
+    limit: int = 200,
+    actor_user_id: Optional[int] = None,
+):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = """SELECT a.id, a.entity_type, a.entity_id, a.action, a.description, a.user_name,
+                            a.source_channel, a.details_json, a.created_at::text,
+                            a.user_id_ref AS actor_user_id,
+                            COALESCE(u.display_name, a.user_name, '') AS actor_display_name,
+                            COALESCE(u.email, '') AS actor_email
+                     FROM activity_timeline a
+                     LEFT JOIN users u
+                       ON u.id::text = a.user_id_ref
+                      AND u.tenant_id = a.tenant_id
+                     WHERE a.tenant_id=%s"""
+            params = [admin["tenant_id"]]
+            if actor_user_id is not None:
+                sql += " AND a.user_id_ref=%s"
+                params.append(str(actor_user_id))
+            sql += " ORDER BY a.created_at DESC LIMIT %s"
+            params.append(max(1, min(limit, 1000)))
+            cur.execute(sql, params)
+            return [map_admin_activity_entry(dict(row)) for row in cur.fetchall()]
+    finally:
+        release_conn(conn)
 
 @app.post("/crm/jobs/{job_id}/audit")
 async def add_job_audit(job_id: int, data: dict, request: Request):
@@ -5090,8 +5244,27 @@ async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(requi
                 clear_user_permission_overrides(conn, user_id)
             if not updates and not permissions_payload and data.get("reset_permission_overrides") is not True:
                 raise HTTPException(400, "Nothing to update")
+            log_activity(
+                conn,
+                "user",
+                user_id,
+                "update_user",
+                f"Updated user {user_id}",
+                tenant_id=admin["tenant_id"],
+                user_id=admin["user_id"],
+                details={
+                    "display_name": data.get("display_name"),
+                    "phone": data.get("phone"),
+                    "role": data.get("role"),
+                    "status": data.get("status"),
+                    "permissions_changed": bool(permissions_payload),
+                    "reset_password_to_default": data.get("reset_password_to_default") is True,
+                    "reset_permission_overrides": data.get("reset_permission_overrides") is True,
+                },
+                source_channel="settings",
+            )
             conn.commit()
-        return {"ok": True}
+            return {"ok": True}
     except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
@@ -5106,6 +5279,7 @@ async def auth_delete_user(user_id: int, admin: dict = Depends(require_permissio
                 (user_id, admin["tenant_id"]))
             if not cur.fetchone(): raise HTTPException(404, "User not found")
             cur.execute("UPDATE users SET deleted_at=now(), status='inactive' WHERE id=%s", (user_id,))
+            log_activity(conn, "user", user_id, "delete_user", f"Deleted user {user_id}", tenant_id=admin["tenant_id"], user_id=admin["user_id"], source_channel="settings")
             conn.commit()
         return {"ok": True}
     except HTTPException: raise
@@ -5388,6 +5562,20 @@ async def update_tenant_languages_endpoint(tenant_id: int, data: dict, user: dic
             if default_customer_lang:
                 upsert_default_language("customer", resolved_customer)
                 upsert_default_language("voice_output", resolved_customer)
+            log_activity(
+                conn,
+                "tenant_config",
+                tenant_id,
+                "update_languages",
+                "Updated tenant language settings",
+                tenant_id=tenant_id,
+                user_id=user["user_id"],
+                details={
+                    "default_internal_language_code": resolved_internal,
+                    "default_customer_language_code": resolved_customer,
+                },
+                source_channel="settings",
+            )
             conn.commit()
             _tenant_config_cache.pop(tenant_id, None)
         return get_tenant_config(conn, tenant_id)
@@ -5725,7 +5913,7 @@ def generate_whatsapp(ctx):
 
 # ========== VOICE SESSION API ==========
 @app.post("/voice/session/start")
-async def voice_session_start(data: dict):
+async def voice_session_start(data: dict, request: Request):
     conn = get_db_conn()
     try:
         sid = str(uuid.uuid4())
@@ -5737,15 +5925,34 @@ async def voice_session_start(data: dict):
             cur.execute("INSERT INTO voice_sessions (id,tenant_id,user_id,session_type,state,dialog_step,context) VALUES (%s,%s,%s,'work_report','active','client',%s)",
                 (sid,tenant_id,data.get("user_id"),ctx))
             conn.commit()
+        audit_request_event(
+            request,
+            action="voice_session_start",
+            description="Started voice session",
+            entity_type="voice_session",
+            entity_id=sid,
+            details={"language": lang, "work_date": data.get("work_date")},
+            source_channel="voice",
+        )
         return {"session_id":sid,"step":"client","prompt":get_prompt("client",lang)}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
 @app.post("/voice/session/input")
-async def voice_session_input(data: dict):
+async def voice_session_input(data: dict, request: Request):
     sid = data.get("session_id")
     text = data.get("text","").strip()
     if not sid: raise HTTPException(400,"session_id required")
+    if text:
+        audit_request_event(
+            request,
+            action="voice_session_input",
+            description=text,
+            entity_type="voice_session",
+            entity_id=sid,
+            details={"tenant_id": data.get("tenant_id", 1)},
+            source_channel="voice",
+        )
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
