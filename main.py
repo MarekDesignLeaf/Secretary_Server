@@ -30,6 +30,8 @@ JWT_ALGORITHM = "HS256"
 JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
 DEFAULT_TEMP_PASSWORD = "12345"
+WEATHER_CACHE_TTL_SECONDS = 600
+WEATHER_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
 PROTECTED_PREFIXES = ["/crm/", "/plants/", "/process", "/voice/", "/work-reports"]
@@ -1916,9 +1918,18 @@ RULES:
 
             if action == "GET_WEATHER":
                 try:
-                    import urllib.request, urllib.parse
-                    loc = args.get("location","Didcot")
-                    days = min(args.get("days",3), 7)
+                    import urllib.request, urllib.parse, urllib.error
+                    loc = str(args.get("location") or "Didcot").strip() or "Didcot"
+                    try:
+                        days = int(float(args.get("days", 3)))
+                    except Exception:
+                        days = 3
+                    days = max(1, min(days, 7))
+                    cache_key = f"{loc.lower()}::{days}"
+                    cached_entry = WEATHER_CACHE.get(cache_key)
+                    now_ts = datetime.utcnow().timestamp()
+                    if cached_entry and (now_ts - cached_entry.get("ts", 0)) < WEATHER_CACHE_TTL_SECONDS:
+                        return {"reply_cs": cached_entry["reply"]}
                     # Geocode location
                     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(loc)}&count=1&language=en"
                     with urllib.request.urlopen(geo_url, timeout=5) as r:
@@ -1938,6 +1949,9 @@ RULES:
                         f"&timezone=Europe/London&forecast_days={days}")
                     with urllib.request.urlopen(wx_url, timeout=8) as r:
                         wx = json.loads(r.read())
+                    if wx.get("error") or not wx.get("daily"):
+                        reason = wx.get("reason") or wx.get("error") or "unknown weather service error"
+                        raise RuntimeError(reason)
                     # Format daily summary
                     wmo = {0:"☀️ Jasno",1:"🌤 Polojasno",2:"⛅ Oblačno",3:"☁️ Zataženo",45:"🌫 Mlha",48:"🌫 Námraza",
                            51:"🌧 Mrholení",53:"🌧 Mrholení",55:"🌧 Mrholení",56:"🌧 Mrz. mrholení",57:"🌧 Mrz. mrholení",
@@ -1952,25 +1966,39 @@ RULES:
                         f"📍 Počasí — {name} ({days} dní):",
                         f"📍 Pogoda — {name} ({days} dni):"
                     )]
+                    daily_codes = daily.get("weathercode") or daily.get("weather_code") or []
+                    daily_tmax = daily.get("temperature_2m_max") or []
+                    daily_tmin = daily.get("temperature_2m_min") or []
+                    daily_rain = daily.get("precipitation_sum") or []
+                    daily_rain_prob = daily.get("precipitation_probability_max") or []
+                    daily_wind = daily.get("windspeed_10m_max") or daily.get("wind_speed_10m_max") or []
                     for i, d in enumerate(daily.get("time",[])):
-                        code = daily["weathercode"][i] if daily.get("weathercode") else 0
-                        tmax = daily.get("temperature_2m_max",[None])[i]
-                        tmin = daily.get("temperature_2m_min",[None])[i]
-                        rain = daily.get("precipitation_sum",[None])[i]
-                        rain_prob = daily.get("precipitation_probability_max",[None])[i]
-                        wind = daily.get("windspeed_10m_max",[None])[i]
+                        code = daily_codes[i] if i < len(daily_codes) else 0
+                        tmax = daily_tmax[i] if i < len(daily_tmax) else None
+                        tmin = daily_tmin[i] if i < len(daily_tmin) else None
+                        rain = daily_rain[i] if i < len(daily_rain) else None
+                        rain_prob = daily_rain_prob[i] if i < len(daily_rain_prob) else None
+                        wind = daily_wind[i] if i < len(daily_wind) else None
                         desc = wmo.get(code, f"Kód {code}")
-                        line = f"\n{d}: {desc}, {tmin:.0f}–{tmax:.0f}°C"
-                        if rain and rain > 0: line += tr(f", rain {rain:.1f}mm", f", déšť {rain:.1f}mm", f", deszcz {rain:.1f}mm")
-                        if rain_prob: line += f" ({rain_prob}%)"
-                        if wind: line += tr(f", wind {wind:.0f} km/h", f", vítr {wind:.0f} km/h", f", wiatr {wind:.0f} km/h")
+                        if tmin is not None and tmax is not None:
+                            line = f"\n{d}: {desc}, {tmin:.0f}–{tmax:.0f}°C"
+                        elif tmax is not None:
+                            line = f"\n{d}: {desc}, {tmax:.0f}°C"
+                        else:
+                            line = f"\n{d}: {desc}"
+                        if rain is not None and rain > 0:
+                            line += tr(f", rain {rain:.1f}mm", f", déšť {rain:.1f}mm", f", deszcz {rain:.1f}mm")
+                        if rain_prob is not None:
+                            line += f" ({rain_prob:.0f}%)"
+                        if wind is not None:
+                            line += tr(f", wind {wind:.0f} km/h", f", vítr {wind:.0f} km/h", f", wiatr {wind:.0f} km/h")
                         lines.append(line)
                     # Add hourly for today
                     hourly = wx.get("hourly",{})
                     h_times = hourly.get("time",[])
                     h_temps = hourly.get("temperature_2m",[])
                     h_rain = hourly.get("precipitation_probability",[])
-                    h_codes = hourly.get("weathercode",[])
+                    h_codes = hourly.get("weathercode") or hourly.get("weather_code") or []
                     if h_times:
                         lines.append(tr("\n⏰ Hourly forecast today:", "\n⏰ Hodinová předpověď dnes:", "\n⏰ Prognoza godzinowa na dziś:"))
                         today_str = daily.get("time",[""])[0]
@@ -1978,17 +2006,33 @@ RULES:
                             if today_str in ht:
                                 hour = ht.split("T")[1][:5]
                                 if hour in ["06:00","09:00","12:00","15:00","18:00","21:00"]:
-                                    t = h_temps[j] if j < len(h_temps) else "?"
+                                    t = h_temps[j] if j < len(h_temps) else None
                                     rp = h_rain[j] if j < len(h_rain) else 0
                                     cd = h_codes[j] if j < len(h_codes) else 0
                                     emoji = wmo.get(cd,"")[:2]
                                     lines.append(tr(
-                                        f"  {hour} {emoji} {t:.0f}°C, rain {rp}%",
-                                        f"  {hour} {emoji} {t:.0f}°C, déšť {rp}%",
-                                        f"  {hour} {emoji} {t:.0f}°C, deszcz {rp}%"
+                                        f"  {hour} {emoji} {f'{t:.0f}°C' if t is not None else '?'} , rain {rp:.0f}%",
+                                        f"  {hour} {emoji} {f'{t:.0f}°C' if t is not None else '?'} , déšť {rp:.0f}%",
+                                        f"  {hour} {emoji} {f'{t:.0f}°C' if t is not None else '?'} , deszcz {rp:.0f}%"
                                     ))
                     reply = "\n".join(lines)
+                    WEATHER_CACHE[cache_key] = {"reply": reply, "ts": now_ts}
                     return {"reply_cs": reply}
+                except urllib.error.HTTPError as e:
+                    if e.code == 429:
+                        cached_entry = WEATHER_CACHE.get(cache_key)
+                        if cached_entry:
+                            return {"reply_cs": cached_entry["reply"] + tr(
+                                "\n\nℹ️ Using the last saved weather because the weather service is busy.",
+                                "\n\nℹ️ Používám poslední uložené počasí, protože weather služba je teď přetížená.",
+                                "\n\nℹ️ Używam ostatnio zapisanej prognozy, ponieważ usługa pogody jest teraz przeciążona."
+                            )}
+                        return {"reply_cs": tr(
+                            "Weather service is temporarily busy. Try again in a minute.",
+                            "Služba počasí je dočasně přetížená. Zkus to znovu za chvíli.",
+                            "Usługa pogody jest chwilowo przeciążona. Spróbuj ponownie za chwilę."
+                        )}
+                    raise
                 except Exception as e:
                     return {"reply_cs": tr(
                         f"Failed to load weather: {e}",
