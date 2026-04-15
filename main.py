@@ -2259,6 +2259,11 @@ def close_db_pool():
 async def app_lifespan(_: FastAPI):
     run_startup_bootstrap()
     ensure_quote_items_table()
+    print(
+        "Startup routes: "
+        f"admin_activity_log={any(getattr(route, 'path', None) == '/admin/activity-log' for route in app.routes)} "
+        f"nature_services_status={any(getattr(route, 'path', None) == '/nature/services/status' for route in app.routes)}"
+    )
     yield
     close_db_pool()
 
