@@ -1,4 +1,4 @@
-﻿import os, json, uuid, csv, io, hashlib
+[Resource from github at repo://marekdesignleaf/secretary_server/sha/cc5891abbeedec362b3ff09038d2d07042d7fdc0/contents/main.py] ﻿import os, json, uuid, csv, io, hashlib
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
@@ -16,6 +16,8 @@ import jwt as pyjwt
 import json
 import urllib.request
 from contextlib import contextmanager, asynccontextmanager
+import hashlib
+import hmac
 
 app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
 
@@ -501,6 +503,8 @@ WA_PHONE_ID = env_first("WHATSAPP_PHONE_NUMBER_ID", "WA_PHONE_ID", "META_WHATSAP
 WA_ACCOUNT_ID = env_first("WHATSAPP_BUSINESS_ACCOUNT_ID", "WA_ACCOUNT_ID", "META_WHATSAPP_BUSINESS_ACCOUNT_ID")
 WA_TOKEN = env_first("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOKEN")
 WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="designleaf_webhook_2026")
+WA_TENANT_ID = int(os.getenv("WA_TENANT_ID", "1"))  # S2/S16: configurable tenant for WhatsApp
+WA_APP_SECRET = env_first("WHATSAPP_APP_SECRET", "WA_APP_SECRET", "META_APP_SECRET")  # S17: HMAC
 PLANTNET_API_KEY = env_first(
     "PLANTNET_API_KEY",
     "PLANTNET_KEY",
@@ -780,6 +784,7 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
             return response.json()
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:500]
+        print(f"[S20] PlantNet HTTP error {exc.response.status_code}: {detail}")  # S20: log external API errors
         if exc.response.status_code in (401, 403):
             raise HTTPException(502, tr_lang(
                 language,
@@ -794,6 +799,7 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
             f"Rozpoznanie rośliny nie powiodło się: {detail}"
         ))
     except httpx.HTTPError as exc:
+        print(f"[S20] PlantNet network error: {exc}")  # S20
         raise HTTPException(502, tr_lang(
             language,
             f"Plant identification network error: {exc}",
@@ -2682,7 +2688,7 @@ RULES:
                         )}
                     with conn.cursor() as cur:
                         cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                            VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
+                            VALUES (WA_TENANT_ID,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
                             (client["id"], message[:500], f"To: {phone}"))
                     log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']}: {message[:100]}")
                     conn.commit()
@@ -3258,7 +3264,7 @@ async def create_job(data: dict, request: Request):
                     tid,
                     code,
                     data.get("client_id"),
-                    data.get("property_id",data.get("client_id")),
+                    data.get("property_id"),  # S19: never default to client_id
                     data.get("title","Zakazka"),
                     data.get("start_date"),
                     planning_start,
@@ -3525,21 +3531,23 @@ async def update_lead(lead_id: int, data: dict):
     finally: release_conn(conn)
 
 @app.post("/crm/leads/{lead_id}/convert-to-client")
-async def convert_lead_to_client(lead_id: int, data: dict):
+async def convert_lead_to_client(lead_id: int, data: dict, request: Request):
+    # S1: get tenant_id from JWT, not from data
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM leads WHERE id=%s",(lead_id,))
+            cur.execute("SELECT * FROM leads WHERE id=%s AND tenant_id=%s",(lead_id, tid))
             lead = cur.fetchone()
             if not lead: raise HTTPException(404,"Lead nenalezen")
             name = data.get("name",lead.get("contact_name","Nový klient"))
             email = data.get("email",lead.get("contact_email"))
             phone = data.get("phone",lead.get("contact_phone"))
             code = f"CL-{uuid.uuid4().hex[:6].upper()}"
-            cur.execute("INSERT INTO clients (client_code,client_type,display_name,email_primary,phone_primary,status) VALUES (%s,'domestic',%s,%s,%s,'active') RETURNING id",
-                (code,name,email,phone))
+            cur.execute("INSERT INTO clients (tenant_id,client_code,client_type,display_name,email_primary,phone_primary,status) VALUES (%s,%s,'domestic',%s,%s,%s,'active') RETURNING id",
+                (tid,code,name,email,phone))
             cid = cur.fetchone()['id']
-            cur.execute("UPDATE leads SET status='preveden_na_klienta',client_id=%s,updated_at=now() WHERE id=%s",(cid,lead_id))
+            cur.execute("UPDATE leads SET status='preveden_na_klienta',client_id=%s,updated_at=now() WHERE id=%s AND tenant_id=%s",(cid,lead_id,tid))
             log_activity(conn,"lead",lead_id,"convert","Lead preveden na klienta "+code)
             log_activity(conn,"client",cid,"create","Klient vytvoren z leadu "+lead.get('lead_code',''))
             conn.commit()
@@ -3549,11 +3557,13 @@ async def convert_lead_to_client(lead_id: int, data: dict):
     finally: release_conn(conn)
 
 @app.post("/crm/leads/{lead_id}/convert-to-job")
-async def convert_lead_to_job(lead_id: int, data: dict):
+async def convert_lead_to_job(lead_id: int, data: dict, request: Request):
+    # S1: get tenant_id from JWT
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM leads WHERE id=%s",(lead_id,))
+            cur.execute("SELECT * FROM leads WHERE id=%s AND tenant_id=%s",(lead_id, tid))
             lead = cur.fetchone()
             if not lead: raise HTTPException(404)
             jcode = f"JOB-{uuid.uuid4().hex[:6].upper()}"
@@ -4427,6 +4437,35 @@ async def delete_quote_item(quote_id: int, item_id: int):
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
+# S12: missing PUT endpoint for updating individual quote items
+@app.put("/crm/quotes/{quote_id}/items/{item_id}")
+async def update_quote_item(quote_id: int, item_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM quote_items WHERE id=%s AND quote_id=%s",(item_id,quote_id))
+            if not cur.fetchone(): raise HTTPException(404,"Quote item not found")
+            fields = []; vals = []
+            for k in ["description","quantity","unit_price"]:
+                if k in data:
+                    fields.append(f"{k}=%s"); vals.append(data[k])
+            if not fields: raise HTTPException(400,"No fields to update")
+            # Recalculate total if quantity or unit_price changed
+            if "quantity" in data or "unit_price" in data:
+                cur.execute("SELECT quantity,unit_price FROM quote_items WHERE id=%s",(item_id,))
+                row = dict(cur.fetchone())
+                qty = float(data.get("quantity", row["quantity"]))
+                price = float(data.get("unit_price", row["unit_price"]))
+                fields.append("total=%s"); vals.append(round(qty * price, 2))
+            vals.extend([item_id, quote_id])
+            cur.execute(f"UPDATE quote_items SET {','.join(fields)} WHERE id=%s AND quote_id=%s",vals)
+            cur.execute("UPDATE quotes SET grand_total=(SELECT COALESCE(SUM(total),0) FROM quote_items WHERE quote_id=%s),updated_at=now() WHERE id=%s",(quote_id,quote_id))
+            conn.commit()
+        return {"id":item_id,"status":"updated"}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
+
 @app.post("/crm/quotes/{quote_id}/approve")
 async def approve_quote(quote_id: int, data: dict = {}):
     conn = get_db_conn()
@@ -4460,9 +4499,15 @@ async def update_invoice(invoice_id: int, data: dict):
                 if err: raise HTTPException(422, err)
             fields = []
             vals = []
-            for k in ["status","grand_total","due_date","notes"]:
+            for k in ["status","due_date","notes"]:
                 if k in data:
                     fields.append(f"{k}=%s"); vals.append(data[k])
+            # S11: recalculate grand_total from items; only use provided value if no items exist
+            if "grand_total" in data:
+                cur.execute("SELECT COALESCE(SUM(total),0) as items_total FROM invoice_items WHERE invoice_id=%s",(invoice_id,))
+                items_total = float((cur.fetchone() or {}).get("items_total") or 0)
+                new_total = items_total if items_total > 0 else float(data["grand_total"])
+                fields.append("grand_total=%s"); vals.append(new_total)
             if not fields: raise HTTPException(400,"No fields to update")
             vals.append(invoice_id)
             cur.execute(f"UPDATE invoices SET {','.join(fields)},updated_at=now() WHERE id=%s",vals)
@@ -4979,15 +5024,18 @@ async def mark_notification_read(notification_id: int):
 
 # ========== MANUAL WORK REPORT ==========
 @app.post("/work-reports")
-async def create_work_report(data: dict):
+async def create_work_report(data: dict, request: Request):
+    # S13: use JWT tenant_id and user for created_by - never trust client-supplied values
+    tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            created_by = get_user_display_name(conn, tid, request.state.user.get("user_id")) or data.get("created_by")
             cur.execute("""INSERT INTO work_reports (tenant_id,client_id,work_date,total_hours,total_price,notes,input_type,status,created_by)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (data.get("tenant_id",1),data.get("client_id"),data.get("work_date"),
+                (tid,data.get("client_id"),data.get("work_date"),
                  data.get("total_hours",0),data.get("total_price",0),data.get("notes"),
-                 data.get("input_type","manual"),data.get("status","draft"),data.get("created_by")))
+                 data.get("input_type","manual"),data.get("status","draft"),created_by))
             rid = cur.fetchone()['id']; conn.commit()
         return {"id":rid,"status":"created"}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
@@ -5972,7 +6020,7 @@ async def voice_session_input(data: dict, request: Request):
             description=text,
             entity_type="voice_session",
             entity_id=sid,
-            details={"tenant_id": data.get("tenant_id", 1)},
+            details={"tenant_id": data.get("tenant_id")},  # S4: tenant resolved from JWT later
             source_channel="voice",
         )
     conn = get_db_conn()
@@ -5984,7 +6032,8 @@ async def voice_session_input(data: dict, request: Request):
                 conn.rollback(); release_conn(conn)
                 return {"step":"error","prompt":"Session not found or expired","error":"no_session"}
             # Tenant isolation check
-            req_tenant = data.get("tenant_id", 1)
+            # S4: use JWT tenant_id for isolation, not client-supplied value
+            req_tenant = get_request_tenant_id(request)
             if sess["tenant_id"] != req_tenant:
                 raise HTTPException(403, "Tenant mismatch")
             _raw = sess['context']
@@ -6401,7 +6450,16 @@ async def wa_verify(request: Request):
 @app.post("/whatsapp/webhook")
 async def wa_incoming(request: Request):
     """Receive incoming WhatsApp messages"""
-    body = await request.json()
+    # S17: Verify X-Hub-Signature-256 HMAC before processing
+    if WA_APP_SECRET:
+        raw_body = await request.body()
+        sig_header = request.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + hmac.new(WA_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig_header, expected):
+            raise HTTPException(403, "Invalid webhook signature")
+        body = json.loads(raw_body)
+    else:
+        body = await request.json()
     try:
         for entry in body.get("entry", []):
             for change in entry.get("changes", []):
@@ -6435,7 +6493,7 @@ async def wa_incoming(request: Request):
                                     log_activity(conn,"client",client_id,"auto_create",f"Klient vytvoren z WhatsApp: {display}")
                         with conn.cursor() as cur:
                             cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                                VALUES (1,%s,'whatsapp',%s,%s,'inbound',%s,now())""",
+                                VALUES (WA_TENANT_ID,%s,'whatsapp',%s,%s,'inbound',%s,now())""",
                                 (client_id, f"WA od {client_name or '+'+sender}", text[:500], f"Phone: +{sender}"))
                         log_activity(conn,"communication",0,"whatsapp_in",f"WhatsApp od +{sender}: {text[:100]}")
                         conn.commit()
@@ -6461,7 +6519,7 @@ async def wa_send(request: Request, data: dict):
         translated = result.get("translated_text", message)
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
+                VALUES (WA_TENANT_ID,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
                 (client_id, translated[:500], f"To: {to} | Original: {message[:200]}"))
         log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to}: {translated[:100]}")
         conn.commit()
