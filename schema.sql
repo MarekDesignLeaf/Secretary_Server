@@ -285,4 +285,15 @@ CREATE INDEX idx_clients_display_name ON clients(display_name);
 CREATE INDEX idx_jobs_status ON jobs(job_status);
 CREATE INDEX idx_audit_log_changed_at ON audit_log(changed_at);
 
+-- Performance indexes added for common query patterns
+CREATE INDEX IF NOT EXISTS idx_clients_tenant_deleted ON clients(tenant_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_clients_tenant_name ON clients(tenant_id, display_name);
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status ON jobs(tenant_id, job_status, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_tenant_completed ON tasks(tenant_id, is_completed, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_leads_tenant_status ON leads(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_invoices_tenant_status ON invoices(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_reports_tenant ON work_reports(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_tenant ON audit_log(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_communications_client ON communications(client_id, created_at DESC);
+
 COMMIT;
