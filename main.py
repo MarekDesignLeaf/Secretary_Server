@@ -3400,10 +3400,12 @@ async def update_task(task_id: str, data: dict, request: Request):
         if "checklist" in data: sets.append("checklist=%s"); vals.append(json.dumps(data["checklist"]))
         sets.append("updated_at=now()"); vals.append(task_id)
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=%s",vals)
+            cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=%s AND tenant_id=%s", vals + [tenant_id])
+            if cur.rowcount == 0: raise HTTPException(404, "Task not found")  # S21
             log_activity(conn,"task",task_id,"update",f"Ukol upraven: {list(data.keys())}")
             conn.commit()
         return {"status":"updated"}
+    except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
@@ -4407,8 +4409,13 @@ async def update_quote(quote_id: int, data: dict):
             fields,vals = [],[]
             for k in ["quote_title","status","grand_total"]:
                 if k in data: fields.append(f"{k}=%s"); vals.append(data[k])
-            if fields: vals.append(quote_id); cur.execute(f"UPDATE quotes SET {','.join(fields)},updated_at=now() WHERE id=%s",vals); conn.commit()
+            if fields:
+                vals.append(quote_id)
+                cur.execute(f"UPDATE quotes SET {','.join(fields)},updated_at=now() WHERE id=%s",vals)
+                if cur.rowcount == 0: raise HTTPException(404, "Quote not found")  # S21
+                conn.commit()
         return {"id":quote_id,"status":"updated"}
+    except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
@@ -5017,8 +5024,10 @@ async def mark_notification_read(notification_id: int):
     try:
         with conn.cursor() as cur:
             cur.execute("UPDATE notifications SET is_read=true,read_at=now() WHERE id=%s",(notification_id,))
+            if cur.rowcount == 0: raise HTTPException(404, "Notification not found")  # S21
             conn.commit()
         return {"status":"read"}
+    except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
