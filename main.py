@@ -559,12 +559,64 @@ def get_nature_service_status() -> dict:
         "mushroom_api_url": MUSHROOM_ID_API_URL,
     }
 
+def normalize_language_code(language: Optional[str], default: str = "en") -> str:
+    raw = (language or "").strip().lower()
+    if not raw:
+        return default
+    aliases = {
+        "en": "en",
+        "en-gb": "en",
+        "en-us": "en",
+        "english": "en",
+        "anglictina": "en",
+        "angličtina": "en",
+        "cs": "cs",
+        "cs-cz": "cs",
+        "czech": "cs",
+        "cestina": "cs",
+        "čeština": "cs",
+        "pl": "pl",
+        "pl-pl": "pl",
+        "polish": "pl",
+        "polski": "pl",
+        "de": "de",
+        "de-de": "de",
+        "german": "de",
+        "deutsch": "de",
+        "fr": "fr",
+        "fr-fr": "fr",
+        "french": "fr",
+        "francais": "fr",
+        "français": "fr",
+        "es": "es",
+        "es-es": "es",
+        "spanish": "es",
+        "espanol": "es",
+        "español": "es",
+        "sk": "sk",
+        "sk-sk": "sk",
+        "slovak": "sk",
+        "slovencina": "sk",
+        "slovenčina": "sk",
+        "ro": "ro",
+        "ro-ro": "ro",
+        "romanian": "ro",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    raw_prefix = raw.split("-")[0]
+    if raw_prefix in aliases:
+        return aliases[raw_prefix]
+    if raw_prefix in {"en", "cs", "pl", "de", "fr", "es", "sk", "ro"}:
+        return raw_prefix
+    return default
+
 def tr_lang(lang: str, en: str, cs: str, pl: str) -> str:
-    code = (lang or "en").split("-")[0].lower()
+    code = normalize_language_code(lang, default="en")
     return cs if code == "cs" else pl if code == "pl" else en
 
 def plant_guidance_labels(language: str) -> dict:
-    code = (language or "en").split("-")[0].lower()
+    code = normalize_language_code(language, default="en")
     if code == "cs":
         return {
             "language_name": "Czech",
@@ -599,7 +651,7 @@ def plant_guidance_labels(language: str) -> dict:
     }
 
 def plant_health_labels(language: str) -> dict:
-    code = (language or "en").split("-")[0].lower()
+    code = normalize_language_code(language, default="en")
     if code == "cs":
         return {
             "finding": "Nález",
@@ -628,7 +680,7 @@ def plant_health_labels(language: str) -> dict:
     }
 
 def mushroom_guidance_labels(language: str) -> dict:
-    code = (language or "en").split("-")[0].lower()
+    code = normalize_language_code(language, default="en")
     if code == "cs":
         return {
             "subject_fallback": "houba",
@@ -844,7 +896,7 @@ async def plantnet_identify(files: List[UploadFile], organs: List[str], language
             ),
         ))
         await upload.seek(0)
-    lang_code = (language or "en").split("-")[0].lower()
+    lang_code = normalize_language_code(language, default="en")
     params = {"api-key": PLANTNET_API_KEY, "lang": lang_code, "include-related-images": "false", "nb-results": "5"}
     multipart_parts = list(payload_files)
     for organ in organs:
@@ -905,7 +957,7 @@ async def plant_health_assessment(files: List[UploadFile], language: str) -> dic
             ))
         encoded_images.append(base64.b64encode(content).decode("ascii"))
         await upload.seek(0)
-    lang_code = (language or "en").split("-")[0].lower()
+    lang_code = normalize_language_code(language, default="en")
     params = {
         "details": "description,treatment,common_names",
         "language": lang_code,
@@ -972,7 +1024,7 @@ async def mushroom_identify(files: List[UploadFile], language: str) -> dict:
         await upload.seek(0)
     params = {
         "details": "common_names,url,description,edibility,psychoactive,look_alikes,taxonomy,characteristics",
-        "language": (language or "en").split("-")[0].lower(),
+        "language": normalize_language_code(language, default="en"),
     }
     payload = {
         "images": encoded_images,
