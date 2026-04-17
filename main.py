@@ -730,6 +730,85 @@ def flatten_mushroom_bool(value) -> Optional[bool]:
                 return parsed
     return None
 
+def flatten_plant_list(value) -> List[str]:
+    items: List[str] = []
+
+    def append(candidate) -> None:
+        if candidate is None:
+            return
+        if isinstance(candidate, str):
+            text = candidate.strip()
+            if text:
+                items.append(text)
+            return
+        if isinstance(candidate, (int, float)):
+            items.append(str(candidate))
+            return
+        if isinstance(candidate, dict):
+            primary = (
+                candidate.get("scientificNameWithoutAuthor")
+                or candidate.get("scientificName")
+                or candidate.get("commonName")
+                or candidate.get("common_name")
+                or candidate.get("name")
+                or candidate.get("label")
+                or candidate.get("title")
+                or candidate.get("value")
+                or candidate.get("text")
+            )
+            if isinstance(primary, (str, int, float)):
+                append(primary)
+                return
+            for nested in candidate.values():
+                append(nested)
+            return
+        if isinstance(candidate, list):
+            for nested in candidate:
+                append(nested)
+
+    append(value)
+    return list(dict.fromkeys(items))
+
+def flatten_plant_text(value) -> str:
+    items = flatten_plant_list(value)
+    return items[0] if items else ""
+
+def normalize_plant_score(value) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except Exception:
+            return 0.0
+    if isinstance(value, dict):
+        for key in ("score", "probability", "value"):
+            parsed = normalize_plant_score(value.get(key))
+            if parsed > 0:
+                return parsed
+        for nested in value.values():
+            parsed = normalize_plant_score(nested)
+            if parsed > 0:
+                return parsed
+    if isinstance(value, list):
+        for nested in value:
+            parsed = normalize_plant_score(nested)
+            if parsed > 0:
+                return parsed
+    return 0.0
+
+def extract_plant_taxon_name(value) -> str:
+    if isinstance(value, dict):
+        return flatten_plant_text(
+            value.get("scientificNameWithoutAuthor")
+            or value.get("scientificName")
+            or value.get("name")
+            or value.get("label")
+            or value.get("value")
+            or value
+        )
+    return flatten_plant_text(value)
+
 def flatten_treatment_items(treatment: dict) -> dict:
     treatment = treatment or {}
     return {
@@ -1125,10 +1204,12 @@ def map_plantnet_result(raw: dict, language: str, requested_organs: List[str]) -
         ))
     def suggestion(item: dict) -> dict:
         species = item.get("species") or {}
-        common_names = species.get("commonNames") or []
-        scientific_name = species.get("scientificNameWithoutAuthor") or species.get("scientificName") or ""
-        family = (species.get("family") or {}).get("scientificNameWithoutAuthor")
-        genus = (species.get("genus") or {}).get("scientificNameWithoutAuthor")
+        common_names = flatten_plant_list(species.get("commonNames"))
+        scientific_name = flatten_plant_text(
+            species.get("scientificNameWithoutAuthor") or species.get("scientificName")
+        )
+        family = extract_plant_taxon_name(species.get("family"))
+        genus = extract_plant_taxon_name(species.get("genus"))
         display_name = common_names[0] if common_names else scientific_name
         return {
             "display_name": display_name,
@@ -1136,7 +1217,7 @@ def map_plantnet_result(raw: dict, language: str, requested_organs: List[str]) -
             "common_names": common_names,
             "family": family,
             "genus": genus,
-            "score": float(item.get("score") or 0.0),
+            "score": normalize_plant_score(item.get("score")),
         }
     top = suggestion(results[0])
     guidance, spoken = build_plant_guidance(language, top["display_name"], top["scientific_name"], top["family"] or "", top["genus"] or "")
@@ -5966,37 +6047,54 @@ async def identify_plant(
     for index in range(len(images)):
         organ = (raw_organs[index] if index < len(raw_organs) else "auto") or "auto"
         organs.append(str(organ).strip().lower() or "auto")
-    plantnet_raw = await plantnet_identify(images, organs, language or "en")
-    result = map_plantnet_result(plantnet_raw, language or "en", organs)
-    history_photos = await build_history_photos(images, organs)
-    conn = get_db_conn()
     try:
-        store_nature_history(
-            conn,
-            tenant_id,
-            user.get("user_id"),
-            "plant_identification",
-            language or "en",
-            result,
-            history_photos,
-            captured_at=captured_at,
-            latitude=latitude,
-            longitude=longitude,
-            accuracy_meters=accuracy_meters,
-            location_source=location_source,
-        )
-        log_activity(
-            conn,
-            "plant_identification",
-            uuid.uuid4().hex[:12],
-            "identify",
-            f"Plant identified as {result['scientific_name'] or result['display_name']}",
-            tenant_id=tenant_id,
-            user_id=user.get("user_id"),
-        )
-        conn.commit()
-    finally:
-        release_conn(conn)
+        plantnet_raw = await plantnet_identify(images, organs, language or "en")
+        result = map_plantnet_result(plantnet_raw, language or "en", organs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Plant recognition response could not be processed: {exc}",
+            f"Odpověď rozpoznávání rostliny nešla zpracovat: {exc}",
+            f"Odpowiedź rozpoznawania rośliny nie mogła zostać przetworzona: {exc}"
+        ))
+
+    try:
+        history_photos = await build_history_photos(images, organs)
+        conn = get_db_conn()
+        try:
+            store_nature_history(
+                conn,
+                tenant_id,
+                user.get("user_id"),
+                "plant_identification",
+                language or "en",
+                result,
+                history_photos,
+                captured_at=captured_at,
+                latitude=latitude,
+                longitude=longitude,
+                accuracy_meters=accuracy_meters,
+                location_source=location_source,
+            )
+            log_activity(
+                conn,
+                "plant_identification",
+                uuid.uuid4().hex[:12],
+                "identify",
+                f"Plant identified as {result['scientific_name'] or result['display_name']}",
+                tenant_id=tenant_id,
+                user_id=user.get("user_id"),
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            print(f"Plant recognition history/logging failed: {exc}")
+        finally:
+            release_conn(conn)
+    except Exception as exc:
+        print(f"Plant recognition post-processing failed: {exc}")
     return result
 
 @app.post("/plants/health-assessment")
