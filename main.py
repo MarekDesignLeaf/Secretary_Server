@@ -1759,6 +1759,654 @@ def resolve_assigned_user(conn, tenant_id: int, assigned_user_id: Any = None, as
         return None, assignee_text
     return None, None
 
+def get_active_user_row(conn, tenant_id: int, user_id: Optional[int]) -> Optional[dict]:
+    if not user_id:
+        return None
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT u.id, u.display_name, u.email, COALESCE(r.role_name, 'viewer') AS role_name
+            FROM users u
+            LEFT JOIN roles r ON r.id = u.role_id
+            WHERE u.id=%s
+              AND u.tenant_id=%s
+              AND u.deleted_at IS NULL
+              AND COALESCE(u.status, 'active')='active'
+        """, (user_id, tenant_id))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+def validate_active_user(conn, tenant_id: int, user_id: Optional[int], label: str = "assigned user") -> dict:
+    row = get_active_user_row(conn, tenant_id, user_id)
+    if not row:
+        raise HTTPException(422, f"{label.capitalize()} must be an active user")
+    return row
+
+def validate_task_planning(task_payload: dict) -> tuple[Optional[datetime], Optional[datetime], Optional[str]]:
+    planning_start, planning_end = planning_window_from_values(
+        task_payload.get("planned_start_at"),
+        task_payload.get("planned_end_at"),
+        task_payload.get("planned_date") or task_payload.get("deadline"),
+    )
+    deadline = (task_payload.get("deadline") or "").strip() or None
+    if not planning_start and not deadline:
+        raise HTTPException(422, "Task must have planned_start_at or deadline")
+    return planning_start, planning_end, deadline
+
+def is_task_open_for_workflow(task_row: Optional[dict]) -> bool:
+    if not task_row:
+        return False
+    if bool(task_row.get("is_completed")):
+        return False
+    return (task_row.get("status") or "novy") not in ("hotovo", "zruseno")
+
+def next_business_day_at_nine(base_dt: Optional[datetime] = None) -> datetime:
+    candidate = (base_dt or datetime.utcnow()).replace(hour=9, minute=0, second=0, microsecond=0)
+    if candidate <= (base_dt or datetime.utcnow()):
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+def merge_planning_note(existing_note: Optional[str], extra_note: str) -> str:
+    existing = (existing_note or "").strip()
+    extra = (extra_note or "").strip()
+    if not existing:
+        return extra
+    if extra in existing:
+        return existing
+    return f"{existing}\n\n{extra}"
+
+def get_default_hierarchy_user(conn, tenant_id: int) -> Optional[dict]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT u.id, u.display_name, u.email, COALESCE(r.role_name, 'viewer') AS role_name
+            FROM users u
+            LEFT JOIN roles r ON r.id = u.role_id
+            WHERE u.tenant_id=%s
+              AND u.deleted_at IS NULL
+              AND COALESCE(u.status, 'active')='active'
+            ORDER BY CASE
+                WHEN COALESCE(r.role_name, '')='manager' THEN 0
+                WHEN COALESCE(r.role_name, '')='admin' THEN 1
+                ELSE 2
+            END, u.id
+            LIMIT 1
+        """, (tenant_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+def get_valid_client_next_action_task(conn, tenant_id: int, client_id: int, task_id: Optional[str] = None) -> Optional[dict]:
+    params: List[Any] = [tenant_id, client_id]
+    sql = """
+        SELECT t.id, t.title, t.client_id, t.job_id, t.assigned_user_id, t.assigned_to,
+               t.status, COALESCE(t.is_completed, FALSE) AS is_completed,
+               t.planned_start_at::text AS planned_start_at, t.deadline,
+               u.display_name AS assignee_display_name
+        FROM tasks t
+        JOIN users u
+          ON u.id = t.assigned_user_id
+         AND u.tenant_id = t.tenant_id
+         AND u.deleted_at IS NULL
+         AND COALESCE(u.status, 'active')='active'
+        WHERE t.tenant_id=%s
+          AND t.client_id=%s
+          AND t.job_id IS NULL
+          AND COALESCE(t.is_completed, FALSE)=FALSE
+          AND COALESCE(t.status, 'novy') NOT IN ('hotovo', 'zruseno')
+          AND (t.planned_start_at IS NOT NULL OR NULLIF(COALESCE(t.deadline, ''), '') IS NOT NULL)
+    """
+    if task_id:
+        sql += " AND t.id=%s"
+        params.append(task_id)
+    sql += " ORDER BY COALESCE(t.planned_start_at, t.created_at) ASC LIMIT 1"
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+def get_valid_job_next_action_task(conn, tenant_id: int, job_id: int, task_id: Optional[str] = None) -> Optional[dict]:
+    params: List[Any] = [tenant_id, job_id]
+    sql = """
+        SELECT t.id, t.title, t.client_id, t.job_id, t.assigned_user_id, t.assigned_to,
+               t.status, COALESCE(t.is_completed, FALSE) AS is_completed,
+               t.planned_start_at::text AS planned_start_at, t.deadline,
+               u.display_name AS assignee_display_name
+        FROM tasks t
+        JOIN users u
+          ON u.id = t.assigned_user_id
+         AND u.tenant_id = t.tenant_id
+         AND u.deleted_at IS NULL
+         AND COALESCE(u.status, 'active')='active'
+        WHERE t.tenant_id=%s
+          AND t.job_id=%s
+          AND COALESCE(t.is_completed, FALSE)=FALSE
+          AND COALESCE(t.status, 'novy') NOT IN ('hotovo', 'zruseno')
+          AND (t.planned_start_at IS NOT NULL OR NULLIF(COALESCE(t.deadline, ''), '') IS NOT NULL)
+    """
+    if task_id:
+        sql += " AND t.id=%s"
+        params.append(task_id)
+    sql += " ORDER BY COALESCE(t.planned_start_at, t.created_at) ASC LIMIT 1"
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+def validate_client_hierarchy(conn, tenant_id: int, client_id: int) -> dict:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, display_name, owner_user_id, next_action_task_id, hierarchy_status
+            FROM clients
+            WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
+        """, (tenant_id, client_id))
+        client_row = cur.fetchone()
+    if not client_row:
+        return {"valid": False, "issues": ["client_not_found"], "client": None, "next_action_task": None}
+    client = dict(client_row)
+    issues: List[str] = []
+    owner_row = get_active_user_row(conn, tenant_id, client.get("owner_user_id"))
+    if not owner_row:
+        issues.append("missing_or_inactive_owner")
+    next_action = None
+    if client.get("next_action_task_id"):
+        next_action = get_valid_client_next_action_task(conn, tenant_id, client_id, str(client["next_action_task_id"]))
+    if not next_action:
+        issues.append("missing_or_invalid_next_action")
+    return {
+        "valid": len(issues) == 0,
+        "issues": issues,
+        "client": client,
+        "owner": owner_row,
+        "next_action_task": next_action,
+    }
+
+def validate_job_hierarchy(conn, tenant_id: int, job_id: int) -> dict:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, job_title, client_id, assigned_user_id, assigned_to, next_action_task_id, hierarchy_status
+            FROM jobs
+            WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
+        """, (tenant_id, job_id))
+        job_row = cur.fetchone()
+    if not job_row:
+        return {"valid": False, "issues": ["job_not_found"], "job": None, "next_action_task": None}
+    job = dict(job_row)
+    issues: List[str] = []
+    owner_row = get_active_user_row(conn, tenant_id, job.get("assigned_user_id"))
+    if not owner_row:
+        issues.append("missing_or_inactive_owner")
+    next_action = None
+    if job.get("next_action_task_id"):
+        next_action = get_valid_job_next_action_task(conn, tenant_id, job_id, str(job["next_action_task_id"]))
+    if not next_action:
+        issues.append("missing_or_invalid_next_action")
+    return {
+        "valid": len(issues) == 0,
+        "issues": issues,
+        "job": job,
+        "owner": owner_row,
+        "next_action_task": next_action,
+    }
+
+def create_hierarchy_placeholder_task(
+    conn,
+    tenant_id: int,
+    *,
+    assigned_user_id: int,
+    assigned_to: str,
+    client_id: Optional[int] = None,
+    client_name: Optional[str] = None,
+    job_id: Optional[int] = None,
+    property_id: Optional[int] = None,
+    property_address: Optional[str] = None,
+    created_by: str = "system_migration",
+) -> dict:
+    task_id = str(uuid.uuid4())
+    planned_start = next_business_day_at_nine()
+    planned_end = planned_start + timedelta(hours=1)
+    placeholder_note = "Systémově vytvořený task při migraci hierarchie. Nutná ruční kontrola."
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO tasks (
+                id, title, description, task_type, status, priority, deadline, planned_date,
+                planned_start_at, planned_end_at, created_by, assigned_to, assigned_user_id,
+                planning_note, reminder_for_assignee_only, delegated_by,
+                client_id, client_name, job_id, property_id, property_address,
+                source, calendar_sync_enabled, tenant_id
+            ) VALUES (
+                %s, %s, %s, 'interni_poznamka', 'novy', 'vysoka', %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, TRUE, %s,
+                %s, %s, %s, %s, %s,
+                'system_migration', TRUE, %s
+            )
+            RETURNING id, title, assigned_user_id, assigned_to, client_id, job_id,
+                      planned_start_at::text AS planned_start_at, deadline
+        """, (
+            task_id,
+            "Doplnit další krok",
+            "Systémově vytvořený task při migraci hierarchie. Nutná ruční kontrola.",
+            planned_start.strftime("%Y-%m-%d %H:%M:%S"),
+            planned_start.strftime("%Y-%m-%d"),
+            planned_start,
+            planned_end,
+            created_by,
+            assigned_to,
+            assigned_user_id,
+            placeholder_note,
+            created_by,
+            client_id,
+            client_name,
+            job_id,
+            property_id,
+            property_address,
+            tenant_id,
+        ))
+        row = cur.fetchone()
+    return dict(row)
+
+def build_blocked_user_deactivations(conn, tenant_id: int) -> List[dict]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT u.id, u.display_name, u.email,
+                EXISTS(SELECT 1 FROM clients c WHERE c.tenant_id=u.tenant_id AND c.deleted_at IS NULL AND c.owner_user_id=u.id) AS owns_clients,
+                EXISTS(SELECT 1 FROM jobs j WHERE j.tenant_id=u.tenant_id AND j.deleted_at IS NULL AND j.assigned_user_id=u.id) AS owns_jobs,
+                EXISTS(
+                    SELECT 1 FROM tasks t
+                    WHERE t.tenant_id=u.tenant_id
+                      AND t.assigned_user_id=u.id
+                      AND COALESCE(t.is_completed, FALSE)=FALSE
+                      AND COALESCE(t.status, 'novy') NOT IN ('hotovo', 'zruseno')
+                ) AS has_open_tasks,
+                EXISTS(
+                    SELECT 1
+                    FROM clients c
+                    JOIN tasks t ON t.id = c.next_action_task_id
+                    WHERE c.tenant_id=u.tenant_id
+                      AND c.deleted_at IS NULL
+                      AND t.assigned_user_id=u.id
+                ) OR EXISTS(
+                    SELECT 1
+                    FROM jobs j
+                    JOIN tasks t ON t.id = j.next_action_task_id
+                    WHERE j.tenant_id=u.tenant_id
+                      AND j.deleted_at IS NULL
+                      AND t.assigned_user_id=u.id
+                ) AS owns_next_actions
+            FROM users u
+            WHERE u.tenant_id=%s
+              AND u.deleted_at IS NULL
+              AND COALESCE(u.status, 'active')='active'
+            ORDER BY u.display_name, u.id
+        """, (tenant_id,))
+        rows = cur.fetchall()
+    blocked = []
+    for row in rows:
+        item = dict(row)
+        reasons = []
+        if item.get("owns_clients"):
+            reasons.append("client_owner")
+        if item.get("owns_jobs"):
+            reasons.append("job_owner")
+        if item.get("has_open_tasks"):
+            reasons.append("open_task_assignee")
+        if item.get("owns_next_actions"):
+            reasons.append("next_action_assignee")
+        if reasons:
+            item["reasons"] = reasons
+            blocked.append(item)
+    return blocked
+
+def get_hierarchy_integrity_report(conn, tenant_id: int) -> dict:
+    orphan_clients: List[dict] = []
+    orphan_jobs: List[dict] = []
+    orphan_tasks: List[dict] = []
+    next_action_mismatches: List[dict] = []
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, display_name, owner_user_id, next_action_task_id, hierarchy_status
+            FROM clients
+            WHERE tenant_id=%s AND deleted_at IS NULL
+            ORDER BY display_name, id
+        """, (tenant_id,))
+        client_rows = [dict(row) for row in cur.fetchall()]
+        cur.execute("""
+            SELECT id, job_title, client_id, assigned_user_id, assigned_to, next_action_task_id, hierarchy_status
+            FROM jobs
+            WHERE tenant_id=%s AND deleted_at IS NULL
+            ORDER BY created_at DESC, id DESC
+        """, (tenant_id,))
+        job_rows = [dict(row) for row in cur.fetchall()]
+        cur.execute("""
+            SELECT t.id, t.title, t.client_id, t.job_id, t.assigned_user_id, t.assigned_to, t.status,
+                   COALESCE(t.is_completed, FALSE) AS is_completed,
+                   t.planned_start_at::text AS planned_start_at, t.deadline,
+                   u.id AS active_user_id
+            FROM tasks t
+            LEFT JOIN users u
+              ON u.id = t.assigned_user_id
+             AND u.tenant_id = t.tenant_id
+             AND u.deleted_at IS NULL
+             AND COALESCE(u.status, 'active')='active'
+            WHERE t.tenant_id=%s
+            ORDER BY t.created_at DESC
+        """, (tenant_id,))
+        task_rows = [dict(row) for row in cur.fetchall()]
+
+    for client in client_rows:
+        validation = validate_client_hierarchy(conn, tenant_id, client["id"])
+        if not validation["valid"]:
+            item = {
+                "id": client["id"],
+                "display_name": client["display_name"],
+                "owner_user_id": client.get("owner_user_id"),
+                "next_action_task_id": client.get("next_action_task_id"),
+                "issues": validation["issues"],
+            }
+            orphan_clients.append(item)
+            if any("next_action" in issue for issue in validation["issues"]):
+                next_action_mismatches.append({"entity_type": "client", **item})
+
+    for job in job_rows:
+        validation = validate_job_hierarchy(conn, tenant_id, job["id"])
+        if not validation["valid"]:
+            item = {
+                "id": job["id"],
+                "job_title": job["job_title"],
+                "client_id": job.get("client_id"),
+                "assigned_user_id": job.get("assigned_user_id"),
+                "next_action_task_id": job.get("next_action_task_id"),
+                "issues": validation["issues"],
+            }
+            orphan_jobs.append(item)
+            if any("next_action" in issue for issue in validation["issues"]):
+                next_action_mismatches.append({"entity_type": "job", **item})
+
+    for task in task_rows:
+        issues: List[str] = []
+        if not task.get("assigned_user_id") or not task.get("active_user_id"):
+            issues.append("missing_or_inactive_assignee")
+        if not task.get("planned_start_at") and not ((task.get("deadline") or "").strip()):
+            issues.append("missing_planning")
+        if issues:
+            orphan_tasks.append({
+                "id": task["id"],
+                "title": task["title"],
+                "client_id": task.get("client_id"),
+                "job_id": task.get("job_id"),
+                "assigned_user_id": task.get("assigned_user_id"),
+                "status": task.get("status"),
+                "issues": issues,
+            })
+
+    blocked_user_deactivations = build_blocked_user_deactivations(conn, tenant_id)
+    return {
+        "tenant_id": tenant_id,
+        "orphan_clients": orphan_clients,
+        "orphan_jobs": orphan_jobs,
+        "orphan_tasks": orphan_tasks,
+        "blocked_user_deactivations": blocked_user_deactivations,
+        "next_action_mismatches": next_action_mismatches,
+        "summary": {
+            "orphan_clients": len(orphan_clients),
+            "orphan_jobs": len(orphan_jobs),
+            "orphan_tasks": len(orphan_tasks),
+            "blocked_user_deactivations": len(blocked_user_deactivations),
+            "next_action_mismatches": len(next_action_mismatches),
+        },
+    }
+
+def run_hierarchy_backfill(conn, tenant_id: int, actor_user_id: Optional[int] = None, dry_run: bool = True) -> dict:
+    default_user = get_default_hierarchy_user(conn, tenant_id)
+    if not default_user:
+        raise HTTPException(422, "No active user is available for hierarchy backfill")
+
+    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system_migration"
+    updates = {"clients": [], "jobs": [], "tasks": []}
+    client_owner_cache: Dict[int, dict] = {}
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, display_name, owner_user_id, next_action_task_id
+            FROM clients
+            WHERE tenant_id=%s AND deleted_at IS NULL
+            ORDER BY id
+        """, (tenant_id,))
+        clients = [dict(row) for row in cur.fetchall()]
+
+    for client in clients:
+        active_owner = get_active_user_row(conn, tenant_id, client.get("owner_user_id"))
+        next_action = get_valid_client_next_action_task(conn, tenant_id, client["id"], client.get("next_action_task_id"))
+        fallback_task = next_action or get_valid_client_next_action_task(conn, tenant_id, client["id"])
+        target_owner = active_owner
+        if not target_owner and fallback_task:
+            target_owner = get_active_user_row(conn, tenant_id, fallback_task.get("assigned_user_id"))
+        if not target_owner:
+            target_owner = default_user
+        target_task = fallback_task
+        if not target_task and not dry_run:
+            target_task = create_hierarchy_placeholder_task(
+                conn,
+                tenant_id,
+                assigned_user_id=int(target_owner["id"]),
+                assigned_to=target_owner["display_name"],
+                client_id=client["id"],
+                client_name=client["display_name"],
+                created_by=actor_name,
+            )
+        changes = {
+            "owner_user_id": int(target_owner["id"]),
+            "next_action_task_id": target_task["id"] if target_task else "placeholder_required",
+            "placeholder_created": bool(target_task and target_task.get("id") not in (client.get("next_action_task_id"), None) and not fallback_task),
+        }
+        client_owner_cache[client["id"]] = target_owner
+        needs_update = (
+            client.get("owner_user_id") != changes["owner_user_id"] or
+            str(client.get("next_action_task_id") or "") != str(changes["next_action_task_id"] or "")
+        )
+        if needs_update and not dry_run and target_task:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE clients
+                    SET owner_user_id=%s, next_action_task_id=%s, hierarchy_status='valid', updated_at=now()
+                    WHERE tenant_id=%s AND id=%s
+                """, (changes["owner_user_id"], changes["next_action_task_id"], tenant_id, client["id"]))
+            log_activity(
+                conn, "client", client["id"], "hierarchy_backfill",
+                f"Client hierarchy backfilled for {client['display_name']}",
+                tenant_id=tenant_id, user_id=actor_user_id, source_channel="hierarchy_migration",
+                details={"before": client, "after": changes},
+            )
+        if needs_update or changes["next_action_task_id"] == "placeholder_required":
+            updates["clients"].append({
+                "id": client["id"],
+                "display_name": client["display_name"],
+                "changes": changes,
+            })
+
+    job_owner_cache: Dict[int, dict] = {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT j.id, j.job_title, j.client_id, j.property_id, j.assigned_user_id, j.next_action_task_id,
+                   c.display_name AS client_name, p.property_name, p.address_line1
+            FROM jobs j
+            LEFT JOIN clients c ON c.id = j.client_id
+            LEFT JOIN properties p ON p.id = j.property_id
+            WHERE j.tenant_id=%s AND j.deleted_at IS NULL
+            ORDER BY j.id
+        """, (tenant_id,))
+        jobs = [dict(row) for row in cur.fetchall()]
+
+    for job in jobs:
+        active_owner = get_active_user_row(conn, tenant_id, job.get("assigned_user_id"))
+        next_action = get_valid_job_next_action_task(conn, tenant_id, job["id"], job.get("next_action_task_id"))
+        fallback_task = next_action or get_valid_job_next_action_task(conn, tenant_id, job["id"])
+        target_owner = active_owner
+        if not target_owner and fallback_task:
+            target_owner = get_active_user_row(conn, tenant_id, fallback_task.get("assigned_user_id"))
+        if not target_owner and job.get("client_id"):
+            target_owner = client_owner_cache.get(int(job["client_id"]))
+        if not target_owner:
+            target_owner = default_user
+        job_owner_cache[job["id"]] = target_owner
+        target_task = fallback_task
+        if not target_task and not dry_run:
+            target_task = create_hierarchy_placeholder_task(
+                conn,
+                tenant_id,
+                assigned_user_id=int(target_owner["id"]),
+                assigned_to=target_owner["display_name"],
+                client_id=job.get("client_id"),
+                client_name=job.get("client_name"),
+                job_id=job["id"],
+                property_id=job.get("property_id"),
+                property_address=job.get("address_line1") or job.get("property_name"),
+                created_by=actor_name,
+            )
+        changes = {
+            "assigned_user_id": int(target_owner["id"]),
+            "assigned_to": target_owner["display_name"],
+            "next_action_task_id": target_task["id"] if target_task else "placeholder_required",
+            "placeholder_created": bool(target_task and target_task.get("id") not in (job.get("next_action_task_id"), None) and not fallback_task),
+        }
+        needs_update = (
+            job.get("assigned_user_id") != changes["assigned_user_id"] or
+            (job.get("next_action_task_id") or "") != (changes["next_action_task_id"] or "")
+        )
+        if needs_update and not dry_run and target_task:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE jobs
+                    SET assigned_user_id=%s,
+                        assigned_to=%s,
+                        next_action_task_id=%s,
+                        hierarchy_status='valid',
+                        updated_at=now()
+                    WHERE tenant_id=%s AND id=%s
+                """, (changes["assigned_user_id"], changes["assigned_to"], changes["next_action_task_id"], tenant_id, job["id"]))
+            log_activity(
+                conn, "job", job["id"], "hierarchy_backfill",
+                f"Job hierarchy backfilled for {job['job_title']}",
+                tenant_id=tenant_id, user_id=actor_user_id, source_channel="hierarchy_migration",
+                details={"before": job, "after": changes},
+            )
+        if needs_update or changes["next_action_task_id"] == "placeholder_required":
+            updates["jobs"].append({
+                "id": job["id"],
+                "job_title": job["job_title"],
+                "changes": changes,
+            })
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT t.id, t.title, t.client_id, t.job_id, t.assigned_user_id, t.assigned_to, t.planning_note,
+                   t.planned_start_at::text AS planned_start_at, t.planned_end_at::text AS planned_end_at, t.deadline,
+                   u.id AS active_user_id
+            FROM tasks t
+            LEFT JOIN users u
+              ON u.id = t.assigned_user_id
+             AND u.tenant_id = t.tenant_id
+             AND u.deleted_at IS NULL
+             AND COALESCE(u.status, 'active')='active'
+            WHERE t.tenant_id=%s
+            ORDER BY t.created_at DESC
+        """, (tenant_id,))
+        tasks = [dict(row) for row in cur.fetchall()]
+
+    for task in tasks:
+        needs_assignee = not task.get("assigned_user_id") or not task.get("active_user_id")
+        has_planning = bool(task.get("planned_start_at")) or bool((task.get("deadline") or "").strip())
+        if not needs_assignee and has_planning:
+            continue
+        target_owner = None
+        if task.get("job_id"):
+            target_owner = job_owner_cache.get(int(task["job_id"]))
+        if not target_owner and task.get("client_id"):
+            target_owner = client_owner_cache.get(int(task["client_id"]))
+        if not target_owner:
+            target_owner = default_user
+        planning_start = parse_planning_datetime(task.get("planned_start_at"))
+        planning_end = parse_planning_datetime(task.get("planned_end_at"))
+        deadline = (task.get("deadline") or "").strip() or None
+        planning_note = task.get("planning_note")
+        if not planning_start and not deadline:
+            planning_start = next_business_day_at_nine()
+            planning_end = planning_start + timedelta(hours=1)
+            deadline = planning_start.strftime("%Y-%m-%d %H:%M:%S")
+            planning_note = merge_planning_note(planning_note, "Systémově doplněný termín během migrace hierarchie. Nutná ruční kontrola.")
+        changes = {
+            "assigned_user_id": int(target_owner["id"]),
+            "assigned_to": target_owner["display_name"],
+            "planned_start_at": format_planning_datetime(planning_start),
+            "planned_end_at": format_planning_datetime(planning_end),
+            "deadline": deadline,
+        }
+        if not dry_run:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE tasks
+                    SET assigned_user_id=%s,
+                        assigned_to=%s,
+                        planned_start_at=%s,
+                        planned_end_at=%s,
+                        deadline=%s,
+                        planning_note=%s,
+                        updated_at=now()
+                    WHERE tenant_id=%s AND id=%s
+                """, (
+                    changes["assigned_user_id"],
+                    changes["assigned_to"],
+                    planning_start,
+                    planning_end,
+                    deadline,
+                    planning_note,
+                    tenant_id,
+                    task["id"],
+                ))
+            log_activity(
+                conn, "task", task["id"], "hierarchy_backfill",
+                f"Task hierarchy backfilled for {task['title']}",
+                tenant_id=tenant_id, user_id=actor_user_id, source_channel="hierarchy_migration",
+                details={"before": task, "after": changes},
+            )
+        updates["tasks"].append({
+            "id": task["id"],
+            "title": task["title"],
+            "changes": changes,
+        })
+
+    if not dry_run:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE clients
+                SET hierarchy_status = CASE
+                    WHEN owner_user_id IS NOT NULL AND next_action_task_id IS NOT NULL THEN 'valid'
+                    ELSE 'invalid'
+                END
+                WHERE tenant_id=%s AND deleted_at IS NULL
+            """, (tenant_id,))
+            cur.execute("""
+                UPDATE jobs
+                SET hierarchy_status = CASE
+                    WHEN assigned_user_id IS NOT NULL AND next_action_task_id IS NOT NULL THEN 'valid'
+                    ELSE 'invalid'
+                END
+                WHERE tenant_id=%s AND deleted_at IS NULL
+            """, (tenant_id,))
+
+    return {
+        "tenant_id": tenant_id,
+        "dry_run": dry_run,
+        "default_user": {"id": default_user["id"], "display_name": default_user["display_name"]},
+        "updates": updates,
+        "summary": {
+            "clients": len(updates["clients"]),
+            "jobs": len(updates["jobs"]),
+            "tasks": len(updates["tasks"]),
+        },
+    }
+
 def build_calendar_entry(
     entry_type: str,
     source: dict,
@@ -2259,6 +2907,7 @@ def close_db_pool():
 async def app_lifespan(_: FastAPI):
     run_startup_bootstrap()
     ensure_quote_items_table()
+    ensure_hierarchy_workflow_schema()
     print(
         "Startup routes: "
         f"admin_activity_log={any(getattr(route, 'path', None) == '/admin/activity-log' for route in app.routes)} "
@@ -3173,7 +3822,8 @@ async def get_jobs(request: Request, client_id: Optional[int] = None, status: Op
         with conn.cursor() as cur:
             sql = """SELECT j.id,j.job_number,j.job_title,j.job_status,j.client_id,j.property_id,j.quote_id,
                 j.start_date_planned::text,j.planned_start_at::text,j.planned_end_at::text,
-                j.assigned_user_id,j.assigned_to,j.handover_note,j.handed_over_by,j.handed_over_at::text,
+                j.assigned_user_id,j.assigned_to,j.next_action_task_id,j.hierarchy_status,
+                j.handover_note,j.handed_over_by,j.handed_over_at::text,
                 COALESCE(j.calendar_sync_enabled, TRUE) AS calendar_sync_enabled,
                 j.created_at::text,j.updated_at::text,c.display_name as client_name
                 FROM jobs j
@@ -4335,6 +4985,78 @@ def ensure_quote_items_table():
     except: conn.rollback()
     finally: release_conn(conn)
 
+def ensure_hierarchy_workflow_schema():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_user_id BIGINT;
+                ALTER TABLE clients ADD COLUMN IF NOT EXISTS next_action_task_id TEXT;
+                ALTER TABLE clients ADD COLUMN IF NOT EXISTS hierarchy_status TEXT NOT NULL DEFAULT 'valid';
+                ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_action_task_id TEXT;
+                ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hierarchy_status TEXT NOT NULL DEFAULT 'valid';
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_clients_tenant_owner ON clients (tenant_id, owner_user_id) WHERE deleted_at IS NULL")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_clients_tenant_next_action ON clients (tenant_id, next_action_task_id) WHERE deleted_at IS NULL")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_tenant_assigned_user ON jobs (tenant_id, assigned_user_id) WHERE deleted_at IS NULL")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_tenant_next_action ON jobs (tenant_id, next_action_task_id) WHERE deleted_at IS NULL")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant_assigned_user ON tasks (tenant_id, assigned_user_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant_client_open ON tasks (tenant_id, client_id, is_completed)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant_job_open ON tasks (tenant_id, job_id, is_completed)")
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_clients_owner_user'
+                    ) THEN
+                        ALTER TABLE clients
+                        ADD CONSTRAINT fk_clients_owner_user
+                        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+                        ON DELETE RESTRICT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_clients_next_action_task'
+                    ) THEN
+                        ALTER TABLE clients
+                        ADD CONSTRAINT fk_clients_next_action_task
+                        FOREIGN KEY (next_action_task_id) REFERENCES tasks(id)
+                        ON DELETE RESTRICT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_jobs_next_action_task'
+                    ) THEN
+                        ALTER TABLE jobs
+                        ADD CONSTRAINT fk_jobs_next_action_task
+                        FOREIGN KEY (next_action_task_id) REFERENCES tasks(id)
+                        ON DELETE RESTRICT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_jobs_assigned_user'
+                    ) THEN
+                        ALTER TABLE jobs
+                        ADD CONSTRAINT fk_jobs_assigned_user
+                        FOREIGN KEY (assigned_user_id) REFERENCES users(id)
+                        ON DELETE RESTRICT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_tasks_assigned_user'
+                    ) THEN
+                        ALTER TABLE tasks
+                        ADD CONSTRAINT fk_tasks_assigned_user
+                        FOREIGN KEY (assigned_user_id) REFERENCES users(id)
+                        ON DELETE RESTRICT;
+                    END IF;
+                EXCEPTION WHEN OTHERS THEN
+                    NULL;
+                END $$;
+            """)
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
 @app.get("/crm/quotes")
 async def list_quotes(tenant_id: int=1, client_id: Optional[int]=None, status: Optional[str]=None):
     conn = get_db_conn()
@@ -4771,6 +5493,48 @@ async def get_nature_history(
 async def get_nature_services_status(request: Request):
     ensure_request_permissions(request, "crm_read")
     return get_nature_service_status()
+
+@app.get("/admin/hierarchy-integrity")
+async def get_admin_hierarchy_integrity(request: Request):
+    user = ensure_request_permissions(request, "manage_users")
+    conn = get_db_conn()
+    try:
+        return get_hierarchy_integrity_report(conn, user["tenant_id"])
+    finally:
+        release_conn(conn)
+
+@app.post("/admin/hierarchy-integrity/backfill")
+async def backfill_admin_hierarchy_integrity(request: Request, data: Optional[dict] = None):
+    user = ensure_request_permissions(request, "manage_users")
+    payload = data or {}
+    dry_run = not bool(payload.get("apply"))
+    conn = get_db_conn()
+    try:
+        result = run_hierarchy_backfill(conn, user["tenant_id"], actor_user_id=user.get("user_id"), dry_run=dry_run)
+        if not dry_run:
+            log_activity(
+                conn,
+                "hierarchy_integrity",
+                user["tenant_id"],
+                "backfill",
+                "Hierarchy backfill applied",
+                tenant_id=user["tenant_id"],
+                user_id=user.get("user_id"),
+                source_channel="admin",
+                details=result["summary"],
+            )
+            conn.commit()
+        else:
+            conn.rollback()
+        return result
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
 
 @app.get("/admin/activity-log")
 async def get_admin_activity_log(
