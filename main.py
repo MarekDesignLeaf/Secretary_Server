@@ -7465,9 +7465,10 @@ def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_
     return defaults.get(rule_type, 0.0)
 
 # ========== DIALOG STATE MACHINE ==========
-DIALOG_STEPS = ["client","workers","total_hours","entries","validate_hours","waste","materials","notes","summary","confirm"]
+DIALOG_STEPS = ["client","client_create_name","workers","total_hours","entries","validate_hours","waste","materials","notes","summary","confirm"]
 VALID_TRANSITIONS = {
-    "client": ["client","workers"],
+    "client": ["client","client_create_name","workers"],
+    "client_create_name": ["client_create_name","client","workers"],
     "workers": ["workers","total_hours"],
     "total_hours": ["total_hours","entries"],
     "entries": ["entries","validate_hours","waste"],
@@ -7481,7 +7482,8 @@ VALID_TRANSITIONS = {
 def validate_transition(current_step, next_step):
     return next_step in VALID_TRANSITIONS.get(current_step, [])
 DIALOG_PROMPTS = {
-    "client": {"en":"Which client did you work for?","cs":"U kterého klienta jsi pracoval?","pl":"U którego klienta pracowałeś?"},
+    "client": {"en":"Which client did you work for? You can also say 'new client'.","cs":"U kterého klienta jsi pracoval? Můžeš také říct 'nový klient'.","pl":"U którego klienta pracowałeś? Możesz też powiedzieć 'nowy klient'."},
+    "client_create_name": {"en":"What is the new client name?","cs":"Jak se jmenuje nový klient?","pl":"Jak nazywa się nowy klient?"},
     "workers": {"en":"Who worked? (names)","cs":"Kdo pracoval? (jména)","pl":"Kto pracował? (imiona)"},
     "total_hours": {"en":"How many hours total?","cs":"Kolik hodin celkem?","pl":"Ile godzin łącznie?"},
     "entries": {"en":"How many hours pruning?","cs":"Kolik hodin prořez?","pl":"Ile godzin przycinanie?"},
@@ -7494,6 +7496,84 @@ DIALOG_PROMPTS = {
 }
 def get_prompt(step, lang="en"):
     return DIALOG_PROMPTS.get(step,{}).get(lang, DIALOG_PROMPTS.get(step,{}).get("en",""))
+
+def parse_new_client_command(text: str) -> tuple[bool, Optional[str]]:
+    raw = (text or "").strip()
+    low = raw.lower()
+    prefixes = [
+        "new client", "create client", "add client",
+        "novy klient", "nový klient", "vytvor klienta", "vytvoř klienta", "pridat klienta", "přidat klienta",
+        "nowy klient", "utworz klienta", "utwórz klienta", "dodaj klienta",
+    ]
+    for prefix in prefixes:
+        if low == prefix:
+            return True, None
+        if low.startswith(prefix + " "):
+            remainder = raw[len(prefix):].strip(" :-,")
+            for leading in ("named ", "called ", "jmenem ", "s nazvem ", "s názvem ", "o nazwie "):
+                if remainder.lower().startswith(leading):
+                    remainder = remainder[len(leading):].strip()
+                    break
+            return True, remainder or None
+    return False, None
+
+def create_voice_work_report_client(conn, tenant_id: int, actor_user_id: int, client_name: str, lang: str) -> dict:
+    name = (client_name or "").strip()
+    if not name:
+        raise HTTPException(422, "Client name is required")
+    owner = validate_active_user(conn, tenant_id, actor_user_id, "client owner")
+    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or owner["display_name"] or "system"
+    code = f"CL-{uuid.uuid4().hex[:6].upper()}"
+    planning_dt = next_business_day_at_nine()
+    planning_note = tr_lang(
+        lang,
+        "System placeholder task created from voice work report. Review and replace with the real next action.",
+        "Systémový placeholder úkol vytvořený z hlasového výkazu práce. Zkontroluj ho a nahraď skutečným dalším krokem.",
+        "Systemowe zadanie zastępcze utworzone z głosowego raportu pracy. Sprawdź je i zastąp właściwym kolejnym krokiem."
+    )
+    action_title = tr_lang(lang, "Fill in next action", "Doplnit další krok", "Uzupełnić kolejny krok")
+    with conn.cursor() as cur:
+        cur.execute("""INSERT INTO clients
+            (client_code, display_name, status, tenant_id, owner_user_id, hierarchy_status)
+            VALUES (%s,%s,'active',%s,%s,'pending')
+            RETURNING id, display_name""",
+            (code, name, tenant_id, int(owner["id"])))
+        client = cur.fetchone()
+    next_action = create_workflow_task(
+        conn,
+        tenant_id,
+        {
+            "title": action_title,
+            "assigned_user_id": int(owner["id"]),
+            "assigned_to": owner["display_name"],
+            "planned_start_at": format_planning_datetime(planning_dt),
+            "deadline": planning_dt.strftime("%Y-%m-%d"),
+            "priority": "vysoka",
+            "planning_note": planning_note,
+            "client_id": int(client["id"]),
+            "client_name": client["display_name"],
+        },
+        actor_name=actor_name,
+        default_client_id=int(client["id"]),
+        default_client_name=client["display_name"],
+        source="voice_client_create",
+    )
+    set_client_next_action(conn, tenant_id, int(client["id"]), str(next_action["id"]))
+    validation = validate_client_hierarchy(conn, tenant_id, int(client["id"]))
+    if not validation["valid"]:
+        raise HTTPException(422, f"Client hierarchy invalid: {', '.join(validation['issues'])}")
+    log_activity(
+        conn,
+        "client",
+        int(client["id"]),
+        "create",
+        f"Voice-created client {client['display_name']}",
+        tenant_id=tenant_id,
+        user_id=actor_user_id,
+        source_channel="voice",
+        details={"next_action_task_id": str(next_action["id"])},
+    )
+    return {"id": int(client["id"]), "display_name": client["display_name"], "next_action_task_id": str(next_action["id"])}
 
 def generate_summary(ctx, lang="en"):
     c = ctx
@@ -7538,10 +7618,11 @@ async def voice_session_start(data: dict, request: Request):
         tenant_id = data.get("tenant_id",1)
         tenant_config = get_tenant_config(conn, tenant_id)
         lang = resolve_voice_language(tenant_config, data.get("language"))
+        actor_user_id = request.state.user.get("user_id")
         with conn.cursor() as cur:
             ctx = json.dumps({"language":lang,"work_date":data.get("work_date",datetime.now().strftime("%Y-%m-%d"))})
             cur.execute("INSERT INTO voice_sessions (id,tenant_id,user_id,session_type,state,dialog_step,context) VALUES (%s,%s,%s,'work_report','active','client',%s)",
-                (sid,tenant_id,data.get("user_id"),ctx))
+                (sid,tenant_id,actor_user_id,ctx))
             conn.commit()
         audit_request_event(
             request,
@@ -7595,17 +7676,59 @@ async def voice_session_input(data: dict, request: Request):
 
             # === STEP: CLIENT ===
             if step == "client":
-                cur.execute("SELECT id,display_name FROM clients WHERE tenant_id=%s AND deleted_at IS NULL AND (display_name ILIKE %s OR client_code ILIKE %s) LIMIT 5",
-                    (tenant_id,f"%{text}%",f"%{text}%"))
-                matches = cur.fetchall()
-                if len(matches) == 1:
-                    ctx["client_id"] = matches[0]['id']; ctx["client_name"] = matches[0]['display_name']
-                    next_step = "workers"; reply = f"{matches[0]['display_name']}. {get_prompt('workers',lang)}"
-                elif len(matches) > 1:
-                    names = ", ".join([m['display_name'] for m in matches])
-                    reply = f"Found: {names}. Which one?" if lang=="en" else f"Nalezeni: {names}. Který?" if lang=="cs" else f"Znalezieni: {names}. Który?"
+                wants_new_client, provided_new_client_name = parse_new_client_command(text)
+                if wants_new_client and provided_new_client_name:
+                    actor_user_id = sess.get("user_id")
+                    if not actor_user_id:
+                        raise HTTPException(422, "Voice session has no user for client creation")
+                    created_client = create_voice_work_report_client(conn, tenant_id, int(actor_user_id), provided_new_client_name, lang)
+                    ctx["client_id"] = created_client["id"]
+                    ctx["client_name"] = created_client["display_name"]
+                    next_step = "workers"
+                    reply = (
+                        f"Created client {created_client['display_name']}. {get_prompt('workers',lang)}"
+                        if lang == "en" else
+                        f"Vytvořil jsem klienta {created_client['display_name']}. {get_prompt('workers',lang)}"
+                        if lang == "cs" else
+                        f"Utworzyłem klienta {created_client['display_name']}. {get_prompt('workers',lang)}"
+                    )
+                elif wants_new_client:
+                    next_step = "client_create_name"
+                    reply = get_prompt("client_create_name", lang)
                 else:
-                    reply = "Client not found. Try again." if lang=="en" else "Klient nenalezen. Zkus znovu." if lang=="cs" else "Klient nie znaleziony. Spróbuj ponownie."
+                    cur.execute("SELECT id,display_name FROM clients WHERE tenant_id=%s AND deleted_at IS NULL AND (display_name ILIKE %s OR client_code ILIKE %s) LIMIT 5",
+                        (tenant_id,f"%{text}%",f"%{text}%"))
+                    matches = cur.fetchall()
+                    if len(matches) == 1:
+                        ctx["client_id"] = matches[0]['id']; ctx["client_name"] = matches[0]['display_name']
+                        next_step = "workers"; reply = f"{matches[0]['display_name']}. {get_prompt('workers',lang)}"
+                    elif len(matches) > 1:
+                        names = ", ".join([m['display_name'] for m in matches])
+                        reply = f"Found: {names}. Which one?" if lang=="en" else f"Nalezeni: {names}. Který?" if lang=="cs" else f"Znalezieni: {names}. Który?"
+                    else:
+                        reply = (
+                            "Client not found. Try again or say 'new client'."
+                            if lang=="en" else
+                            "Klient nenalezen. Zkus to znovu nebo řekni 'nový klient'."
+                            if lang=="cs" else
+                            "Klient nie znaleziony. Spróbuj ponownie albo powiedz 'nowy klient'."
+                        )
+
+            elif step == "client_create_name":
+                actor_user_id = sess.get("user_id")
+                if not actor_user_id:
+                    raise HTTPException(422, "Voice session has no user for client creation")
+                created_client = create_voice_work_report_client(conn, tenant_id, int(actor_user_id), text, lang)
+                ctx["client_id"] = created_client["id"]
+                ctx["client_name"] = created_client["display_name"]
+                next_step = "workers"
+                reply = (
+                    f"Created client {created_client['display_name']}. {get_prompt('workers',lang)}"
+                    if lang == "en" else
+                    f"Vytvořil jsem klienta {created_client['display_name']}. {get_prompt('workers',lang)}"
+                    if lang == "cs" else
+                    f"Utworzyłem klienta {created_client['display_name']}. {get_prompt('workers',lang)}"
+                )
 
             # === STEP: WORKERS ===
             elif step == "workers":
