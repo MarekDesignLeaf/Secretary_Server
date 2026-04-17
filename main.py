@@ -1948,6 +1948,306 @@ def validate_job_hierarchy(conn, tenant_id: int, job_id: int) -> dict:
         "next_action_task": next_action,
     }
 
+def get_task_row(conn, tenant_id: int, task_id: str) -> Optional[dict]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT *
+            FROM tasks
+            WHERE tenant_id=%s AND id=%s
+        """, (tenant_id, str(task_id)))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+def get_task_next_action_links(conn, tenant_id: int, task_id: str) -> List[dict]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 'client' AS entity_type,
+                   c.id AS entity_id,
+                   c.display_name AS entity_name,
+                   c.next_action_task_id,
+                   c.owner_user_id,
+                   c.id AS client_id,
+                   NULL::BIGINT AS job_id
+            FROM clients c
+            WHERE c.tenant_id=%s
+              AND c.deleted_at IS NULL
+              AND c.next_action_task_id=%s
+            UNION ALL
+            SELECT 'job' AS entity_type,
+                   j.id AS entity_id,
+                   j.job_title AS entity_name,
+                   j.next_action_task_id,
+                   j.assigned_user_id AS owner_user_id,
+                   j.client_id,
+                   j.id AS job_id
+            FROM jobs j
+            WHERE j.tenant_id=%s
+              AND j.deleted_at IS NULL
+              AND j.next_action_task_id=%s
+        """, (tenant_id, str(task_id), tenant_id, str(task_id)))
+        rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+def set_client_next_action(conn, tenant_id: int, client_id: int, task_id: str) -> None:
+    candidate = get_valid_client_next_action_task(conn, tenant_id, client_id, str(task_id))
+    if not candidate:
+        raise HTTPException(422, "Client next action must be an open planned task assigned to an active user")
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE clients
+            SET next_action_task_id=%s,
+                hierarchy_status='valid',
+                updated_at=now()
+            WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
+        """, (str(task_id), tenant_id, client_id))
+
+def set_job_next_action(conn, tenant_id: int, job_id: int, task_id: str) -> None:
+    candidate = get_valid_job_next_action_task(conn, tenant_id, job_id, str(task_id))
+    if not candidate:
+        raise HTTPException(422, "Job next action must be an open planned task assigned to an active user")
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE jobs
+            SET next_action_task_id=%s,
+                hierarchy_status='valid',
+                updated_at=now()
+            WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
+        """, (str(task_id), tenant_id, job_id))
+
+def create_workflow_task(
+    conn,
+    tenant_id: int,
+    task_payload: dict,
+    *,
+    actor_name: str,
+    default_client_id: Optional[int] = None,
+    default_client_name: Optional[str] = None,
+    default_job_id: Optional[int] = None,
+    default_property_id: Optional[int] = None,
+    default_property_address: Optional[str] = None,
+    source: str = "workflow",
+) -> dict:
+    if not isinstance(task_payload, dict):
+        raise HTTPException(422, "Task payload is required")
+    title = (task_payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(422, "Task title is required")
+    assigned_user_id, assigned_to = resolve_assigned_user(
+        conn,
+        tenant_id,
+        task_payload.get("assigned_user_id"),
+        task_payload.get("assigned_to"),
+    )
+    assignee = validate_active_user(conn, tenant_id, assigned_user_id, "task assignee")
+    planning_start, planning_end, deadline = validate_task_planning(task_payload)
+    task_id = str(task_payload.get("id") or uuid.uuid4())
+    client_id = task_payload.get("client_id", default_client_id)
+    client_name = task_payload.get("client_name", default_client_name)
+    job_id = task_payload.get("job_id", default_job_id)
+    property_id = task_payload.get("property_id", default_property_id)
+    property_address = task_payload.get("property_address", default_property_address)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO tasks (
+                id,title,description,task_type,status,priority,deadline,planned_date,
+                planned_start_at,planned_end_at,estimated_minutes,created_by,assigned_to,assigned_user_id,
+                planning_note,reminder_for_assignee_only,delegated_by,client_id,client_name,job_id,property_id,property_address,
+                is_recurring,recurrence_rule,communication_method,source,is_billable,has_cost,checklist,calendar_sync_enabled,tenant_id
+            ) VALUES (
+                %s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s,%s,%s
+            ) RETURNING *
+        """, (
+            task_id,
+            title,
+            task_payload.get("description"),
+            task_payload.get("task_type", "interni_poznamka"),
+            task_payload.get("status", "novy"),
+            task_payload.get("priority", "bezna"),
+            deadline,
+            task_payload.get("planned_date") or deadline,
+            planning_start,
+            planning_end,
+            task_payload.get("estimated_minutes"),
+            actor_name,
+            assigned_to or assignee["display_name"],
+            int(assignee["id"]),
+            task_payload.get("planning_note"),
+            task_payload.get("reminder_for_assignee_only", True),
+            task_payload.get("delegated_by") or actor_name,
+            client_id,
+            client_name,
+            job_id,
+            property_id,
+            property_address,
+            task_payload.get("is_recurring", False),
+            task_payload.get("recurrence_rule"),
+            task_payload.get("communication_method"),
+            task_payload.get("source") or source,
+            task_payload.get("is_billable", False),
+            task_payload.get("has_cost", False),
+            json.dumps(task_payload.get("checklist", [])),
+            task_payload.get("calendar_sync_enabled", True),
+            tenant_id,
+        ))
+        row = cur.fetchone()
+    return dict(row)
+
+def resolve_replacement_task_for_link(
+    conn,
+    tenant_id: int,
+    link: dict,
+    current_task_id: str,
+    *,
+    replacement_task_id: Optional[str] = None,
+    replacement_task_payload: Optional[dict] = None,
+    actor_name: str,
+    fallback_task: Optional[dict] = None,
+) -> dict:
+    if replacement_task_id:
+        if str(replacement_task_id) == str(current_task_id):
+            raise HTTPException(422, "Replacement task must be different from current next action")
+        candidate = (
+            get_valid_client_next_action_task(conn, tenant_id, int(link["entity_id"]), str(replacement_task_id))
+            if link["entity_type"] == "client"
+            else get_valid_job_next_action_task(conn, tenant_id, int(link["entity_id"]), str(replacement_task_id))
+        )
+        if not candidate:
+            raise HTTPException(422, "Replacement task must be an open planned task linked to the same entity")
+        return candidate
+    if not replacement_task_payload:
+        raise HTTPException(422, "Current next action cannot be completed without replacement_task_id or replacement_task_payload")
+    payload = dict(replacement_task_payload)
+    if fallback_task:
+        payload.setdefault("client_id", fallback_task.get("client_id"))
+        payload.setdefault("client_name", fallback_task.get("client_name"))
+        payload.setdefault("job_id", fallback_task.get("job_id"))
+        payload.setdefault("property_id", fallback_task.get("property_id"))
+        payload.setdefault("property_address", fallback_task.get("property_address"))
+    if link["entity_type"] == "client":
+        payload["client_id"] = int(link["entity_id"])
+        payload["job_id"] = None
+    else:
+        payload["job_id"] = int(link["entity_id"])
+        payload.setdefault("client_id", link.get("client_id"))
+    return create_workflow_task(
+        conn,
+        tenant_id,
+        payload,
+        actor_name=actor_name,
+        default_client_id=payload.get("client_id"),
+        default_client_name=payload.get("client_name"),
+        default_job_id=payload.get("job_id"),
+        default_property_id=payload.get("property_id"),
+        default_property_address=payload.get("property_address"),
+        source="replacement_workflow",
+    )
+
+def replace_next_action_links(
+    conn,
+    tenant_id: int,
+    task_row: dict,
+    *,
+    replacement_task_id: Optional[str] = None,
+    replacement_task_payload: Optional[dict] = None,
+    actor_user_id: Optional[int] = None,
+    actor_name: str,
+) -> List[dict]:
+    links = get_task_next_action_links(conn, tenant_id, str(task_row["id"]))
+    replacements: List[dict] = []
+    for link in links:
+        replacement = resolve_replacement_task_for_link(
+            conn,
+            tenant_id,
+            link,
+            str(task_row["id"]),
+            replacement_task_id=replacement_task_id,
+            replacement_task_payload=replacement_task_payload,
+            actor_name=actor_name,
+            fallback_task=task_row,
+        )
+        if link["entity_type"] == "client":
+            set_client_next_action(conn, tenant_id, int(link["entity_id"]), str(replacement["id"]))
+            log_activity(
+                conn,
+                "client",
+                int(link["entity_id"]),
+                "change_next_action",
+                f"Client next action changed from {task_row['id']} to {replacement['id']}",
+                tenant_id=tenant_id,
+                user_id=actor_user_id,
+                source_channel="hierarchy",
+                details={"before": str(task_row["id"]), "after": str(replacement["id"])},
+            )
+        else:
+            set_job_next_action(conn, tenant_id, int(link["entity_id"]), str(replacement["id"]))
+            log_activity(
+                conn,
+                "job",
+                int(link["entity_id"]),
+                "change_next_action",
+                f"Job next action changed from {task_row['id']} to {replacement['id']}",
+                tenant_id=tenant_id,
+                user_id=actor_user_id,
+                source_channel="hierarchy",
+                details={"before": str(task_row["id"]), "after": str(replacement["id"])},
+            )
+        replacements.append({"link": link, "task": replacement})
+    return replacements
+
+def get_user_deactivation_blockers(conn, tenant_id: int, user_id: int) -> dict:
+    blockers = {"clients": [], "jobs": [], "open_tasks": [], "next_action_tasks": []}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, display_name
+            FROM clients
+            WHERE tenant_id=%s AND deleted_at IS NULL AND owner_user_id=%s
+            ORDER BY id
+            LIMIT 20
+        """, (tenant_id, user_id))
+        blockers["clients"] = [dict(row) for row in cur.fetchall()]
+        cur.execute("""
+            SELECT id, job_title
+            FROM jobs
+            WHERE tenant_id=%s AND deleted_at IS NULL AND assigned_user_id=%s
+            ORDER BY id
+            LIMIT 20
+        """, (tenant_id, user_id))
+        blockers["jobs"] = [dict(row) for row in cur.fetchall()]
+        cur.execute("""
+            SELECT id, title, client_id, job_id
+            FROM tasks
+            WHERE tenant_id=%s
+              AND assigned_user_id=%s
+              AND COALESCE(is_completed, FALSE)=FALSE
+              AND COALESCE(status, 'novy') NOT IN ('hotovo', 'zruseno')
+            ORDER BY created_at DESC
+            LIMIT 20
+        """, (tenant_id, user_id))
+        blockers["open_tasks"] = [dict(row) for row in cur.fetchall()]
+        cur.execute("""
+            SELECT t.id, t.title, c.id AS client_id, j.id AS job_id
+            FROM tasks t
+            LEFT JOIN clients c
+              ON c.tenant_id=t.tenant_id
+             AND c.deleted_at IS NULL
+             AND c.next_action_task_id=t.id
+            LEFT JOIN jobs j
+              ON j.tenant_id=t.tenant_id
+             AND j.deleted_at IS NULL
+             AND j.next_action_task_id=t.id
+            WHERE t.tenant_id=%s
+              AND t.assigned_user_id=%s
+              AND (c.id IS NOT NULL OR j.id IS NOT NULL)
+            ORDER BY t.created_at DESC
+            LIMIT 20
+        """, (tenant_id, user_id))
+        blockers["next_action_tasks"] = [dict(row) for row in cur.fetchall()]
+    blockers["has_blockers"] = any(bool(blockers[key]) for key in ("clients", "jobs", "open_tasks", "next_action_tasks"))
+    return blockers
+
 def create_hierarchy_placeholder_task(
     conn,
     tenant_id: int,
@@ -3041,12 +3341,48 @@ RULES:
             if action == "CREATE_CLIENT":
                 conn = get_db_conn()
                 try:
+                    tenant_id = get_request_tenant_id(request)
+                    actor_user_id = request.state.user.get("user_id")
+                    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
+                    owner = get_active_user_row(conn, tenant_id, actor_user_id) or get_default_hierarchy_user(conn, tenant_id)
+                    if not owner:
+                        return error_reply("No active owner is available for the new client.")
                     code = f"CL-{uuid.uuid4().hex[:6].upper()}"
                     with conn.cursor() as cur:
-                        cur.execute("INSERT INTO clients (client_code,client_type,display_name,email_primary,phone_primary,status) VALUES (%s,%s,%s,%s,%s,'active') RETURNING id",
-                            (code,"domestic",args["name"],args.get("email"),args.get("phone")))
-                        cid = cur.fetchone()['id']
-                        log_activity(conn,"client",cid,"create",f"Klient {args['name']} vytvoren")
+                        cur.execute("""INSERT INTO clients (
+                                client_code,client_type,display_name,email_primary,phone_primary,status,tenant_id,owner_user_id,hierarchy_status
+                            ) VALUES (%s,%s,%s,%s,%s,'active',%s,%s,'pending') RETURNING id,display_name""",
+                            (code,"domestic",args["name"],args.get("email"),args.get("phone"),tenant_id,int(owner["id"])))
+                        client_row = dict(cur.fetchone())
+                        cid = client_row['id']
+                        first_action = create_workflow_task(
+                            conn,
+                            tenant_id,
+                            {
+                                "title": tr("Follow up with new client", "Navázat další krok s novým klientem", "Wykonać kolejny krok z nowym klientem"),
+                                "description": args.get("note") or args.get("description"),
+                                "assigned_user_id": int(owner["id"]),
+                                "planned_start_at": next_business_day_at_nine().isoformat(),
+                                "priority": "vysoka",
+                                "planning_note": "Systémově vytvořený první krok z AI flow.",
+                            },
+                            actor_name=actor_name,
+                            default_client_id=cid,
+                            default_client_name=client_row.get("display_name") or args["name"],
+                            source="assistant_client_create",
+                        )
+                        set_client_next_action(conn, tenant_id, cid, str(first_action["id"]))
+                        log_activity(
+                            conn,
+                            "client",
+                            cid,
+                            "create",
+                            f"Klient {args['name']} vytvoren",
+                            tenant_id=tenant_id,
+                            user_id=actor_user_id,
+                            source_channel="assistant",
+                            details={"owner_user_id": int(owner["id"]), "next_action_task_id": str(first_action["id"])},
+                        )
                         conn.commit()
                     return {"reply_cs": tr(
                         f"Client {args['name']} ({code}) is now in CRM.",
@@ -3076,28 +3412,33 @@ RULES:
                 t = args.get("title","Ukol")
                 conn = get_db_conn()
                 try:
-                    tid = str(uuid.uuid4())
                     tenant_id = get_request_tenant_id(request)
-                    assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
-                    planning_start, planning_end = planning_window_from_values(
-                        args.get("planned_start_at"),
-                        args.get("planned_end_at"),
-                        args.get("planned_date") or args.get("deadline"),
+                    actor_user_id = request.state.user.get("user_id")
+                    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
+                    default_owner = get_active_user_row(conn, tenant_id, actor_user_id) or get_default_hierarchy_user(conn, tenant_id)
+                    task_payload = dict(args)
+                    task_payload.setdefault("assigned_user_id", default_owner["id"] if default_owner else None)
+                    task_payload.setdefault("planned_start_at", next_business_day_at_nine().isoformat())
+                    task_payload.setdefault("priority", "bezna")
+                    task = create_workflow_task(
+                        conn,
+                        tenant_id,
+                        task_payload,
+                        actor_name=actor_name,
+                        default_client_name=args.get("client_name"),
+                        source="hlasovy_prikaz",
                     )
-                    current_user_name = get_user_display_name(conn, tenant_id, request.state.user.get("user_id"))
-                    with conn.cursor() as cur:
-                        cur.execute("""INSERT INTO tasks (
-                                id,title,description,task_type,status,priority,deadline,planned_date,
-                                planned_start_at,planned_end_at,assigned_to,assigned_user_id,planning_note,
-                                delegated_by,client_name,created_by,source,tenant_id
-                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
-                            (tid,t,args.get("description"),args.get("task_type","interni_poznamka"),"novy",
-                             args.get("priority","bezna"),args.get("deadline"),args.get("planned_date"),
-                             planning_start, planning_end, assigned_to, assigned_user_id, args.get("planning_note"),
-                             current_user_name, args.get("client_name"), current_user_name or "Marek", "hlasovy_prikaz", tenant_id))
-                        task = dict(cur.fetchone())
-                        log_activity(conn,"task",tid,"create",f"Ukol '{t}' vytvoren")
-                        conn.commit()
+                    log_activity(
+                        conn,
+                        "task",
+                        task["id"],
+                        "create",
+                        f"Ukol '{t}' vytvoren",
+                        tenant_id=tenant_id,
+                        user_id=actor_user_id,
+                        source_channel="assistant",
+                    )
+                    conn.commit()
                     return {"reply_cs":tr(
                         f"I created a task: {t}.",
                         f"Vytvořila jsem úkol: {t}.",
@@ -3112,13 +3453,17 @@ RULES:
                 try:
                     code = f"JOB-{uuid.uuid4().hex[:6].upper()}"
                     tenant_id = get_request_tenant_id(request)
+                    actor_user_id = request.state.user.get("user_id")
+                    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
                     cname = args.get("client_name","")
                     cid = None
                     assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
+                    owner = get_active_user_row(conn, tenant_id, assigned_user_id) or get_active_user_row(conn, tenant_id, actor_user_id) or get_default_hierarchy_user(conn, tenant_id)
+                    if not owner:
+                        return error_reply("No active owner is available for the new job.")
                     planning_start, planning_end = planning_window_from_values(
                         args.get("planned_start_at"), args.get("planned_end_at"), args.get("start_date")
                     )
-                    current_user_name = get_user_display_name(conn, tenant_id, request.state.user.get("user_id"))
                     with conn.cursor() as cur:
                         if cname:
                             cur.execute("SELECT id FROM clients WHERE tenant_id=%s AND display_name ILIKE %s AND deleted_at IS NULL LIMIT 1",(tenant_id, f"%{cname}%",))
@@ -3126,14 +3471,43 @@ RULES:
                             if row: cid = row['id']
                         cur.execute("""INSERT INTO jobs (
                                 tenant_id,job_number,client_id,job_title,job_status,start_date_planned,
-                                planned_start_at,planned_end_at,assigned_user_id,assigned_to,handover_note,
+                                planned_start_at,planned_end_at,assigned_user_id,assigned_to,next_action_task_id,hierarchy_status,handover_note,
                                 handed_over_by,handed_over_at,calendar_sync_enabled
-                            ) VALUES (%s,%s,%s,%s,'nova',%s,%s,%s,%s,%s,%s,%s,%s,TRUE) RETURNING id""",
+                            ) VALUES (%s,%s,%s,%s,'nova',%s,%s,%s,%s,%s,NULL,'pending',%s,%s,%s,TRUE) RETURNING id""",
                             (tenant_id, code, cid, t, args.get("start_date"), planning_start, planning_end,
-                             assigned_user_id, assigned_to, args.get("handover_note"), current_user_name,
+                             int(owner["id"]), assigned_to or owner["display_name"], args.get("handover_note"), actor_name,
                              datetime.utcnow() if (assigned_to or args.get("handover_note")) else None))
                         jid = cur.fetchone()['id']
-                        log_activity(conn,"job",jid,"create",f"Zakazka '{t}' ({code}) vytvorena")
+                        first_action = create_workflow_task(
+                            conn,
+                            tenant_id,
+                            {
+                                "title": tr("Continue with the new job", "Pokračovat v nové zakázce", "Kontynuować nowe zlecenie"),
+                                "description": args.get("description"),
+                                "assigned_user_id": int(owner["id"]),
+                                "planned_start_at": next_business_day_at_nine().isoformat(),
+                                "priority": "vysoka",
+                                "client_id": cid,
+                                "client_name": cname or None,
+                            },
+                            actor_name=actor_name,
+                            default_client_id=cid,
+                            default_client_name=cname or None,
+                            default_job_id=jid,
+                            source="assistant_job_create",
+                        )
+                        set_job_next_action(conn, tenant_id, jid, str(first_action["id"]))
+                        log_activity(
+                            conn,
+                            "job",
+                            jid,
+                            "create",
+                            f"Zakazka '{t}' ({code}) vytvorena",
+                            tenant_id=tenant_id,
+                            user_id=actor_user_id,
+                            source_channel="assistant",
+                            details={"assigned_user_id": int(owner["id"]), "next_action_task_id": str(first_action["id"])},
+                        )
                         conn.commit()
                     return {"reply_cs":tr(
                         f"Job {code}: {t} created.",
@@ -3437,6 +3811,14 @@ RULES:
                             ORDER BY created_at DESC LIMIT 1""",(tenant_id, f"%{title_q}%",))
                         row = cur.fetchone()
                         if not row: return {"reply_cs":tr(f"Task '{title_q}' not found.", f"Úkol '{title_q}' nenalezen.", f"Nie znaleziono zadania '{title_q}'.")}
+                        task_links = get_task_next_action_links(conn, tenant_id, row["id"])
+                        requested_status = args.get("status")
+                        if task_links and requested_status in ("hotovo", "zruseno"):
+                            return {"reply_cs": tr(
+                                "This task is the current next step. Choose or create the replacement task first.",
+                                "Tento úkol je aktuální další krok. Nejprve vyber nebo vytvoř náhradní úkol.",
+                                "To zadanie jest bieżącym kolejnym krokiem. Najpierw wybierz lub utwórz zadanie zastępcze."
+                            )}
                         sets = []; vals = []
                         if "status" in args: sets.append("status=%s"); vals.append(args["status"])
                         if "priority" in args: sets.append("priority=%s"); vals.append(args["priority"])
@@ -3543,10 +3925,17 @@ RULES:
                 title_q = args.get("title","")
                 conn = get_db_conn()
                 try:
+                    tenant_id = get_request_tenant_id(request)
                     with conn.cursor() as cur:
-                        cur.execute("SELECT id,title FROM tasks WHERE title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
+                        cur.execute("SELECT id,title FROM tasks WHERE tenant_id=%s AND title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(tenant_id, f"%{title_q}%",))
                         row = cur.fetchone()
                         if not row: return {"reply_cs":tr(f"Task '{title_q}' not found or is already done.", f"Úkol '{title_q}' nenalezen nebo už je hotový.", f"Zadanie '{title_q}' nie zostało znalezione albo jest już ukończone.")}
+                        if get_task_next_action_links(conn, tenant_id, row["id"]):
+                            return {"reply_cs": tr(
+                                "This task is the current next step. Create or choose the replacement task before completing it.",
+                                "Tento úkol je aktuální další krok. Před dokončením nejdřív vytvoř nebo vyber náhradní úkol.",
+                                "To zadanie jest bieżącym kolejnym krokiem. Przed ukończeniem najpierw utwórz lub wybierz zadanie zastępcze."
+                            )}
                         result = args.get("result", tr("Completed", "Dokončeno", "Ukończono"))
                         cur.execute("UPDATE tasks SET status='hotovo',is_completed=TRUE,result=%s,updated_at=now() WHERE id=%s",(result,row['id']))
                         log_activity(conn,"task",row['id'],"complete",f"Ukol '{row['title']}' dokoncen: {result}")
@@ -3636,15 +4025,23 @@ async def api_create_client(data: dict, request: Request):
     conn = get_db_conn()
     try:
         ok, msg = check_subscription_limit(conn, tid, "clients")
-        if not ok: raise HTTPException(429, msg)
+        if not ok:
+            raise HTTPException(429, msg)
+        owner_user_id = data.get("owner_user_id")
+        first_action = data.get("first_action")
+        actor_user_id = request.state.user.get("user_id")
+        actor_name = get_user_display_name(conn, tid, actor_user_id) or "system"
+        owner = validate_active_user(conn, tid, owner_user_id, "client owner")
+        if not isinstance(first_action, dict):
+            raise HTTPException(422, "Client must include first_action")
         code = f"CL-{uuid.uuid4().hex[:6].upper()}"
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO clients (client_code,client_type,title,first_name,last_name,display_name,
                 company_name,company_registration_no,vat_no,email_primary,email_secondary,
                 phone_primary,phone_secondary,website,preferred_contact_method,
                 billing_address_line1,billing_city,billing_postcode,billing_country,
-                status,is_commercial,tenant_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s) RETURNING id""",
+                status,is_commercial,tenant_id,owner_user_id,hierarchy_status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,%s,'pending') RETURNING id,display_name""",
                 (code,data.get("type",data.get("client_type","domestic")),
                  data.get("title"),data.get("first_name"),data.get("last_name"),
                  data.get("name",data.get("display_name","")),
@@ -3654,31 +4051,109 @@ async def api_create_client(data: dict, request: Request):
                  data.get("website"),data.get("preferred_contact_method","email"),
                  data.get("billing_address_line1"),data.get("billing_city"),
                  data.get("billing_postcode"),data.get("billing_country","GB"),
-                 data.get("is_commercial",False),tid))
-            cid = cur.fetchone()['id']
-            log_activity(conn,"client",cid,"create",f"Klient {data.get('name',data.get('display_name',''))} vytvoren")
+                 data.get("is_commercial",False),tid,int(owner["id"])))
+            client_row = dict(cur.fetchone())
+            cid = client_row["id"]
+            next_action = create_workflow_task(
+                conn,
+                tid,
+                first_action,
+                actor_name=actor_name,
+                default_client_id=cid,
+                default_client_name=client_row.get("display_name") or data.get("name", data.get("display_name", "")),
+                source="client_first_action",
+            )
+            set_client_next_action(conn, tid, cid, str(next_action["id"]))
+            validation = validate_client_hierarchy(conn, tid, cid)
+            if not validation["valid"]:
+                raise HTTPException(422, f"Client hierarchy invalid: {', '.join(validation['issues'])}")
+            log_activity(
+                conn,
+                "client",
+                cid,
+                "create",
+                f"Klient {data.get('name',data.get('display_name',''))} vytvoren",
+                tenant_id=tid,
+                user_id=actor_user_id,
+                source_channel="crm",
+                details={
+                    "owner_user_id": int(owner["id"]),
+                    "next_action_task_id": str(next_action["id"]),
+                },
+            )
             conn.commit()
-        return {"id":cid,"client_code":code,"status":"success"}
-    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
-    finally: release_conn(conn)
+        return {
+            "id": cid,
+            "client_code": code,
+            "status": "success",
+            "owner_user_id": int(owner["id"]),
+            "next_action_task_id": str(next_action["id"]),
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500,str(e))
+    finally:
+        release_conn(conn)
 
 @app.put("/crm/clients/{client_id}")
-async def update_client(client_id: int, data: dict):
+async def update_client(client_id: int, data: dict, request: Request):
     conn = get_db_conn()
     try:
+        tid = get_request_tenant_id(request)
+        actor_user_id = request.state.user.get("user_id")
         sets = []; vals = []
+        if "owner_user_id" in data:
+            if data.get("owner_user_id") in (None, "", 0, "0"):
+                raise HTTPException(422, "Client owner cannot be empty")
+            owner = validate_active_user(conn, tid, data.get("owner_user_id"), "client owner")
+            sets.append("owner_user_id=%s"); vals.append(int(owner["id"]))
+        if "next_action_task_id" in data:
+            if not data.get("next_action_task_id"):
+                raise HTTPException(422, "Client next_action_task_id cannot be empty")
+            candidate = get_valid_client_next_action_task(conn, tid, client_id, str(data["next_action_task_id"]))
+            if not candidate:
+                raise HTTPException(422, "Client next action must point to an open planned client task")
+            sets.append("next_action_task_id=%s"); vals.append(str(data["next_action_task_id"]))
         for k in ["display_name","first_name","last_name","title","client_type","company_name","company_registration_no","vat_no","email_primary","email_secondary","phone_primary","phone_secondary","website","preferred_contact_method","billing_address_line1","billing_city","billing_postcode","billing_country","status","is_commercial"]:
             if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
-        if not sets: raise HTTPException(400,"Zadna data")
-        sets.append("updated_at=now()"); vals.append(client_id)
+        if not sets:
+            raise HTTPException(400,"Zadna data")
+        sets.append("updated_at=now()"); vals.extend([tid, client_id])
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE clients SET {','.join(sets)} WHERE id=%s AND deleted_at IS NULL",vals)
-            log_activity(conn,"client",client_id,"update",f"Klient upraven: {list(data.keys())}")
+            cur.execute(f"UPDATE clients SET {','.join(sets)} WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL",vals)
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Client not found")
+            validation = validate_client_hierarchy(conn, tid, client_id)
+            if not validation["valid"]:
+                raise HTTPException(422, f"Client hierarchy invalid: {', '.join(validation['issues'])}")
+            cur.execute("""
+                UPDATE clients
+                SET hierarchy_status='valid', updated_at=now()
+                WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
+            """, (tid, client_id))
+            log_activity(
+                conn,
+                "client",
+                client_id,
+                "update",
+                f"Klient upraven: {list(data.keys())}",
+                tenant_id=tid,
+                user_id=actor_user_id,
+                source_channel="crm",
+            )
             conn.commit()
         return {"status":"updated"}
-    except HTTPException: raise
-    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
-    finally: release_conn(conn)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500,str(e))
+    finally:
+        release_conn(conn)
 
 @app.delete("/crm/clients/{client_id}")
 async def archive_client(client_id: int):
@@ -3878,21 +4353,29 @@ async def create_job(data: dict, request: Request):
     conn = get_db_conn()
     try:
         ok, msg = check_subscription_limit(conn, tid, "jobs")
-        if not ok: raise HTTPException(429, msg)
+        if not ok:
+            raise HTTPException(429, msg)
         code = f"JOB-{uuid.uuid4().hex[:6].upper()}"
+        first_action = data.get("first_action")
+        if not isinstance(first_action, dict):
+            raise HTTPException(422, "Job must include first_action")
+        actor_user_id = request.state.user.get("user_id")
+        actor_name = get_user_display_name(conn, tid, actor_user_id) or "system"
         assigned_user_id, assigned_to = resolve_assigned_user(conn, tid, data.get("assigned_user_id"), data.get("assigned_to"))
+        owner = validate_active_user(conn, tid, assigned_user_id, "job owner")
         planning_start, planning_end = planning_window_from_values(
             data.get("planned_start_at"), data.get("planned_end_at"), data.get("start_date")
         )
         handover_note = (data.get("handover_note") or "").strip() or None
-        handover_by = get_user_display_name(conn, tid, request.state.user.get("user_id"))
+        handover_by = actor_name
         handover_at = datetime.utcnow() if (handover_note or assigned_to) else None
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO jobs (
                     tenant_id, job_number, client_id, property_id, job_title, job_status,
                     start_date_planned, planned_start_at, planned_end_at,
-                    assigned_user_id, assigned_to, handover_note, handed_over_by, handed_over_at, calendar_sync_enabled
-                ) VALUES (%s,%s,%s,%s,%s,'nova',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    assigned_user_id, assigned_to, next_action_task_id, hierarchy_status,
+                    handover_note, handed_over_by, handed_over_at, calendar_sync_enabled
+                ) VALUES (%s,%s,%s,%s,%s,'nova',%s,%s,%s,%s,%s,NULL,'pending',%s,%s,%s,%s) RETURNING id""",
                 (
                     tid,
                     code,
@@ -3902,42 +4385,95 @@ async def create_job(data: dict, request: Request):
                     data.get("start_date"),
                     planning_start,
                     planning_end,
-                    assigned_user_id,
-                    assigned_to,
+                    int(owner["id"]),
+                    assigned_to or owner["display_name"],
                     handover_note,
                     handover_by,
                     handover_at,
                     data.get("calendar_sync_enabled", True),
                 ))
             jid = cur.fetchone()['id']
-            log_activity(conn,"job",jid,"create",f"Zakazka {code} vytvorena")
+            next_action = create_workflow_task(
+                conn,
+                tid,
+                first_action,
+                actor_name=actor_name,
+                default_client_id=data.get("client_id"),
+                default_client_name=data.get("client_name"),
+                default_job_id=jid,
+                default_property_id=data.get("property_id", data.get("client_id")),
+                default_property_address=data.get("property_address"),
+                source="job_first_action",
+            )
+            set_job_next_action(conn, tid, jid, str(next_action["id"]))
+            validation = validate_job_hierarchy(conn, tid, jid)
+            if not validation["valid"]:
+                raise HTTPException(422, f"Job hierarchy invalid: {', '.join(validation['issues'])}")
+            log_activity(
+                conn,
+                "job",
+                jid,
+                "create",
+                f"Zakazka {code} vytvorena",
+                tenant_id=tid,
+                user_id=actor_user_id,
+                source_channel="crm",
+                details={
+                    "assigned_user_id": int(owner["id"]),
+                    "next_action_task_id": str(next_action["id"]),
+                },
+            )
             conn.commit()
-        return {"id":jid,"job_number":code,"status":"created"}
-    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
-    finally: release_conn(conn)
+        return {
+            "id": jid,
+            "job_number": code,
+            "status": "created",
+            "assigned_user_id": int(owner["id"]),
+            "next_action_task_id": str(next_action["id"]),
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500,str(e))
+    finally:
+        release_conn(conn)
 
 @app.put("/crm/jobs/{job_id}")
 async def update_job(job_id: int, data: dict, request: Request):
     conn = get_db_conn()
     try:
+        tid = get_request_tenant_id(request)
+        actor_user_id = request.state.user.get("user_id")
         with conn.cursor() as cur:
             # Validate state transition if status is being changed
             if "job_status" in data:
-                cur.execute("SELECT job_status FROM jobs WHERE id=%s AND deleted_at IS NULL",(job_id,))
+                cur.execute("SELECT job_status FROM jobs WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL",(tid, job_id))
                 row = cur.fetchone()
-                if not row: raise HTTPException(404,"Job not found")
+                if not row:
+                    raise HTTPException(404,"Job not found")
                 err = validate_state_transition(row["job_status"], data["job_status"], JOB_TRANSITIONS, "Job")
-                if err: raise HTTPException(422, err)
+                if err:
+                    raise HTTPException(422, err)
             sets = []; vals = []
             if "assigned_user_id" in data or "assigned_to" in data:
-                assigned_user_id, assigned_to = resolve_assigned_user(conn, request.state.user.get("tenant_id", 1), data.get("assigned_user_id"), data.get("assigned_to"))
-                sets.append("assigned_user_id=%s"); vals.append(assigned_user_id)
-                sets.append("assigned_to=%s"); vals.append(assigned_to)
-                sets.append("handed_over_by=%s"); vals.append(get_user_display_name(conn, request.state.user.get("tenant_id", 1), request.state.user.get("user_id")))
+                assigned_user_id, assigned_to = resolve_assigned_user(conn, tid, data.get("assigned_user_id"), data.get("assigned_to"))
+                owner = validate_active_user(conn, tid, assigned_user_id, "job owner")
+                sets.append("assigned_user_id=%s"); vals.append(int(owner["id"]))
+                sets.append("assigned_to=%s"); vals.append(assigned_to or owner["display_name"])
+                sets.append("handed_over_by=%s"); vals.append(get_user_display_name(conn, tid, actor_user_id))
                 sets.append("handed_over_at=%s"); vals.append(datetime.utcnow())
+            if "next_action_task_id" in data:
+                if not data.get("next_action_task_id"):
+                    raise HTTPException(422, "Job next_action_task_id cannot be empty")
+                candidate = get_valid_job_next_action_task(conn, tid, job_id, str(data["next_action_task_id"]))
+                if not candidate:
+                    raise HTTPException(422, "Job next action must point to an open planned job task")
+                sets.append("next_action_task_id=%s"); vals.append(str(data["next_action_task_id"]))
             if "handover_note" in data:
                 sets.append("handover_note=%s"); vals.append((data.get("handover_note") or "").strip() or None)
-                sets.append("handed_over_by=%s"); vals.append(get_user_display_name(conn, request.state.user.get("tenant_id", 1), request.state.user.get("user_id")))
+                sets.append("handed_over_by=%s"); vals.append(get_user_display_name(conn, tid, actor_user_id))
                 sets.append("handed_over_at=%s"); vals.append(datetime.utcnow())
             if "planned_start_at" in data or "planned_end_at" in data or "start_date_planned" in data:
                 planning_start, planning_end = planning_window_from_values(
@@ -3949,15 +4485,40 @@ async def update_job(job_id: int, data: dict, request: Request):
                     sets.append("planned_end_at=%s"); vals.append(planning_end)
             for k in ["job_title","job_status","start_date_planned","calendar_sync_enabled"]:
                 if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
-            if not sets: raise HTTPException(400)
-            sets.append("updated_at=now()"); vals.append(job_id)
-            cur.execute(f"UPDATE jobs SET {','.join(sets)} WHERE id=%s AND deleted_at IS NULL",vals)
-            log_activity(conn,"job",job_id,"update",f"Zakazka upravena: {list(data.keys())}")
+            if not sets:
+                raise HTTPException(400)
+            sets.append("updated_at=now()"); vals.extend([tid, job_id])
+            cur.execute(f"UPDATE jobs SET {','.join(sets)} WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL",vals)
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Job not found")
+            validation = validate_job_hierarchy(conn, tid, job_id)
+            if not validation["valid"]:
+                raise HTTPException(422, f"Job hierarchy invalid: {', '.join(validation['issues'])}")
+            cur.execute("""
+                UPDATE jobs
+                SET hierarchy_status='valid', updated_at=now()
+                WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
+            """, (tid, job_id))
+            log_activity(
+                conn,
+                "job",
+                job_id,
+                "update",
+                f"Zakazka upravena: {list(data.keys())}",
+                tenant_id=tid,
+                user_id=actor_user_id,
+                source_channel="crm",
+            )
             conn.commit()
         return {"status":"updated"}
-    except HTTPException: raise
-    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
-    finally: release_conn(conn)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500,str(e))
+    finally:
+        release_conn(conn)
 
 # ========== REST API: TASKS ==========
 @app.get("/crm/tasks")
@@ -3979,34 +4540,57 @@ async def get_tasks(request: Request, status: Optional[str]=None, client_id: Opt
 async def api_create_task(data: dict, request: Request):
     conn = get_db_conn()
     try:
-        task_id = data.get("id",str(uuid.uuid4()))
         tenant_id = get_request_tenant_id(request)
-        assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, data.get("assigned_user_id"), data.get("assigned_to"))
-        planning_start, planning_end = planning_window_from_values(
-            data.get("planned_start_at"), data.get("planned_end_at"), data.get("planned_date") or data.get("deadline")
+        actor_user_id = request.state.user.get("user_id")
+        actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
+        task = create_workflow_task(
+            conn,
+            tenant_id,
+            data,
+            actor_name=actor_name,
+            default_client_id=data.get("client_id"),
+            default_client_name=data.get("client_name"),
+            default_job_id=data.get("job_id"),
+            default_property_id=data.get("property_id"),
+            default_property_address=data.get("property_address"),
+            source=data.get("source") or "manualne",
         )
+        if data.get("set_as_next_action") is True:
+            if task.get("job_id"):
+                set_job_next_action(conn, tenant_id, int(task["job_id"]), str(task["id"]))
+            elif task.get("client_id"):
+                set_client_next_action(conn, tenant_id, int(task["client_id"]), str(task["id"]))
+            else:
+                raise HTTPException(422, "set_as_next_action requires client_id or job_id")
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO tasks (id,title,description,task_type,status,priority,deadline,planned_date,
-                planned_start_at,planned_end_at,estimated_minutes,created_by,assigned_to,assigned_user_id,
-                planning_note,reminder_for_assignee_only,delegated_by,client_id,client_name,job_id,property_id,property_address,
-                is_recurring,recurrence_rule,communication_method,source,is_billable,has_cost,checklist,calendar_sync_enabled,tenant_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
-                (task_id,data.get("title",""),data.get("description"),data.get("task_type","interni_poznamka"),
-                 data.get("status","novy"),data.get("priority","bezna"),data.get("deadline"),data.get("planned_date"),
-                 planning_start, planning_end,
-                 data.get("estimated_minutes"),data.get("created_by","Marek"),assigned_to,assigned_user_id,
-                 data.get("planning_note"),data.get("reminder_for_assignee_only", True),data.get("delegated_by"),
-                 data.get("client_id"),data.get("client_name"),data.get("job_id"),data.get("property_id"),
-                 data.get("property_address"),data.get("is_recurring",False),data.get("recurrence_rule"),
-                 data.get("communication_method"),data.get("source","manualne"),
-                 data.get("is_billable",False),data.get("has_cost",False),json.dumps(data.get("checklist",[])),
-                 data.get("calendar_sync_enabled", True),tenant_id))
-            task = dict(cur.fetchone())
-            log_activity(conn,"task",task_id,"create",f"Ukol '{data.get('title','')}' vytvoren")
+            if task.get("job_id"):
+                validation = validate_job_hierarchy(conn, tenant_id, int(task["job_id"]))
+                if not validation["valid"] and data.get("set_as_next_action") is True:
+                    raise HTTPException(422, f"Job hierarchy invalid: {', '.join(validation['issues'])}")
+            elif task.get("client_id"):
+                validation = validate_client_hierarchy(conn, tenant_id, int(task["client_id"]))
+                if not validation["valid"] and data.get("set_as_next_action") is True:
+                    raise HTTPException(422, f"Client hierarchy invalid: {', '.join(validation['issues'])}")
+            log_activity(
+                conn,
+                "task",
+                task["id"],
+                "create",
+                f"Ukol '{data.get('title','')}' vytvoren",
+                tenant_id=tenant_id,
+                user_id=actor_user_id,
+                source_channel="crm",
+            )
             conn.commit()
         return task
-    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
-    finally: release_conn(conn)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500,str(e))
+    finally:
+        release_conn(conn)
 
 @app.put("/crm/tasks/{task_id}")
 async def update_task(task_id: str, data: dict, request: Request):
@@ -4014,31 +4598,91 @@ async def update_task(task_id: str, data: dict, request: Request):
     try:
         sets = []; vals = []
         tenant_id = get_request_tenant_id(request)
+        actor_user_id = request.state.user.get("user_id")
+        actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
+        current_task = get_task_row(conn, tenant_id, task_id)
+        if not current_task:
+            raise HTTPException(404, "Task not found")
+        new_assigned_user_id = current_task.get("assigned_user_id")
+        new_assigned_to = current_task.get("assigned_to")
         if "assigned_user_id" in data or "assigned_to" in data:
             assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, data.get("assigned_user_id"), data.get("assigned_to"))
+            assignee = validate_active_user(conn, tenant_id, assigned_user_id, "task assignee")
             sets.append("assigned_to=%s"); vals.append(assigned_to)
-            sets.append("assigned_user_id=%s"); vals.append(assigned_user_id)
-            sets.append("delegated_by=%s"); vals.append(get_user_display_name(conn, tenant_id, request.state.user.get("user_id")))
+            sets.append("assigned_user_id=%s"); vals.append(int(assignee["id"]))
+            sets.append("delegated_by=%s"); vals.append(actor_name)
+            new_assigned_user_id = int(assignee["id"])
+            new_assigned_to = assigned_to
+        else:
+            validate_active_user(conn, tenant_id, current_task.get("assigned_user_id"), "task assignee")
+        merged_planning_payload = {
+            "planned_start_at": data.get("planned_start_at", current_task.get("planned_start_at")),
+            "planned_end_at": data.get("planned_end_at", current_task.get("planned_end_at")),
+            "planned_date": data.get("planned_date", current_task.get("planned_date")),
+            "deadline": data.get("deadline", current_task.get("deadline")),
+        }
+        planning_start, planning_end, deadline = validate_task_planning(merged_planning_payload)
         if "planned_start_at" in data or "planned_end_at" in data or "planned_date" in data or "deadline" in data:
-            planning_start, planning_end = planning_window_from_values(
-                data.get("planned_start_at"), data.get("planned_end_at"), data.get("planned_date") or data.get("deadline")
-            )
             if "planned_start_at" in data or "planned_date" in data or "deadline" in data:
                 sets.append("planned_start_at=%s"); vals.append(planning_start)
             if "planned_end_at" in data or "planned_start_at" in data:
                 sets.append("planned_end_at=%s"); vals.append(planning_end)
+            if "deadline" in data:
+                sets.append("deadline=%s"); vals.append(deadline)
         for k in ["title","description","task_type","status","priority","deadline","result","is_completed","actual_minutes","planned_date","planning_note","reminder_for_assignee_only","calendar_sync_enabled"]:
-            if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
-        if "notes" in data: sets.append("notes=%s"); vals.append(json.dumps(data["notes"]))
-        if "checklist" in data: sets.append("checklist=%s"); vals.append(json.dumps(data["checklist"]))
-        sets.append("updated_at=now()"); vals.append(task_id)
+            if k in data and not (k == "deadline" and ("planned_start_at" in data or "planned_end_at" in data or "planned_date" in data or "deadline" in data)):
+                sets.append(f"{k}=%s"); vals.append(data[k])
+        if "notes" in data:
+            sets.append("notes=%s"); vals.append(json.dumps(data["notes"]))
+        if "checklist" in data:
+            sets.append("checklist=%s"); vals.append(json.dumps(data["checklist"]))
+        will_close = bool(data.get("is_completed") is True or data.get("status") in ("hotovo", "zruseno"))
+        links = get_task_next_action_links(conn, tenant_id, task_id)
+        if will_close and links:
+            replace_next_action_links(
+                conn,
+                tenant_id,
+                current_task,
+                replacement_task_id=data.get("replacement_task_id"),
+                replacement_task_payload=data.get("replacement_task_payload"),
+                actor_user_id=actor_user_id,
+                actor_name=actor_name,
+            )
+        if not sets:
+            raise HTTPException(400, "No changes provided")
+        sets.append("updated_at=now()"); vals.extend([tenant_id, task_id])
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=%s",vals)
-            log_activity(conn,"task",task_id,"update",f"Ukol upraven: {list(data.keys())}")
+            cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE tenant_id=%s AND id=%s",vals)
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Task not found")
+            for link in links:
+                validation = (
+                    validate_client_hierarchy(conn, tenant_id, int(link["entity_id"]))
+                    if link["entity_type"] == "client"
+                    else validate_job_hierarchy(conn, tenant_id, int(link["entity_id"]))
+                )
+                if not validation["valid"]:
+                    raise HTTPException(422, f"{link['entity_type'].capitalize()} hierarchy invalid: {', '.join(validation['issues'])}")
+            log_activity(
+                conn,
+                "task",
+                task_id,
+                "update",
+                f"Ukol upraven: {list(data.keys())}",
+                tenant_id=tenant_id,
+                user_id=actor_user_id,
+                source_channel="crm",
+            )
             conn.commit()
         return {"status":"updated"}
-    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
-    finally: release_conn(conn)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500,str(e))
+    finally:
+        release_conn(conn)
 
 @app.get("/crm/calendar-feed")
 async def get_calendar_feed(request: Request, days: int = 30):
@@ -4088,15 +4732,37 @@ async def get_calendar_feed(request: Request, days: int = 30):
         release_conn(conn)
 
 @app.delete("/crm/tasks/{task_id}")
-async def delete_task(task_id: str):
+async def delete_task(task_id: str, request: Request):
     conn = get_db_conn()
     try:
+        tenant_id = get_request_tenant_id(request)
+        actor_user_id = request.state.user.get("user_id")
+        if get_task_next_action_links(conn, tenant_id, task_id):
+            raise HTTPException(422, "Current next action task cannot be deleted")
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM tasks WHERE id=%s",(task_id,))
-            log_activity(conn,"task",task_id,"delete","Ukol smazan")
+            cur.execute("DELETE FROM tasks WHERE tenant_id=%s AND id=%s",(tenant_id, task_id))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Task not found")
+            log_activity(
+                conn,
+                "task",
+                task_id,
+                "delete",
+                "Ukol smazan",
+                tenant_id=tenant_id,
+                user_id=actor_user_id,
+                source_channel="crm",
+            )
             conn.commit()
         return {"status":"deleted"}
-    finally: release_conn(conn)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
 
 # ========== REST API: LEADS ==========
 @app.get("/crm/leads")
@@ -5994,6 +6660,22 @@ async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(requi
             if "phone" in data:
                 updates.append("phone=%s"); params.append(data["phone"])
             if "status" in data and data["status"] in ("active","inactive"):
+                if data["status"] == "inactive":
+                    blockers = get_user_deactivation_blockers(conn, admin["tenant_id"], user_id)
+                    if blockers["has_blockers"]:
+                        log_activity(
+                            conn,
+                            "user",
+                            user_id,
+                            "blocked_deactivation",
+                            f"Blocked user deactivation for {user_id}",
+                            tenant_id=admin["tenant_id"],
+                            user_id=admin["user_id"],
+                            source_channel="settings",
+                            details=blockers,
+                        )
+                        conn.commit()
+                        raise HTTPException(422, "User cannot be deactivated while holding active hierarchy responsibilities")
                 updates.append("status=%s"); params.append(data["status"])
             if "role" in data:
                 cur.execute("SELECT id FROM roles WHERE role_name=%s", (data["role"],))
@@ -6049,7 +6731,22 @@ async def auth_delete_user(user_id: int, admin: dict = Depends(require_permissio
             cur.execute("SELECT id FROM users WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL",
                 (user_id, admin["tenant_id"]))
             if not cur.fetchone(): raise HTTPException(404, "User not found")
-            cur.execute("UPDATE users SET deleted_at=now(), status='inactive' WHERE id=%s", (user_id,))
+            blockers = get_user_deactivation_blockers(conn, admin["tenant_id"], user_id)
+            if blockers["has_blockers"]:
+                log_activity(
+                    conn,
+                    "user",
+                    user_id,
+                    "blocked_delete",
+                    f"Blocked user delete for {user_id}",
+                    tenant_id=admin["tenant_id"],
+                    user_id=admin["user_id"],
+                    source_channel="settings",
+                    details=blockers,
+                )
+                conn.commit()
+                raise HTTPException(422, "User cannot be deleted while holding active hierarchy responsibilities")
+            cur.execute("UPDATE users SET deleted_at=now(), status='inactive' WHERE id=%s AND tenant_id=%s", (user_id, admin["tenant_id"]))
             log_activity(conn, "user", user_id, "delete_user", f"Deleted user {user_id}", tenant_id=admin["tenant_id"], user_id=admin["user_id"], source_channel="settings")
             conn.commit()
         return {"ok": True}
