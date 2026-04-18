@@ -796,6 +796,31 @@ def flatten_mushroom_bool(value) -> Optional[bool]:
                 return parsed
     return None
 
+def extract_mushroom_suggestions(raw) -> List[dict]:
+    candidates = []
+    if isinstance(raw, dict):
+        result = raw.get("result")
+        if isinstance(result, dict):
+            classification = result.get("classification")
+            if isinstance(classification, dict):
+                suggestions = classification.get("suggestions")
+                if isinstance(suggestions, list):
+                    candidates.extend([item for item in suggestions if isinstance(item, dict)])
+            suggestions = result.get("suggestions")
+            if isinstance(suggestions, list):
+                candidates.extend([item for item in suggestions if isinstance(item, dict)])
+        classification = raw.get("classification")
+        if isinstance(classification, dict):
+            suggestions = classification.get("suggestions")
+            if isinstance(suggestions, list):
+                candidates.extend([item for item in suggestions if isinstance(item, dict)])
+        suggestions = raw.get("suggestions")
+        if isinstance(suggestions, list):
+            candidates.extend([item for item in suggestions if isinstance(item, dict)])
+    if isinstance(raw, list):
+        candidates.extend([item for item in raw if isinstance(item, dict)])
+    return candidates
+
 def flatten_plant_list(value) -> List[str]:
     items: List[str] = []
 
@@ -1345,7 +1370,7 @@ def map_plant_health_result(raw: dict, language: str) -> dict:
     }
 
 def map_mushroom_result(raw: dict, language: str) -> dict:
-    suggestions_raw = (((raw.get("result") or {}).get("classification") or {}).get("suggestions")) or []
+    suggestions_raw = extract_mushroom_suggestions(raw)
     if not suggestions_raw:
         raise HTTPException(404, tr_lang(
             language,
@@ -1355,29 +1380,42 @@ def map_mushroom_result(raw: dict, language: str) -> dict:
         ))
 
     def mushroom_suggestion(item: dict) -> dict:
-        details = item.get("details") or {}
-        taxonomy = details.get("taxonomy") or {}
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        taxonomy = details.get("taxonomy") if isinstance(details.get("taxonomy"), dict) else {}
         common_names = flatten_mushroom_list(details.get("common_names"))
         look_alikes = flatten_mushroom_list(details.get("look_alikes"))
         characteristics = flatten_mushroom_list(details.get("characteristics"))
-        name = item.get("name") or ""
+        name = (
+            item.get("name")
+            or flatten_mushroom_text(details.get("scientific_name"))
+            or flatten_mushroom_text(details.get("name"))
+            or ""
+        )
         display_name = common_names[0] if common_names else name
         return {
             "name": name,
             "display_name": display_name,
             "common_names": common_names,
-            "probability": float(item.get("probability") or 0.0),
+            "probability": normalize_plant_score(item.get("probability") or item.get("score")),
             "description": flatten_mushroom_text(details.get("description")),
             "url": flatten_mushroom_text(details.get("url")),
-            "edibility": flatten_mushroom_text(details.get("edibility")),
-            "psychoactive": flatten_mushroom_bool(details.get("psychoactive")),
+            "edibility": flatten_mushroom_text(details.get("edibility") or details.get("edible")),
+            "psychoactive": flatten_mushroom_bool(details.get("psychoactive") or details.get("is_psychoactive")),
             "family": flatten_mushroom_text(taxonomy.get("family")),
             "genus": flatten_mushroom_text(taxonomy.get("genus")),
             "look_alikes": look_alikes,
             "characteristics": characteristics,
         }
 
-    suggestions = [mushroom_suggestion(item) for item in suggestions_raw[:5]]
+    suggestions = [mushroom_suggestion(item) for item in suggestions_raw[:5] if isinstance(item, dict)]
+    suggestions = [item for item in suggestions if item.get("name") or item.get("display_name")]
+    if not suggestions:
+        raise HTTPException(404, tr_lang(
+            language,
+            "No usable mushroom match was returned. Try clearer photos of the whole mushroom, underside, and stem or base.",
+            "Nebyla vrácena použitelná shoda houby. Zkus jasnější fotky celé houby, spodní strany a třeně nebo báze.",
+            "Nie zwrócono użytecznego dopasowania grzyba. Spróbuj wyraźniejszych zdjęć całego grzyba, spodu oraz trzonu lub podstawy."
+        ))
     top = suggestions[0]
     guidance, spoken = build_mushroom_guidance(
         language,
@@ -6277,34 +6315,47 @@ async def identify_mushroom(
             "Obsługiwanych jest maksymalnie 5 zdjęć."
         ))
     mushroom_raw = await mushroom_identify(images, language or "en")
-    result = map_mushroom_result(mushroom_raw, language or "en")
+    try:
+        result = map_mushroom_result(mushroom_raw, language or "en")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, tr_lang(
+            language,
+            f"Mushroom recognition response could not be processed: {exc}",
+            f"Odpověď rozpoznávání houby nešla zpracovat: {exc}",
+            f"Nie udało się przetworzyć odpowiedzi rozpoznawania grzyba: {exc}"
+        ))
     history_photos = await build_history_photos(images)
     conn = get_db_conn()
     try:
-        store_nature_history(
-            conn,
-            tenant_id,
-            user.get("user_id"),
-            "mushroom_identification",
-            language or "en",
-            result,
-            history_photos,
-            captured_at=captured_at,
-            latitude=latitude,
-            longitude=longitude,
-            accuracy_meters=accuracy_meters,
-            location_source=location_source,
-        )
-        log_activity(
-            conn,
-            "mushroom_identification",
-            uuid.uuid4().hex[:12],
-            "identify",
-            f"Mushroom identified as {result['scientific_name'] or result['display_name']}",
-            tenant_id=tenant_id,
-            user_id=user.get("user_id"),
-        )
-        conn.commit()
+        try:
+            store_nature_history(
+                conn,
+                tenant_id,
+                user.get("user_id"),
+                "mushroom_identification",
+                language or "en",
+                result,
+                history_photos,
+                captured_at=captured_at,
+                latitude=latitude,
+                longitude=longitude,
+                accuracy_meters=accuracy_meters,
+                location_source=location_source,
+            )
+            log_activity(
+                conn,
+                "mushroom_identification",
+                uuid.uuid4().hex[:12],
+                "identify",
+                f"Mushroom identified as {result['scientific_name'] or result['display_name']}",
+                tenant_id=tenant_id,
+                user_id=user.get("user_id"),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
     finally:
         release_conn(conn)
     return result
