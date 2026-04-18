@@ -1816,6 +1816,14 @@ def resolve_response_language(config, request_lang=None):
         return config.get("default_internal_lang", "en")
     return "en"
 
+def resolve_customer_language(config, request_lang=None):
+    """Determine default outgoing customer language."""
+    if request_lang:
+        return normalize_language_code(request_lang, default="en")
+    if config.get("found"):
+        return normalize_language_code(config.get("default_customer_lang", "en"), default="en")
+    return "en"
+
 def resolve_voice_language(config, request_lang=None):
     """Determine voice session language from config."""
     if request_lang and request_lang != "en":
@@ -3085,6 +3093,14 @@ def normalize_phone(phone: Optional[str]) -> str:
     raw = (phone or "").strip()
     return "".join(ch for ch in raw if ch.isdigit())
 
+def normalize_whatsapp_phone(phone: Optional[str]) -> str:
+    digits = normalize_phone(phone)
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0") and len(digits) == 11:
+        digits = "44" + digits[1:]
+    return digits
+
 def normalize_contact_phone(phone: Optional[str]) -> str:
     digits = normalize_phone(phone)
     if digits.startswith("00"):
@@ -3431,6 +3447,7 @@ RULES:
 - When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report.
 - When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather.
 - When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Find client by name, get their phone, send message.
+- For send_whatsapp: if the user dictates the message in Czech or Polish, keep the meaning but send it in the default customer language. Default customer language is usually English unless the user explicitly requests another language.
 - When user asks about clients database, how many clients, client statistics, sources, types, or any question about CRM data, use query_clients. Examples: 'kolik mam klientu', 'odkud jsou klienti', 'jaci klienti jsou aktivni', 'kolik mam zakazek', 'statistiky', 'prehled databaze'."""
 
         tools = [
@@ -3452,7 +3469,7 @@ RULES:
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
             {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
             {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: Didcot, Oxfordshire"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
-            {"type":"function","function":{"name":"send_whatsapp","description":"Posle WhatsApp zpravu klientovi. Pouzij kdyz uzivatel rekne 'napis na whatsapp', 'posli whatsapp zpravu', 'whatsapp message'.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["client_name","message"]}}},
+            {"type":"function","function":{"name":"send_whatsapp","description":"Posle WhatsApp zpravu klientovi. Pouzij kdyz uzivatel rekne 'napis na whatsapp', 'posli whatsapp zpravu', 'whatsapp message'. Pokud uzivatel rekne jiny jazyk, vypln language.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta"},"message":{"type":"string","description":"Text zpravy k odeslani"},"language":{"type":"string","description":"Cilovy jazyk zpravy pro klienta, napr. en, cs, pl"}},"required":["client_name","message"]}}},
             {"type":"function","function":{"name":"query_clients","description":"Dotaz na databazi klientu. Pouzij kdyz se uzivatel pta kolik ma klientu, odkud jsou, jake typy, statistiky CRM, prehled databaze, aktivni/neaktivni klienti, zdroje klientu.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"Co chce uzivatel vedet o klientech/databazi. Napr: 'kolik klientu', 'statistiky', 'odkud jsou klienti', 'aktivni klienti', 'posledni klienti'"}},"required":["question"]}}},
         ]
 
@@ -3801,10 +3818,14 @@ RULES:
             if action == "SEND_WHATSAPP":
                 client_name = args.get("client_name","")
                 message = args.get("message","")
+                requested_language = args.get("language") or msg.external_language
                 conn = get_db_conn()
                 try:
+                    tenant_id = get_request_tenant_id(request)
+                    tenant_config = get_tenant_config(conn, tenant_id)
+                    outgoing_language = resolve_customer_language(tenant_config, requested_language)
                     with conn.cursor() as cur:
-                        cur.execute("SELECT id,display_name,phone_primary FROM clients WHERE display_name ILIKE %s AND deleted_at IS NULL LIMIT 1", (f"%{client_name}%",))
+                        cur.execute("SELECT id,display_name,phone_primary FROM clients WHERE tenant_id=%s AND display_name ILIKE %s AND deleted_at IS NULL LIMIT 1", (tenant_id, f"%{client_name}%",))
                         client = cur.fetchone()
                     if not client:
                         release_conn(conn)
@@ -3821,20 +3842,25 @@ RULES:
                             f"Klient {client['display_name']} nemá telefonní číslo.",
                             f"Klient {client['display_name']} nie ma numeru telefonu."
                         )}
-                    result = wa_send_message(phone, message)
+                    result = wa_send_message(phone, message, outgoing_language)
                     if "error" in result:
                         extra_hint = f" {result.get('config_hint')}" if result.get("config_hint") else ""
+                        detail_hint = ""
+                        meta_error = result.get("meta_error")
+                        if isinstance(meta_error, dict) and meta_error.get("message"):
+                            detail_hint = f" {meta_error.get('message')}"
                         release_conn(conn)
                         return {"reply_cs": tr(
-                            f"WhatsApp could not be sent: {result.get('error','')}.{extra_hint}",
-                            f"WhatsApp se nepodařilo odeslat: {result.get('error','')}.{extra_hint}",
-                            f"Nie udało się wysłać WhatsApp: {result.get('error','')}.{extra_hint}"
+                            f"WhatsApp could not be sent: {result.get('error','')}.{detail_hint}{extra_hint}",
+                            f"WhatsApp se nepodařilo odeslat: {result.get('error','')}.{detail_hint}{extra_hint}",
+                            f"Nie udało się wysłać WhatsApp: {result.get('error','')}.{detail_hint}{extra_hint}"
                         )}
+                    translated = result.get("translated_text", message)
                     with conn.cursor() as cur:
                         cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                            VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
-                            (client["id"], message[:500], f"To: {phone}"))
-                    log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']}: {message[:100]}")
+                            VALUES (%s,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
+                            (tenant_id, client["id"], translated[:500], f"To: {phone} | Original: {message[:200]} | Language: {outgoing_language}"))
+                    log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']} ({outgoing_language}): {translated[:100]}", tenant_id=tenant_id)
                     conn.commit()
                     return {"reply_cs": tr(
                         f"✅ WhatsApp message sent to {client['display_name']} at {phone}.",
@@ -8241,8 +8267,8 @@ async def create_pricing_rule(data: dict):
 
 # ========== WHATSAPP CLOUD API ==========
 
-def wa_send_message(to_phone: str, message: str):
-    """Send WhatsApp message via Cloud API. Auto-translates to English."""
+def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
+    """Send WhatsApp message via Cloud API. By default translates to customer language."""
     if not WA_TOKEN or not WA_PHONE_ID:
         return {
             "error": "WhatsApp not configured",
@@ -8252,19 +8278,34 @@ def wa_send_message(to_phone: str, message: str):
                 "WHATSAPP_PHONE_NUMBER_ID": not bool(WA_PHONE_ID),
             },
         }
-    # Auto-translate to English using GPT
+    normalized_phone = normalize_whatsapp_phone(to_phone)
+    if len(normalized_phone) < 8:
+        return {
+            "error": "Invalid WhatsApp phone number",
+            "meta_status": 400,
+            "detail": f"Phone '{to_phone}' could not be normalized to a valid international number.",
+        }
+
+    normalized_target_language = normalize_language_code(target_language, default="en")
     translated = message
     if ai_client:
         try:
+            target_label = {
+                "en": "English",
+                "cs": "Czech",
+                "pl": "Polish",
+            }.get(normalized_target_language, "English")
             tr = ai_client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role":"system","content":"Translate the following message to English. Return ONLY the translation, nothing else. If already in English, return as-is."},
+                {"role":"system","content":f"Translate the following customer message to {target_label}. Return ONLY the translated message, nothing else. Preserve meaning and tone. If already in {target_label}, return it as-is."},
                 {"role":"user","content":message}
             ], max_tokens=500)
             translated = tr.choices[0].message.content.strip()
-        except: translated = message
+        except:
+            translated = message
     payload = json.dumps({
         "messaging_product": "whatsapp",
-        "to": to_phone.replace("+","").replace(" ",""),
+        "recipient_type": "individual",
+        "to": normalized_phone,
         "type": "text",
         "text": {"body": translated}
     }).encode("utf-8")
@@ -8275,6 +8316,8 @@ def wa_send_message(to_phone: str, message: str):
             result = json.loads(resp.read().decode())
             result["translated_text"] = translated
             result["original_text"] = message
+            result["target_language"] = normalized_target_language
+            result["normalized_phone"] = normalized_phone
             return result
     except urllib.error.HTTPError as e:
         body = e.read().decode()
@@ -8290,6 +8333,9 @@ def wa_send_message(to_phone: str, message: str):
             human_error = "WhatsApp authorization failed"
         elif e.code == 403:
             human_error = "WhatsApp access forbidden"
+        elif e.code == 400 and meta_error:
+            meta_message = meta_error.get("message") if isinstance(meta_error, dict) else None
+            human_error = f"WhatsApp rejected the request: {meta_message or 'invalid request'}"
         return {
             "error": human_error,
             "meta_status": e.code,
@@ -8369,23 +8415,30 @@ async def wa_send(request: Request, data: dict):
     to = data.get("to", "")
     message = data.get("message", "")
     client_id = data.get("client_id")
+    tenant_id = get_request_tenant_id(request)
     if not to or not message:
         raise HTTPException(400, "to and message required")
-    result = wa_send_message(to, message)
+    conn = get_db_conn()
+    try:
+        tenant_config = get_tenant_config(conn, tenant_id)
+        outgoing_language = resolve_customer_language(tenant_config, data.get("language"))
+    finally:
+        release_conn(conn)
+    result = wa_send_message(to, message, outgoing_language)
     if "error" in result:
-        status_code = 500 if result.get("config_error") else 502
+        status_code = 500 if result.get("config_error") else (result.get("meta_status") or 502)
         raise HTTPException(status_code, result)
     conn = get_db_conn()
     try:
         translated = result.get("translated_text", message)
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
-                (client_id, translated[:500], f"To: {to} | Original: {message[:200]}"))
-        log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to}: {translated[:100]}")
+                VALUES (%s,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
+                (tenant_id, client_id, translated[:500], f"To: {to} | Original: {message[:200]} | Language: {outgoing_language}"))
+        log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to} ({outgoing_language}): {translated[:100]}", tenant_id=tenant_id)
         conn.commit()
     finally: release_conn(conn)
-    return {"status": "sent", "translated": translated, "original": message}
+    return {"status": "sent", "translated": translated, "original": message, "language": outgoing_language}
 
 @app.get("/whatsapp/status")
 async def wa_status():
