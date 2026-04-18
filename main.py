@@ -2,7 +2,7 @@
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -502,6 +502,9 @@ WA_PHONE_ID = env_first("WHATSAPP_PHONE_NUMBER_ID", "WA_PHONE_ID", "META_WHATSAP
 WA_ACCOUNT_ID = env_first("WHATSAPP_BUSINESS_ACCOUNT_ID", "WA_ACCOUNT_ID", "META_WHATSAPP_BUSINESS_ACCOUNT_ID")
 WA_TOKEN = env_first("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOKEN")
 WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="designleaf_webhook_2026")
+TWILIO_ACCOUNT_SID = env_first("TWILIO_ACCOUNT_SID", "TWILIO_SID")
+TWILIO_AUTH_TOKEN = env_first("TWILIO_AUTH_TOKEN", "TWILIO_TOKEN")
+TWILIO_WHATSAPP_FROM = env_first("TWILIO_WHATSAPP_FROM", "TWILIO_WHATSAPP_NUMBER", "TWILIO_WHATSAPP_SENDER")
 PLANTNET_API_KEY = env_first(
     "PLANTNET_API_KEY",
     "PLANTNET_KEY",
@@ -550,6 +553,16 @@ MUSHROOM_ID_API_URL = normalize_kindwise_endpoint(MUSHROOM_ID_API_URL, "/identif
 
 def get_wa_api_url() -> str:
     return f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
+
+def get_twilio_messages_api_url() -> str:
+    return f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+
+def get_whatsapp_provider() -> str:
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM:
+        return "twilio"
+    if WA_TOKEN and WA_PHONE_ID:
+        return "meta"
+    return "none"
 
 def get_nature_service_status() -> dict:
     return {
@@ -8358,14 +8371,18 @@ async def create_pricing_rule(data: dict):
 # ========== WHATSAPP CLOUD API ==========
 
 def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
-    """Send WhatsApp message via Cloud API. By default translates to customer language."""
-    if not WA_TOKEN or not WA_PHONE_ID:
+    """Send WhatsApp message via configured provider. By default translates to customer language."""
+    provider = get_whatsapp_provider()
+    if provider == "none":
         return {
             "error": "WhatsApp not configured",
             "config_error": True,
             "missing": {
                 "WHATSAPP_ACCESS_TOKEN": not bool(WA_TOKEN),
                 "WHATSAPP_PHONE_NUMBER_ID": not bool(WA_PHONE_ID),
+                "TWILIO_ACCOUNT_SID": not bool(TWILIO_ACCOUNT_SID),
+                "TWILIO_AUTH_TOKEN": not bool(TWILIO_AUTH_TOKEN),
+                "TWILIO_WHATSAPP_FROM": not bool(TWILIO_WHATSAPP_FROM),
             },
         }
     normalized_phone = normalize_whatsapp_phone(to_phone)
@@ -8392,6 +8409,59 @@ def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
             translated = tr.choices[0].message.content.strip()
         except:
             translated = message
+    if provider == "twilio":
+        sender = TWILIO_WHATSAPP_FROM.strip()
+        if not sender.startswith("whatsapp:"):
+            sender = f"whatsapp:{sender}"
+        form = urlencode({
+            "To": f"whatsapp:+{normalized_phone}",
+            "From": sender,
+            "Body": translated,
+        }).encode("utf-8")
+        basic_auth = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")).decode("ascii")
+        req = urllib.request.Request(
+            get_twilio_messages_api_url(),
+            data=form,
+            method="POST",
+            headers={
+                "Authorization": f"Basic {basic_auth}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                result = json.loads(resp.read().decode())
+                result["translated_text"] = translated
+                result["original_text"] = message
+                result["target_language"] = normalized_target_language
+                result["normalized_phone"] = normalized_phone
+                result["provider"] = "twilio"
+                return result
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            twilio_error = None
+            try:
+                twilio_error = json.loads(body)
+            except Exception:
+                twilio_error = None
+            human_error = "Twilio WhatsApp request failed"
+            if e.code == 401:
+                human_error = "Twilio authorization failed"
+            elif e.code == 403:
+                human_error = "Twilio access forbidden"
+            elif e.code == 400 and isinstance(twilio_error, dict):
+                human_error = f"Twilio rejected the request: {twilio_error.get('message') or 'invalid request'}"
+            return {
+                "error": human_error,
+                "meta_status": e.code,
+                "detail": body,
+                "meta_error": twilio_error,
+                "provider": "twilio",
+                "config_hint": "Check Railway env vars TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM." if e.code in (400, 401, 403) else None,
+            }
+        except Exception as e:
+            return {"error": str(e), "provider": "twilio"}
+
     payload = json.dumps({
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -8408,10 +8478,10 @@ def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
             result["original_text"] = message
             result["target_language"] = normalized_target_language
             result["normalized_phone"] = normalized_phone
+            result["provider"] = "meta"
             return result
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        detail = body
         meta_error = None
         try:
             parsed = json.loads(body)
@@ -8429,12 +8499,13 @@ def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
         return {
             "error": human_error,
             "meta_status": e.code,
-            "detail": detail,
+            "detail": body,
             "meta_error": meta_error,
+            "provider": "meta",
             "config_hint": "Check Railway env vars WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID." if e.code in (401, 403) else None,
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "provider": "meta"}
 
 def wa_find_client_by_phone(conn, phone: str):
     """Find CRM client by phone number"""
@@ -8533,10 +8604,13 @@ async def wa_send(request: Request, data: dict):
 @app.get("/whatsapp/status")
 async def wa_status():
     return {
-        "configured": bool(WA_TOKEN and WA_PHONE_ID),
+        "configured": get_whatsapp_provider() != "none",
+        "provider": get_whatsapp_provider(),
         "phone_id": WA_PHONE_ID[:6]+"..." if WA_PHONE_ID else None,
         "business_account_id": WA_ACCOUNT_ID[:6]+"..." if WA_ACCOUNT_ID else None,
         "token_present": bool(WA_TOKEN),
+        "twilio_account_sid": TWILIO_ACCOUNT_SID[:6]+"..." if TWILIO_ACCOUNT_SID else None,
+        "twilio_sender": TWILIO_WHATSAPP_FROM or None,
     }
 
 # ========== SYSTEM ==========
