@@ -7465,18 +7465,19 @@ def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_
     return defaults.get(rule_type, 0.0)
 
 # ========== DIALOG STATE MACHINE ==========
-DIALOG_STEPS = ["client","client_create_name","workers","total_hours","entries","validate_hours","waste","materials","notes","summary","confirm"]
+DIALOG_STEPS = ["client","client_create_name","date","workers","total_hours","entries","validate_hours","waste","materials","notes","summary","confirm"]
 VALID_TRANSITIONS = {
-    "client": ["client","client_create_name","workers"],
-    "client_create_name": ["client_create_name","client","workers"],
-    "workers": ["workers","total_hours"],
+    "client": ["client","client_create_name","date"],
+    "client_create_name": ["client_create_name","client","date"],
+    "date": ["date","workers"],
+    "workers": ["workers","date","total_hours"],
     "total_hours": ["total_hours","entries"],
     "entries": ["entries","validate_hours","waste"],
     "validate_hours": ["validate_hours","waste","entries"],
     "materials": ["materials","notes"],
     "waste": ["waste","materials"],
     "notes": ["notes","summary"],
-    "summary": ["summary","confirm","client","workers","total_hours","entries","materials","waste","notes"],
+    "summary": ["summary","confirm","date","client","workers","total_hours","entries","materials","waste","notes"],
     "confirm": ["confirm"],
 }
 def validate_transition(current_step, next_step):
@@ -7484,6 +7485,7 @@ def validate_transition(current_step, next_step):
 DIALOG_PROMPTS = {
     "client": {"en":"Which client did you work for? You can also say 'new client'.","cs":"U kterého klienta jsi pracoval? Můžeš také říct 'nový klient'.","pl":"U którego klienta pracowałeś? Możesz też powiedzieć 'nowy klient'."},
     "client_create_name": {"en":"What is the new client name?","cs":"Jak se jmenuje nový klient?","pl":"Jak nazywa się nowy klient?"},
+    "date": {"en":"Which date is this work report for? Say a date like 2026-04-18 or 18.04.2026.","cs":"Na jaké datum je tento výkaz práce? Řekni datum například 2026-04-18 nebo 18.04.2026.","pl":"Na jaką datę jest ten raport pracy? Powiedz datę na przykład 2026-04-18 albo 18.04.2026."},
     "workers": {"en":"Who worked? (names)","cs":"Kdo pracoval? (jména)","pl":"Kto pracował? (imiona)"},
     "total_hours": {"en":"How many hours total?","cs":"Kolik hodin celkem?","pl":"Ile godzin łącznie?"},
     "entries": {"en":"How many hours pruning?","cs":"Kolik hodin prořez?","pl":"Ile godzin przycinanie?"},
@@ -7491,8 +7493,8 @@ DIALOG_PROMPTS = {
     "materials": {"en":"Any materials used? (name, quantity, price) or 'no'","cs":"Použili jste materiál? (název, množství, cena) nebo 'ne'","pl":"Czy użyto materiałów? (nazwa, ilość, cena) lub 'nie'"},
     "waste": {"en":"How many bulk bags of waste? (number or 'none')","cs":"Kolik pytlů odpadu? (číslo nebo 'žádný')","pl":"Ile worków odpadów? (liczba lub 'żaden')"},
     "notes": {"en":"Any notes? (or 'no')","cs":"Chceš přidat poznámku? (nebo 'ne')","pl":"Chcesz dodać notatkę? (lub 'nie')"},
-    "summary": {"en":"Here is the summary. Say 'confirm' to save or 'edit [field]' to change.","cs":"Tady je shrnutí. Řekni 'potvrdit' pro uložení nebo 'oprav [pole]' pro změnu.","pl":"Oto podsumowanie. Powiedz 'potwierdź' aby zapisać lub 'popraw [pole]' aby zmienić."},
-    "confirm": {"en":"Work report saved.","cs":"Report uložen.","pl":"Raport zapisany."},
+    "summary": {"en":"Here is the day summary. Say 'another day' to add more dates, 'confirm' to save all reports, or 'edit [field]' to change.","cs":"Tady je shrnutí dne. Řekni 'další den' pro přidání dalšího data, 'potvrdit' pro uložení všech reportů nebo 'oprav [pole]' pro změnu.","pl":"Oto podsumowanie dnia. Powiedz 'kolejny dzień', aby dodać następną datę, 'potwierdź', aby zapisać wszystkie raporty, albo 'popraw [pole]', aby coś zmienić."},
+    "confirm": {"en":"Work reports saved.","cs":"Reporty uloženy.","pl":"Raporty zapisane."},
 }
 def get_prompt(step, lang="en"):
     return DIALOG_PROMPTS.get(step,{}).get(lang, DIALOG_PROMPTS.get(step,{}).get("en",""))
@@ -7575,6 +7577,170 @@ def create_voice_work_report_client(conn, tenant_id: int, actor_user_id: int, cl
     )
     return {"id": int(client["id"]), "display_name": client["display_name"], "next_action_task_id": str(next_action["id"])}
 
+WORK_REPORT_DAY_FIELDS = [
+    "work_date", "workers", "total_hours", "entries", "materials", "waste", "notes",
+    "grand_total", "_entry_sub", "_entry_type_name"
+]
+
+def parse_voice_work_date(text: str) -> Optional[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+    if low in {"today", "dnes", "dzisiaj"}:
+        return datetime.now().strftime("%Y-%m-%d")
+    if low in {"yesterday", "vcera", "včera", "wczoraj"}:
+        return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if low in {"tomorrow", "zitra", "zítra", "jutro"}:
+        return (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    cleaned = raw.replace(" ", "")
+    formats = ["%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    for fmt in ("%d.%m.", "%d/%m", "%d-%m"):
+        try:
+            parsed = datetime.strptime(cleaned, fmt)
+            parsed = parsed.replace(year=datetime.now().year)
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+def extract_current_report_day(ctx: dict) -> dict:
+    day = {
+        "client_id": ctx.get("client_id"),
+        "client_name": ctx.get("client_name"),
+        "job_id": ctx.get("job_id"),
+        "work_date": ctx.get("work_date"),
+        "workers": ctx.get("workers") or [],
+        "total_hours": ctx.get("total_hours", 0),
+        "entries": ctx.get("entries") or [],
+        "materials": ctx.get("materials") or [],
+        "waste": ctx.get("waste") or {"qty": 0, "rate": 0, "total": 0},
+        "notes": ctx.get("notes"),
+        "grand_total": ctx.get("grand_total", 0),
+    }
+    return json.loads(json.dumps(day, ensure_ascii=False))
+
+def reset_current_report_day(ctx: dict, work_date: Optional[str] = None):
+    preserved = {
+        "client_id": ctx.get("client_id"),
+        "client_name": ctx.get("client_name"),
+        "job_id": ctx.get("job_id"),
+        "language": ctx.get("language", "en"),
+        "report_days": ctx.get("report_days") or [],
+    }
+    for key in WORK_REPORT_DAY_FIELDS:
+        ctx.pop(key, None)
+    ctx.update(preserved)
+    ctx["work_date"] = work_date or datetime.now().strftime("%Y-%m-%d")
+    return ctx
+
+def append_current_report_day(ctx: dict) -> dict:
+    day = extract_current_report_day(ctx)
+    ctx.setdefault("report_days", []).append(day)
+    return day
+
+def generate_batch_summary(ctx, lang="en"):
+    days = list(ctx.get("report_days") or [])
+    current = extract_current_report_day(ctx)
+    if current.get("entries"):
+        days.append(current)
+    if not days:
+        return generate_summary(ctx, lang)
+    header = (
+        f"Multi-day work report for {ctx.get('client_name', '?')}"
+        if lang == "en" else
+        f"Vícedenní výkaz práce pro {ctx.get('client_name', '?')}"
+        if lang == "cs" else
+        f"Wielodniowy raport pracy dla {ctx.get('client_name', '?')}"
+    )
+    lines = [header]
+    total_hours = 0.0
+    grand_total = 0.0
+    for index, day in enumerate(days, start=1):
+        lines.append("")
+        day_label = (
+            f"Day {index}: {day.get('work_date', '?')}"
+            if lang == "en" else
+            f"Den {index}: {day.get('work_date', '?')}"
+            if lang == "cs" else
+            f"Dzień {index}: {day.get('work_date', '?')}"
+        )
+        lines.append(day_label)
+        lines.append(generate_summary(day, lang))
+        total_hours += float(day.get("total_hours") or 0)
+        grand_total += float(day.get("grand_total") or 0)
+    footer = (
+        f"Combined total: {total_hours:.2f} h, £{grand_total:.2f}"
+        if lang == "en" else
+        f"Celkem: {total_hours:.2f} h, £{grand_total:.2f}"
+        if lang == "cs" else
+        f"Razem: {total_hours:.2f} h, £{grand_total:.2f}"
+    )
+    lines.extend(["", footer])
+    return "\n".join(lines)
+
+def generate_batch_whatsapp(ctx, lang="en"):
+    days = list(ctx.get("report_days") or [])
+    current = extract_current_report_day(ctx)
+    if current.get("entries"):
+        days.append(current)
+    if not days:
+        return generate_whatsapp(ctx)
+    greeting = (
+        f"Hello {ctx.get('client_name','')},\n\nHere is the summary of the work completed across multiple days:\n"
+        if lang == "en" else
+        f"Dobrý den {ctx.get('client_name','')},\n\nTady je shrnutí práce za více dní:\n"
+        if lang == "cs" else
+        f"Dzień dobry {ctx.get('client_name','')},\n\nOto podsumowanie prac z kilku dni:\n"
+    )
+    lines = [greeting]
+    grand_total = 0.0
+    for day in days:
+        lines.append(f"{day.get('work_date')}: £{float(day.get('grand_total') or 0):.2f}")
+        for entry in day.get("entries") or []:
+            lines.append(f"- {entry.get('type','Work')}: {entry.get('hours',0)}h = £{float(entry.get('total') or 0):.2f}")
+        grand_total += float(day.get("grand_total") or 0)
+        lines.append("")
+    lines.append(f"Total: £{grand_total:.2f}")
+    lines.append("\nMarek\nDesignLeaf\n07395 813008")
+    return "\n".join(lines)
+
+def save_voice_work_report_day(conn, tenant_id: int, actor_user_id: Optional[int], day_ctx: dict) -> int:
+    with conn.cursor() as cur:
+        cur.execute("""INSERT INTO work_reports (tenant_id,client_id,job_id,work_date,total_hours,total_price,notes,created_by,input_type,status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'voice','confirmed') RETURNING id""",
+            (
+                tenant_id,
+                day_ctx.get("client_id"),
+                day_ctx.get("job_id"),
+                day_ctx.get("work_date", datetime.now().strftime("%Y-%m-%d")),
+                day_ctx.get("total_hours", 0),
+                day_ctx.get("grand_total", 0),
+                day_ctx.get("notes"),
+                actor_user_id,
+            ))
+        rid = cur.fetchone()['id']
+        for w in day_ctx.get("workers", []):
+            cur.execute("INSERT INTO work_report_workers (work_report_id,user_id,worker_name,hours,hourly_rate,total_price) VALUES (%s,%s,%s,%s,%s,%s)",
+                (rid, w.get("user_id"), w["name"], w["hours"], w["rate"], w["total"]))
+        for e in day_ctx.get("entries", []):
+            cur.execute("INSERT INTO work_report_entries (work_report_id,type,hours,unit_rate,total_price) VALUES (%s,%s,%s,%s,%s)",
+                (rid, e["type"], e["hours"], e["rate"], e["total"]))
+        for m in day_ctx.get("materials", []):
+            cur.execute("INSERT INTO work_report_materials (work_report_id,material_name,quantity,unit_price,total_price) VALUES (%s,%s,%s,%s,%s)",
+                (rid, m["name"], m["qty"], m["price"], m["total"]))
+        waste = day_ctx.get("waste", {})
+        if waste.get("qty", 0) > 0:
+            cur.execute("INSERT INTO work_report_waste (work_report_id,quantity,unit,unit_price,total_price) VALUES (%s,%s,'bulkbag',%s,%s)",
+                (rid, waste["qty"], waste["rate"], waste["total"]))
+    log_activity(conn, "work_report", str(rid), "create", f"Work report £{day_ctx.get('grand_total',0):.2f} for {day_ctx.get('client_name','?')}")
+    return rid
+
 def generate_summary(ctx, lang="en"):
     c = ctx
     lines = []
@@ -7620,7 +7786,11 @@ async def voice_session_start(data: dict, request: Request):
         lang = resolve_voice_language(tenant_config, data.get("language"))
         actor_user_id = request.state.user.get("user_id")
         with conn.cursor() as cur:
-            ctx = json.dumps({"language":lang,"work_date":data.get("work_date",datetime.now().strftime("%Y-%m-%d"))})
+            ctx = json.dumps({
+                "language": lang,
+                "work_date": data.get("work_date", datetime.now().strftime("%Y-%m-%d")),
+                "report_days": [],
+            })
             cur.execute("INSERT INTO voice_sessions (id,tenant_id,user_id,session_type,state,dialog_step,context) VALUES (%s,%s,%s,'work_report','active','client',%s)",
                 (sid,tenant_id,actor_user_id,ctx))
             conn.commit()
@@ -7684,13 +7854,13 @@ async def voice_session_input(data: dict, request: Request):
                     created_client = create_voice_work_report_client(conn, tenant_id, int(actor_user_id), provided_new_client_name, lang)
                     ctx["client_id"] = created_client["id"]
                     ctx["client_name"] = created_client["display_name"]
-                    next_step = "workers"
+                    next_step = "date"
                     reply = (
-                        f"Created client {created_client['display_name']}. {get_prompt('workers',lang)}"
+                        f"Created client {created_client['display_name']}. {get_prompt('date',lang)}"
                         if lang == "en" else
-                        f"Vytvořil jsem klienta {created_client['display_name']}. {get_prompt('workers',lang)}"
+                        f"Vytvořil jsem klienta {created_client['display_name']}. {get_prompt('date',lang)}"
                         if lang == "cs" else
-                        f"Utworzyłem klienta {created_client['display_name']}. {get_prompt('workers',lang)}"
+                        f"Utworzyłem klienta {created_client['display_name']}. {get_prompt('date',lang)}"
                     )
                 elif wants_new_client:
                     next_step = "client_create_name"
@@ -7701,7 +7871,7 @@ async def voice_session_input(data: dict, request: Request):
                     matches = cur.fetchall()
                     if len(matches) == 1:
                         ctx["client_id"] = matches[0]['id']; ctx["client_name"] = matches[0]['display_name']
-                        next_step = "workers"; reply = f"{matches[0]['display_name']}. {get_prompt('workers',lang)}"
+                        next_step = "date"; reply = f"{matches[0]['display_name']}. {get_prompt('date',lang)}"
                     elif len(matches) > 1:
                         names = ", ".join([m['display_name'] for m in matches])
                         reply = f"Found: {names}. Which one?" if lang=="en" else f"Nalezeni: {names}. Který?" if lang=="cs" else f"Znalezieni: {names}. Który?"
@@ -7721,14 +7891,36 @@ async def voice_session_input(data: dict, request: Request):
                 created_client = create_voice_work_report_client(conn, tenant_id, int(actor_user_id), text, lang)
                 ctx["client_id"] = created_client["id"]
                 ctx["client_name"] = created_client["display_name"]
-                next_step = "workers"
+                next_step = "date"
                 reply = (
-                    f"Created client {created_client['display_name']}. {get_prompt('workers',lang)}"
+                    f"Created client {created_client['display_name']}. {get_prompt('date',lang)}"
                     if lang == "en" else
-                    f"Vytvořil jsem klienta {created_client['display_name']}. {get_prompt('workers',lang)}"
+                    f"Vytvořil jsem klienta {created_client['display_name']}. {get_prompt('date',lang)}"
                     if lang == "cs" else
-                    f"Utworzyłem klienta {created_client['display_name']}. {get_prompt('workers',lang)}"
+                    f"Utworzyłem klienta {created_client['display_name']}. {get_prompt('date',lang)}"
                 )
+
+            # === STEP: DATE ===
+            elif step == "date":
+                parsed_date = parse_voice_work_date(text)
+                if not parsed_date:
+                    reply = (
+                        "Invalid date. Say a date like 2026-04-18 or 18.04.2026."
+                        if lang == "en" else
+                        "Neplatné datum. Řekni datum jako 2026-04-18 nebo 18.04.2026."
+                        if lang == "cs" else
+                        "Nieprawidłowa data. Powiedz datę jak 2026-04-18 albo 18.04.2026."
+                    )
+                else:
+                    reset_current_report_day(ctx, parsed_date)
+                    next_step = "workers"
+                    reply = (
+                        f"Date {parsed_date}. {get_prompt('workers',lang)}"
+                        if lang == "en" else
+                        f"Datum {parsed_date}. {get_prompt('workers',lang)}"
+                        if lang == "cs" else
+                        f"Data {parsed_date}. {get_prompt('workers',lang)}"
+                    )
 
             # === STEP: WORKERS ===
             elif step == "workers":
@@ -7897,6 +8089,17 @@ async def voice_session_input(data: dict, request: Request):
                 # POTVRDIT
                 if any(x in low for x in ["confirm","potvrdit","potwierdź","yes","ano","tak","uložit","ulozit","save"]):
                     next_step = "confirm"
+                elif any(x in low for x in ["another day","next day","add day","další den","dalsi den","další datum","dalsi datum","kolejny dzień","kolejny dzien","następny dzień","nastepny dzien"]):
+                    completed_day = append_current_report_day(ctx)
+                    reset_current_report_day(ctx)
+                    next_step = "date"
+                    reply = (
+                        f"Day {completed_day.get('work_date')} added. {get_prompt('date', lang)}"
+                        if lang == "en" else
+                        f"Den {completed_day.get('work_date')} přidán. {get_prompt('date', lang)}"
+                        if lang == "cs" else
+                        f"Dzień {completed_day.get('work_date')} dodany. {get_prompt('date', lang)}"
+                    )
                 # ZRUSIT / SMAZAT
                 elif any(x in low for x in ["zrušit","zrusit","smazat","cancel","delete","storno","konec","stop"]):
                     cur.execute("UPDATE voice_sessions SET state='cancelled',updated_at=now() WHERE id=%s",(sid,))
@@ -7906,6 +8109,7 @@ async def voice_session_input(data: dict, request: Request):
                 # OPRAVIT
                 elif any(low.startswith(x) for x in ["edit","oprav","popraw","zmen","změ","uprav"]):
                     _step_map = {"client":"client","klient":"client","klienta":"client",
+                        "date":"date","datum":"date","data":"date","den":"date","dzień":"date","dzien":"date",
                         "worker":"workers","pracovn":"workers","kdo":"workers",
                         "hour":"total_hours","hodin":"total_hours","celkem":"total_hours","total":"total_hours","godzin":"total_hours",
                         "entr":"entries","polozk":"entries","položk":"entries","rozpad":"entries","práce":"entries","prace":"entries","typ":"entries",
@@ -7917,9 +8121,9 @@ async def voice_session_input(data: dict, request: Request):
                         if _kw in low:
                             next_step = _target; reply = get_prompt(_target,lang); _found = True; break
                     if not _found:
-                        reply = "Co opravit? (klient/pracovniky/hodiny/polozky/odpad/material/poznamku)" if lang=="cs" else "What to edit?"
+                        reply = "Co opravit? (klienta/datum/pracovníky/hodiny/položky/odpad/materiál/poznámku)" if lang=="cs" else "What to edit? (client/date/workers/hours/entries/waste/materials/notes)"
                 else:
-                    reply = "Řekni 'potvrdit', 'oprav [co]', nebo 'zrušit'." if lang=="cs" else "Say 'confirm', 'edit [field]', or 'cancel'."
+                    reply = "Řekni 'další den', 'potvrdit', 'oprav [co]' nebo 'zrušit'." if lang=="cs" else "Say 'another day', 'confirm', 'edit [field]', or 'cancel'."
 
             # === STEP: CONFIRM → save to DB ===
             if next_step == "confirm" and step != "confirm":
@@ -7932,30 +8136,26 @@ async def voice_session_input(data: dict, request: Request):
                     ctx["total_hours"] = sum(e["hours"] for e in ctx.get("entries",[])); next_step = "confirm"
                 else:
                   try:
-                    cur.execute("""INSERT INTO work_reports (tenant_id,client_id,job_id,work_date,total_hours,total_price,notes,created_by,input_type,status)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'voice','confirmed') RETURNING id""",
-                        (tenant_id,ctx.get("client_id"),ctx.get("job_id"),ctx.get("work_date",datetime.now().strftime("%Y-%m-%d")),
-                         ctx.get("total_hours",0),ctx.get("grand_total",0),ctx.get("notes"),sess.get("user_id")))
-                    rid = cur.fetchone()['id']
-                    for w in ctx.get("workers",[]):
-                        cur.execute("INSERT INTO work_report_workers (work_report_id,user_id,worker_name,hours,hourly_rate,total_price) VALUES (%s,%s,%s,%s,%s,%s)",
-                            (rid,w.get("user_id"),w["name"],w["hours"],w["rate"],w["total"]))
-                    for e in ctx.get("entries",[]):
-                        cur.execute("INSERT INTO work_report_entries (work_report_id,type,hours,unit_rate,total_price) VALUES (%s,%s,%s,%s,%s)",
-                            (rid,e["type"],e["hours"],e["rate"],e["total"]))
-                    for m in ctx.get("materials",[]):
-                        cur.execute("INSERT INTO work_report_materials (work_report_id,material_name,quantity,unit_price,total_price) VALUES (%s,%s,%s,%s,%s)",
-                            (rid,m["name"],m["qty"],m["price"],m["total"]))
-                    waste = ctx.get("waste",{})
-                    if waste.get("qty",0) > 0:
-                        cur.execute("INSERT INTO work_report_waste (work_report_id,quantity,unit,unit_price,total_price) VALUES (%s,%s,'bulkbag',%s,%s)",
-                            (rid,waste["qty"],waste["rate"],waste["total"]))
-                    log_activity(conn,"work_report",str(rid),"create",f"Work report £{ctx.get('grand_total',0):.2f} for {ctx.get('client_name','?')}")
+                    pending_days = list(ctx.get("report_days") or [])
+                    pending_days.append(extract_current_report_day(ctx))
+                    report_ids = []
+                    for day_ctx in pending_days:
+                        rid = save_voice_work_report_day(conn, tenant_id, sess.get("user_id"), day_ctx)
+                        report_ids.append(rid)
+                    ctx["saved_work_report_ids"] = report_ids
                     cur.execute("UPDATE voice_sessions SET state='completed',context=%s,updated_at=now() WHERE id=%s",(json.dumps(ctx),sid))
                     conn.commit()
-                    whatsapp = generate_whatsapp(ctx)
+                    whatsapp = generate_batch_whatsapp(ctx, lang)
                     reply = get_prompt("confirm",lang)
-                    return {"session_id":sid,"step":"done","prompt":reply,"work_report_id":rid,"whatsapp_message":whatsapp,"summary":generate_summary(ctx,lang)}
+                    return {
+                        "session_id":sid,
+                        "step":"done",
+                        "prompt":reply,
+                        "work_report_id":report_ids[-1],
+                        "work_report_ids":report_ids,
+                        "whatsapp_message":whatsapp,
+                        "summary":generate_batch_summary(ctx,lang)
+                    }
                   except Exception as e:
                     conn.rollback(); raise HTTPException(500,f"Save error: {e}")
 
