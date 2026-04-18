@@ -15,6 +15,7 @@ import base64
 import jwt as pyjwt
 import json
 import urllib.request
+import unicodedata
 from contextlib import contextmanager, asynccontextmanager
 
 app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
@@ -7670,6 +7671,104 @@ def append_current_report_day(ctx: dict) -> dict:
     ctx.setdefault("report_days", []).append(day)
     return day
 
+def normalize_voice_name_key(value: Optional[str]) -> str:
+    raw = unicodedata.normalize("NFKD", (value or "").strip().lower())
+    ascii_text = raw.encode("ascii", "ignore").decode("ascii")
+    chars = []
+    prev_space = False
+    for ch in ascii_text:
+        if ch.isalnum():
+            chars.append(ch)
+            prev_space = False
+        elif not prev_space:
+            chars.append(" ")
+            prev_space = True
+    return "".join(chars).strip()
+
+def split_voice_worker_fragments(text: str) -> List[str]:
+    normalized = normalize_voice_name_key(text)
+    if not normalized:
+        return []
+    for separator in (" and ", " a ", " i ", " plus ", "&", "+", ";", "/"):
+        normalized = normalized.replace(separator, ",")
+    fragments = [part.strip() for part in normalized.split(",") if part.strip()]
+    if len(fragments) != 1:
+        return fragments
+    return fragments
+
+def match_voice_workers(conn, tenant_id: int, text: str, client_id=None, job_id=None) -> tuple[list, list]:
+    with conn.cursor() as cur:
+        cur.execute("""SELECT id, display_name
+            FROM users
+            WHERE tenant_id=%s AND deleted_at IS NULL AND COALESCE(status,'active')='active'
+            ORDER BY display_name, id""", (tenant_id,))
+        user_rows = [dict(row) for row in cur.fetchall()]
+    if not user_rows:
+        return [], []
+    users = []
+    for row in user_rows:
+        normalized = normalize_voice_name_key(row["display_name"])
+        tokens = [token for token in normalized.split() if token]
+        users.append({
+            "id": row["id"],
+            "display_name": row["display_name"],
+            "normalized": normalized,
+            "tokens": tokens,
+        })
+
+    def build_worker(user_row: dict) -> dict:
+        rate = resolve_rate(conn, tenant_id, "worker_rate", rule_key=str(user_row["id"]), job_id=job_id, client_id=client_id)
+        return {"name": user_row["display_name"], "user_id": user_row["id"], "hours": 0, "rate": rate, "total": 0}
+
+    def find_best_user(fragment: str):
+        normalized_fragment = normalize_voice_name_key(fragment)
+        if not normalized_fragment:
+            return None
+        exact = [u for u in users if u["normalized"] == normalized_fragment]
+        if len(exact) == 1:
+            return exact[0]
+        token_exact = [u for u in users if normalized_fragment in u["tokens"]]
+        if len(token_exact) == 1:
+            return token_exact[0]
+        contains = [u for u in users if normalized_fragment in u["normalized"] or u["normalized"] in normalized_fragment]
+        if len(contains) == 1:
+            return contains[0]
+        if len(contains) > 1:
+            contains.sort(key=lambda item: (abs(len(item["normalized"]) - len(normalized_fragment)), len(item["normalized"])))
+            best = contains[0]
+            if len(contains) == 1 or abs(len(contains[1]["normalized"]) - len(normalized_fragment)) != abs(len(best["normalized"]) - len(normalized_fragment)):
+                return best
+        return None
+
+    matched_workers = []
+    seen_user_ids = set()
+    not_found = []
+    fragments = split_voice_worker_fragments(text)
+    for fragment in fragments:
+        user_row = find_best_user(fragment)
+        if user_row:
+            if user_row["id"] not in seen_user_ids:
+                matched_workers.append(build_worker(user_row))
+                seen_user_ids.add(user_row["id"])
+            continue
+        token_parts = [part for part in normalize_voice_name_key(fragment).split() if part]
+        token_matches = []
+        unresolved_tokens = []
+        for token in token_parts:
+            token_user = find_best_user(token)
+            if token_user:
+                if token_user["id"] not in seen_user_ids and token_user["id"] not in {item["id"] for item in token_matches}:
+                    token_matches.append(token_user)
+            else:
+                unresolved_tokens.append(token)
+        if token_matches and not unresolved_tokens:
+            for token_user in token_matches:
+                matched_workers.append(build_worker(token_user))
+                seen_user_ids.add(token_user["id"])
+        else:
+            not_found.append(fragment.strip())
+    return matched_workers, not_found
+
 def generate_batch_summary(ctx, lang="en"):
     days = list(ctx.get("report_days") or [])
     current = extract_current_report_day(ctx)
@@ -7950,30 +8049,21 @@ async def voice_session_input(data: dict, request: Request):
 
             # === STEP: WORKERS ===
             elif step == "workers":
-                names = [n.strip() for n in text.replace(" and ",",").replace(" a ",",").replace(" i ",",").split(",") if n.strip()]
-                workers = []; not_found = []
-                for name in names:
-                    cur.execute("SELECT id,display_name FROM users WHERE tenant_id=%s AND display_name ILIKE %s AND deleted_at IS NULL LIMIT 1",(tenant_id,f"%{name}%"))
-                    u = cur.fetchone()
-                    if u:
-                        rate = resolve_rate(conn,tenant_id,"worker_rate",rule_key=str(u['id']),job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
-                        workers.append({"name":u['display_name'],"user_id":u['id'],"hours":0,"rate":rate,"total":0})
-                    else:
-                        not_found.append(name)
+                workers, not_found = match_voice_workers(conn, tenant_id, text, client_id=ctx.get("client_id"), job_id=ctx.get("job_id"))
                 if workers and not not_found:
                     ctx["workers"] = workers; next_step = "total_hours"
                     reply = f"{len(workers)} workers. {get_prompt('total_hours',lang)}"
                 elif workers and not_found:
                     ctx["workers"] = workers
                     nf = ", ".join(not_found)
-                    reply = f"Not found in system: {nf}. Found: {len(workers)}. Add more or say 'continue'." if lang=="en" else f"Nenalezeni: {nf}. Nalezeno: {len(workers)}. Přidej další nebo řekni 'pokračuj'."
+                    reply = f"Not found in system: {nf}. Found: {len(workers)}. Add more or say 'continue'." if lang=="en" else f"Nenalezeni: {nf}. Nalezeno: {len(workers)}. Přidej další nebo řekni 'pokračuj'." if lang=="cs" else f"Nie znaleziono: {nf}. Znaleziono: {len(workers)}. Dodaj kolejne albo powiedz 'dalej'."
                 elif "continu" in text.lower() or "pokrac" in text.lower() or "dalej" in text.lower():
                     if ctx.get("workers"):
                         next_step = "total_hours"; reply = get_prompt("total_hours",lang)
                     else:
-                        reply = "No workers added. Try again." if lang=="en" else "Žádní pracovníci. Zkus znovu."
+                        reply = "No workers added. Try again." if lang=="en" else "Žádní pracovníci. Zkus znovu." if lang=="cs" else "Nie dodano pracowników. Spróbuj ponownie."
                 else:
-                    reply = "No workers found in system. Use exact names." if lang=="en" else "Žádní pracovníci nenalezeni. Použij přesná jména." if lang=="cs" else "Nie znaleziono pracowników. Użyj dokładnych imion."
+                    reply = "No workers found in system. Try first names or say them one by one." if lang=="en" else "Žádní pracovníci nenalezeni. Zkus křestní jména nebo je řekni po jednom." if lang=="cs" else "Nie znaleziono pracowników. Spróbuj podać imiona albo powiedz je po kolei."
 
             # === STEP: TOTAL HOURS ===
             elif step == "total_hours":
