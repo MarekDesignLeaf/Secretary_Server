@@ -11,6 +11,7 @@ import uvicorn
 from openai import OpenAI
 import httpx
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import base64
 import jwt as pyjwt
 import json
@@ -7677,13 +7678,20 @@ def parse_voice_work_date(text: str) -> Optional[str]:
     raw = (text or "").strip()
     if not raw:
         return None
-    low = raw.lower()
-    if low in {"today", "dnes", "dzisiaj"}:
-        return datetime.now().strftime("%Y-%m-%d")
-    if low in {"yesterday", "vcera", "včera", "wczoraj"}:
-        return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    if low in {"tomorrow", "zitra", "zítra", "jutro"}:
-        return (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        now = datetime.now(ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/London")))
+    except Exception:
+        now = datetime.now()
+    low = raw.lower().strip()
+    normalized_words = unicodedata.normalize("NFKD", low).encode("ascii", "ignore").decode("ascii")
+    normalized_words = "".join(ch if ch.isalnum() else " " for ch in normalized_words)
+    tokens = set(normalized_words.split())
+    if low in {"today", "dnes", "dneska", "dzisiaj"} or tokens.intersection({"today", "dnes", "dneska", "dzisiaj"}):
+        return now.strftime("%Y-%m-%d")
+    if low in {"yesterday", "vcera", "včera", "wczoraj"} or tokens.intersection({"yesterday", "vcera", "wczoraj"}):
+        return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    if low in {"tomorrow", "zitra", "zítra", "jutro"} or tokens.intersection({"tomorrow", "zitra", "jutro"}):
+        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
     cleaned = raw.replace(" ", "")
     formats = ["%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"]
     for fmt in formats:
@@ -7694,7 +7702,7 @@ def parse_voice_work_date(text: str) -> Optional[str]:
     for fmt in ("%d.%m.", "%d/%m", "%d-%m"):
         try:
             parsed = datetime.strptime(cleaned, fmt)
-            parsed = parsed.replace(year=datetime.now().year)
+            parsed = parsed.replace(year=now.year)
             return parsed.strftime("%Y-%m-%d")
         except ValueError:
             continue
