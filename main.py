@@ -1,4 +1,5 @@
 ﻿import os, json, uuid, csv, io, hashlib
+import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
@@ -7708,6 +7709,138 @@ def parse_voice_work_date(text: str) -> Optional[str]:
             continue
     return None
 
+VOICE_NUMBER_WORDS = {
+    # Czech, normalized without diacritics.
+    "nula": 0, "jeden": 1, "jedna": 1, "jedno": 1, "prvni": 1,
+    "dva": 2, "dve": 2, "druhy": 2, "druha": 2,
+    "tri": 3, "treti": 3, "ctyri": 4, "ctvrty": 4,
+    "pet": 5, "paty": 5, "sest": 6, "sesty": 6, "sedm": 7,
+    "osmy": 8, "osm": 8, "devet": 9, "devaty": 9, "deset": 10,
+    "jedenact": 11, "dvanact": 12, "trinact": 13, "ctrnact": 14,
+    "patnact": 15, "sestnact": 16, "sedmnact": 17, "osmnact": 18,
+    "devatenact": 19,
+    # English.
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19,
+    # Polish, normalized without diacritics.
+    "jeden": 1, "jedna": 1, "dwa": 2, "dwie": 2, "trzy": 3,
+    "cztery": 4, "piec": 5, "szesc": 6, "siedem": 7, "osiem": 8,
+    "dziewiec": 9, "dziesiec": 10, "jedenascie": 11, "dwanascie": 12,
+    "trzynascie": 13, "czternascie": 14, "pietnascie": 15,
+    "szesnascie": 16, "siedemnascie": 17, "osiemnascie": 18,
+    "dziewietnascie": 19,
+}
+
+VOICE_NUMBER_TENS = {
+    "dvacet": 20, "tricet": 30, "ctyricet": 40, "padesat": 50,
+    "sedesat": 60, "sedmdesat": 70, "osmdesat": 80, "devadesat": 90,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "dwadziescia": 20, "trzydziesci": 30, "czterdziesci": 40,
+    "piecdziesiat": 50, "szescdziesiat": 60, "siedemdziesiat": 70,
+    "osiemdziesiat": 80, "dziewiecdziesiat": 90,
+}
+
+VOICE_NUMBER_UNITS = {
+    "h", "hodin", "hodina", "hodiny", "hodinu", "hodinama", "cas", "casy",
+    "hour", "hours", "godzin", "godzina", "godziny", "godzine",
+    "pytel", "pytle", "pytlu", "pytel", "pytle", "bags", "bag", "bulkbag",
+    "liber", "pound", "pounds", "ks", "kus", "kusu", "pieces", "piece",
+}
+
+VOICE_NUMBER_FILLERS = {
+    "a", "and", "plus", "minus", "asi", "cca", "okolo", "zhruba", "about",
+    "approximately", "kolem", "circa", "oraz", "i",
+}
+
+VOICE_NEGATIVE_WORDS = {
+    "ne", "nee", "no", "nope", "none", "nothing", "nic", "zadny", "zadna",
+    "zadne", "zadnej", "zaden", "zadnou", "bez", "nie", "brak", "zaden",
+    "nemam", "nemame", "neni", "nepouzili", "nepouzito", "nebyl", "nebylo",
+    "skip", "preskoc", "preskocit", "dalsi", "dal", "dalej",
+}
+
+def normalize_voice_text(text: str) -> str:
+    raw = unicodedata.normalize("NFKD", (text or "").strip().lower())
+    ascii_text = raw.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9,.\-+]+", " ", ascii_text).strip()
+
+def voice_tokens(text: str) -> list[str]:
+    normalized = normalize_voice_text(text)
+    return [token for token in re.split(r"[\s,.;:!?]+", normalized) if token]
+
+def is_voice_negative_response(text: str, *, include_zero: bool = False) -> bool:
+    normalized = normalize_voice_text(text)
+    if not normalized:
+        return False
+    tokens = voice_tokens(text)
+    compact = " ".join(tokens)
+    if compact in VOICE_NEGATIVE_WORDS:
+        return True
+    if tokens and tokens[0] in VOICE_NEGATIVE_WORDS:
+        return True
+    if include_zero:
+        parsed = parse_voice_number(text)
+        if parsed == 0:
+            return True
+    return False
+
+def _parse_voice_number_tokens(tokens: list[str]) -> Optional[float]:
+    current = 0.0
+    total = 0.0
+    found = False
+    for token in tokens:
+        if not token or token in VOICE_NUMBER_UNITS or token in VOICE_NUMBER_FILLERS:
+            continue
+        if token in {"pul", "half"}:
+            current += 0.5
+            found = True
+            continue
+        if token in {"sto", "hundred", "setka"}:
+            current = (current or 1) * 100
+            found = True
+            continue
+        value = VOICE_NUMBER_WORDS.get(token)
+        if value is not None:
+            current += value
+            found = True
+            continue
+        value = VOICE_NUMBER_TENS.get(token)
+        if value is not None:
+            current += value
+            found = True
+            continue
+        return None
+    if not found:
+        return None
+    return total + current
+
+def parse_voice_number(text: str) -> Optional[float]:
+    normalized = normalize_voice_text(text)
+    if not normalized:
+        return None
+    numeric = re.search(r"[-+]?\d+(?:[,.]\d+)?", normalized)
+    if numeric:
+        try:
+            return float(numeric.group(0).replace(",", "."))
+        except ValueError:
+            return None
+    tokens = voice_tokens(text)
+    if not tokens:
+        return None
+    if any(token in {"pul", "half"} for token in tokens):
+        half_index = next(i for i, token in enumerate(tokens) if token in {"pul", "half"})
+        base_tokens = [token for token in tokens[:half_index] if token not in VOICE_NUMBER_FILLERS]
+        if not base_tokens:
+            return 0.5
+        base = _parse_voice_number_tokens(base_tokens)
+        if base is not None:
+            return base + 0.5
+    return _parse_voice_number_tokens(tokens)
+
 def extract_current_report_day(ctx: dict) -> dict:
     day = {
         "client_id": ctx.get("client_id"),
@@ -8139,16 +8272,8 @@ async def voice_session_input(data: dict, request: Request):
 
             # === STEP: TOTAL HOURS ===
             elif step == "total_hours":
-                try:
-                    _num_words = {"nula":0,"jedna":1,"jeden":1,"jedno":1,"dva":2,"dve":2,"tri":3,"tři":3,"ctyri":4,"čtyři":4,"pet":5,"pět":5,"sest":6,"šest":6,"sedm":7,"osm":8,"devet":9,"devět":9,"deset":10,"jedenact":11,"dvanact":12,
-                        "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10,"eleven":11,"twelve":12,
-                        "jeden a půl":1.5,"jedna a půl":1.5,"dva a půl":2.5,"dvě a půl":2.5,"tři a půl":3.5,"čtyři a půl":4.5,"pět a půl":5.5,"šest a půl":6.5,"sedm a půl":7.5,"osm a půl":8.5,
-                        "půl":0.5,"half":0.5}
-                    _clean = text.lower().replace("hours","").replace("hodin","").replace("hodiny","").replace("hodinu","").replace("godzin","").strip()
-                    if _clean in _num_words:
-                        hrs = _num_words[_clean]
-                    else:
-                        hrs = float(_clean.replace(",","."))
+                hrs = parse_voice_number(text)
+                if hrs is not None:
                     ctx["total_hours"] = hrs
                     # Distribute equally if multiple workers
                     wc = len(ctx.get("workers",[]))
@@ -8156,18 +8281,18 @@ async def voice_session_input(data: dict, request: Request):
                         per = round(hrs / wc, 2)
                         for w in ctx["workers"]: w["hours"] = per; w["total"] = round(per * w["rate"],2)
                     ctx["_entry_sub"] = "pruning"; ctx["entries"] = []; next_step = "entries"; reply = f"{hrs}h. " + get_prompt("entries",lang)
-                except: reply = "Invalid number." if lang=="en" else "Neplatné číslo." if lang=="cs" else "Nieprawidłowa liczba."
+                else:
+                    reply = "Invalid number." if lang=="en" else "Neplatné číslo." if lang=="cs" else "Nieprawidłowa liczba."
 
             # === STEP: ENTRIES (pruning -> maintenance -> additional if needed) ===
             elif step == "entries":
-                _nw = {"nula":0,"jedna":1,"jeden":1,"dva":2,"dve":2,"dvě":2,"tri":3,"tři":3,"ctyri":4,"čtyři":4,"pet":5,"pět":5,"sest":6,"šest":6,"sedm":7,"osm":8,"devet":9,"devět":9,"deset":10,"půl":0.5,"half":0.5,
-                    "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10}
                 sub = ctx.get("_entry_sub","pruning")
                 low = text.lower().strip()
                 def _parse_hours(t):
-                    t2 = t.lower().replace("hodin","").replace("hodiny","").replace("hodinu","").replace("hours","").replace("h","").replace(",",".").strip()
-                    if t2 in _nw: return _nw[t2]
-                    return float(t2)
+                    parsed = parse_voice_number(t)
+                    if parsed is None:
+                        raise ValueError("invalid voice number")
+                    return parsed
                 if not ctx.get("entries"): ctx["entries"] = []
 
                 if sub == "pruning":
@@ -8232,36 +8357,36 @@ async def voice_session_input(data: dict, request: Request):
 
             # === STEP: MATERIALS ===
             elif step == "materials":
-                if any(text.lower().startswith(x) for x in ("no","ne","nie","none","zadny","żaden","skip","přeskoč","preskoc","dalsi","další","zadny","žádný")):
+                if is_voice_negative_response(text, include_zero=True):
                     ctx["materials"] = []
                 else:
-                    import re
                     mats = []
                     parts = re.findall(r'(\w[\w\s]*?)\s+([\d.,]+)\s*[x×]?\s*£?([\d.,]+)?', text)
                     for mname, mqty, mprice in parts:
                         q = float(mqty.replace(",","."))
                         p = float(mprice.replace(",",".")) if mprice else 0
                         mats.append({"name":mname.strip(),"qty":q,"price":p,"total":round(q*p,2)})
-                    if not mats and text.lower() not in ("no","ne","nie","none","skip"):
+                    if not mats and not is_voice_negative_response(text, include_zero=True):
                         mats.append({"name":text,"qty":1,"price":0,"total":0})
                     ctx["materials"] = mats
                 next_step = "notes"; reply = get_prompt("notes",lang)
 
             # === STEP: WASTE ===
             elif step == "waste":
-                if any(text.lower().startswith(x) for x in ("no","ne","nie","none","zadny","żaden","0","skip","přeskoč","preskoc","dalsi","další")):
+                if is_voice_negative_response(text, include_zero=True):
                     ctx["waste"] = {"qty":0,"rate":0,"total":0}
                 else:
-                    try:
-                        qty = float(text.replace(",",".").split()[0])
+                    qty = parse_voice_number(text)
+                    if qty is not None:
                         rate = resolve_rate(conn,tenant_id,"waste_rate",job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
                         ctx["waste"] = {"qty":qty,"rate":rate,"total":round(qty*rate,2)}
-                    except: ctx["waste"] = {"qty":0,"rate":0,"total":0}
+                    else:
+                        ctx["waste"] = {"qty":0,"rate":0,"total":0}
                 next_step = "materials"; reply = get_prompt("materials",lang)
 
             # === STEP: NOTES ===
             elif step == "notes":
-                if not any(text.lower().startswith(x) for x in ("no","ne","nie","skip","přeskoč","preskoc","dalsi","další")) and text.strip() != "":
+                if not is_voice_negative_response(text) and text.strip() != "":
                     ctx["notes"] = text
                 # Calculate grand total
                 gt = sum(e.get("total",0) for e in ctx.get("entries",[]))
