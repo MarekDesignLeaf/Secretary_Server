@@ -518,6 +518,19 @@ CREATE TABLE IF NOT EXISTS voice_sessions (
     context JSONB DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(), expires_at TIMESTAMPTZ DEFAULT now() + interval '1 hour'
 );
+CREATE TABLE IF NOT EXISTS assistant_memory (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT NOT NULL DEFAULT 1,
+    user_id BIGINT,
+    memory_type TEXT NOT NULL DEFAULT 'long',
+    content TEXT NOT NULL,
+    normalized_content TEXT,
+    source TEXT DEFAULT 'voice',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    forgotten_at TIMESTAMPTZ
+);
 CREATE TABLE IF NOT EXISTS pricing_rules (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id INT DEFAULT 1, scope TEXT DEFAULT 'system',
@@ -702,6 +715,8 @@ CREATE INDEX IF NOT EXISTS idx_communications_tenant_client_time
     ON communications(tenant_id, client_id, sent_at DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_communications_source_external
     ON communications(tenant_id, source, external_message_id);
+CREATE INDEX IF NOT EXISTS idx_assistant_memory_tenant_active
+    ON assistant_memory(tenant_id, user_id, is_active, updated_at DESC);
 UPDATE users
 SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), email, display_name),
     updated_at = now()
@@ -4064,8 +4079,16 @@ async def process_message(msg: MessageRequest, request: Request):
                     if r: entity_ctx = f"Marek se diva na klienta: {r['display_name']}"
             finally: release_conn(conn)
 
+        tenant_id = get_request_tenant_id(request)
+        request_user = getattr(request.state, "user", {}) or {}
+        current_user_id = request_user.get("user_id")
+
         # Language from tenant config + request override
-        tenant_config = get_tenant_config(conn if 'conn' in dir() else get_db_conn(), 1)
+        tenant_conn = get_db_conn()
+        try:
+            tenant_config = get_tenant_config(tenant_conn, tenant_id)
+        finally:
+            release_conn(tenant_conn)
         lang = resolve_response_language(tenant_config, msg.internal_language)
         if lang == "cs":
             lang_instruction = "JAZYK: Odpovídej VÝHRADNĚ česky. Celá tvoje odpověď musí být v češtině. Nikdy nepřepínej do jiného jazyka. Uživatel může psát česky, anglicky nebo polsky — ty VŽDY odpovídáš POUZE česky."
@@ -4082,13 +4105,61 @@ async def process_message(msg: MessageRequest, request: Request):
         def error_reply(e: Exception, prefix_en: str = "Error", prefix_cs: str = "Chyba", prefix_pl: str = "Błąd"):
             return {"reply_cs": f"{tr(prefix_en, prefix_cs, prefix_pl)}: {e}"}
 
+        memory_command = extract_assistant_memory_command(msg.text)
+        if memory_command:
+            memory_action, memory_text, memory_type = memory_command
+            memory_conn = get_db_conn()
+            try:
+                if memory_action == "remember":
+                    remembered = remember_assistant_memory(memory_conn, tenant_id, current_user_id, memory_text, memory_type)
+                    memory_conn.commit()
+                    reply = tr(
+                        f"I will remember: {memory_text}",
+                        f"Zapamatovala jsem si: {memory_text}",
+                        f"Zapamiętałam: {memory_text}",
+                    )
+                    return {"reply_cs": reply, "action_type": "MEMORY_REMEMBERED", "action_data": remembered}
+                forgotten = forget_assistant_memory(memory_conn, tenant_id, current_user_id, memory_text)
+                memory_conn.commit()
+                if forgotten["count"] > 0:
+                    reply = tr(
+                        f"I forgot {forgotten['count']} matching memory item(s).",
+                        f"Zapomněla jsem {forgotten['count']} odpovídající položek paměti.",
+                        f"Zapomniałam {forgotten['count']} pasujących pozycji pamięci.",
+                    )
+                else:
+                    reply = tr(
+                        "I did not find a matching memory item to forget.",
+                        "Nenašla jsem odpovídající položku paměti ke smazání.",
+                        "Nie znalazłam pasującej pozycji pamięci do usunięcia.",
+                    )
+                return {"reply_cs": reply, "action_type": "MEMORY_FORGOTTEN", "action_data": forgotten}
+            except Exception as e:
+                memory_conn.rollback()
+                return error_reply(e)
+            finally:
+                release_conn(memory_conn)
+
         if not ai_client:
             return {"reply_cs": tr("AI is not configured.", "AI neni nakonfigurovana.", "AI nie jest skonfigurowane.")}
+
+        memory_ctx = "None."
+        memory_conn = get_db_conn()
+        try:
+            memories = load_assistant_memories(memory_conn, tenant_id, current_user_id)
+            if memories:
+                memory_ctx = "\n".join(f"- {item['content']}" for item in memories)
+        except Exception as e:
+            print(f"Memory load warning: {e}")
+        finally:
+            release_conn(memory_conn)
 
         system_prompt = f"""You are an intelligent VOICE secretary of DesignLeaf company (landscaping services, Oxfordshire UK).
 {lang_instruction}
 TIME: {now}. CONTEXT: {entity_ctx or 'None.'}
 CALENDAR: {msg.calendar_context or 'None.'}
+MEMORY:
+{memory_ctx}
 RULES:
 - You are a VOICE assistant. The user speaks to you and you speak back. NEVER say you can only communicate via text. NEVER say you are a text-based AI. You ARE a voice assistant.
 - Be concise, human, friendly. Remember conversation history.
@@ -4100,12 +4171,13 @@ RULES:
 - For leads: create_lead.
 - For calendar: list_calendar_events, add/modify/delete_calendar_event.
 - For contacts: search_contacts, call_contact.
+- When the user says 'zapamatuj si', 'pamatuj si', 'remember', or 'zapamiętaj', save the fact with remember_memory.
+- When the user says 'zapomeň', 'forget', or 'zapomnij', remove matching facts with forget_memory.
 - When user asks 'what do I have to do' or 'my tasks', use list_tasks.
 - When user says 'done' or 'completed' for a task, use complete_task.
 - When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report.
 - When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather.
-- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Find client by name, get their phone, send message.
-- For send_whatsapp: if the user dictates the message in Czech or Polish, keep the meaning but send it in the default customer language. Default customer language is usually English unless the user explicitly requests another language.
+- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. The Android app will open WhatsApp on the phone with the resolved contact and message.
 - For email inbox: use search_email to find messages, read_email to read a message or latest matching message aloud, and reply_email to answer an existing email thread.
 - For new outbound email use send_email. For replies to an existing incoming email always use reply_email so the reply goes to the original sender.
 - When user asks about clients database, how many clients, client statistics, sources, types, or any question about CRM data, use query_clients. Examples: 'kolik mam klientu', 'odkud jsou klienti', 'jaci klienti jsou aktivni', 'kolik mam zakazek', 'statistiky', 'prehled databaze'."""
@@ -4116,7 +4188,7 @@ RULES:
             {"type":"function","function":{"name":"delete_calendar_event","description":"Smaze udalost","parameters":{"type":"object","properties":{"event_title":{"type":"string"}},"required":["event_title"]}}},
             {"type":"function","function":{"name":"list_calendar_events","description":"Precte kalendar na N dni","parameters":{"type":"object","properties":{"days":{"type":"integer","default":7}}}}},
             {"type":"function","function":{"name":"search_contacts","description":"Hleda v CRM klientech i telefonnich kontaktech","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
-            {"type":"function","function":{"name":"call_contact","description":"Vytoci telefonni cislo","parameters":{"type":"object","properties":{"phone":{"type":"string"}},"required":["phone"]}}},
+            {"type":"function","function":{"name":"call_contact","description":"Vytoci telefonni kontakt. Pokud neni zname cislo, vypln contact_name a Android kontakt dohleda v mobilu/CRM.","parameters":{"type":"object","properties":{"phone":{"type":"string"},"contact_name":{"type":"string"},"client_name":{"type":"string"}}}}},
             {"type":"function","function":{"name":"send_email","description":"Posle email","parameters":{"type":"object","properties":{"to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},"required":["to","subject","body"]}}},
             {"type":"function","function":{"name":"search_email","description":"Vyhleda emaily ve schrankce podle textu, odesilatele nebo neprectenych zprav.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Text hledany v predmetu, odesilateli nebo tele emailu"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"unread_only":{"type":"boolean","default":False},"limit":{"type":"integer","default":5}}}}},
             {"type":"function","function":{"name":"read_email","description":"Precte posledni nebo konkretni email. Pouzij pro 'precti email', 'otevri email', 'precti posledni email od ...'.","parameters":{"type":"object","properties":{"uid":{"type":"string","description":"UID emailu z vysledku search_email"},"query":{"type":"string","description":"Text pro nalezeni emailu, pokud UID neni znamy"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"unread_only":{"type":"boolean","default":False}}}}},
@@ -4132,7 +4204,9 @@ RULES:
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
             {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
             {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: Didcot, Oxfordshire"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
-            {"type":"function","function":{"name":"send_whatsapp","description":"Posle WhatsApp zpravu klientovi. Pouzij kdyz uzivatel rekne 'napis na whatsapp', 'posli whatsapp zpravu', 'whatsapp message'. Pokud uzivatel rekne jiny jazyk, vypln language.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta"},"message":{"type":"string","description":"Text zpravy k odeslani"},"language":{"type":"string","description":"Cilovy jazyk zpravy pro klienta, napr. en, cs, pl"}},"required":["client_name","message"]}}},
+            {"type":"function","function":{"name":"send_whatsapp","description":"Otevre WhatsApp v mobilu s predvyplnenou zpravou pro kontakt nebo klienta.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta nebo kontaktu"},"contact_name":{"type":"string","description":"Jmeno kontaktu, pokud nejde o CRM klienta"},"phone":{"type":"string","description":"Telefonni cislo, pokud je zname"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["message"]}}},
+            {"type":"function","function":{"name":"remember_memory","description":"Ulozi dlouhodobou nebo strednedobou pamet asistenta. Pouzij pro 'zapamatuj si ...', 'pamatuj si ...', 'remember ...'.","parameters":{"type":"object","properties":{"content":{"type":"string","description":"Presny obsah k zapamatovani"},"memory_type":{"type":"string","enum":["medium","long"],"default":"long"}},"required":["content"]}}},
+            {"type":"function","function":{"name":"forget_memory","description":"Smaze odpovidajici polozky pameti asistenta. Pouzij pro 'zapomen ...', 'forget ...'.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Co se ma zapomenout"}},"required":["query"]}}},
             {"type":"function","function":{"name":"query_clients","description":"Dotaz na databazi klientu. Pouzij kdyz se uzivatel pta kolik ma klientu, odkud jsou, jake typy, statistiky CRM, prehled databaze, aktivni/neaktivni klienti, zdroje klientu.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"Co chce uzivatel vedet o klientech/databazi. Napr: 'kolik klientu', 'statistiky', 'odkud jsou klienti', 'aktivni klienti', 'posledni klienti'"}},"required":["question"]}}},
         ]
 
@@ -4581,72 +4655,62 @@ RULES:
                     )}
 
             if action == "SEND_WHATSAPP":
-                client_name = args.get("client_name","")
-                message = args.get("message","")
-                requested_language = args.get("language") or msg.external_language
+                client_name = args.get("client_name") or args.get("contact_name") or args.get("name") or ""
+                message = args.get("message") or ""
+                phone = args.get("phone") or ""
+                return {
+                    "reply_cs": tr(
+                        f"Opening WhatsApp for {client_name or phone}.",
+                        f"Otevírám WhatsApp pro {client_name or phone}.",
+                        f"Otwieram WhatsApp dla {client_name or phone}.",
+                    ),
+                    "action_type": "SEND_WHATSAPP",
+                    "action_data": {
+                        "client_name": client_name,
+                        "contact_name": args.get("contact_name") or client_name,
+                        "phone": phone,
+                        "message": message,
+                    },
+                }
+
+            if action == "REMEMBER_MEMORY":
+                content = args.get("content", "").strip()
+                memory_type = args.get("memory_type", "long")
+                if not content:
+                    return {"reply_cs": tr("What should I remember?", "Co si mám zapamatovat?", "Co mam zapamiętać?")}
                 conn = get_db_conn()
                 try:
-                    tenant_id = get_request_tenant_id(request)
-                    tenant_config = get_tenant_config(conn, tenant_id)
-                    outgoing_language = resolve_customer_language(tenant_config, requested_language)
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT id,display_name,phone_primary FROM clients WHERE tenant_id=%s AND display_name ILIKE %s AND deleted_at IS NULL LIMIT 1", (tenant_id, f"%{client_name}%",))
-                        client = cur.fetchone()
-                    if not client:
-                        release_conn(conn)
-                        return {"reply_cs": tr(
-                            f"I couldn't find client '{client_name}' in CRM.",
-                            f"Klienta '{client_name}' jsem nenašel v CRM.",
-                            f"Nie znalazłam klienta '{client_name}' w CRM."
-                        )}
-                    phone = client["phone_primary"]
-                    if not phone:
-                        release_conn(conn)
-                        return {"reply_cs": tr(
-                            f"Client {client['display_name']} has no phone number.",
-                            f"Klient {client['display_name']} nemá telefonní číslo.",
-                            f"Klient {client['display_name']} nie ma numeru telefonu."
-                        )}
-                    result = wa_send_message(phone, message, outgoing_language)
-                    if "error" in result:
-                        extra_hint = f" {result.get('config_hint')}" if result.get("config_hint") else ""
-                        detail_hint = ""
-                        meta_error = result.get("meta_error")
-                        if isinstance(meta_error, dict) and meta_error.get("message"):
-                            detail_hint = f" {meta_error.get('message')}"
-                        release_conn(conn)
-                        return {"reply_cs": tr(
-                            f"WhatsApp could not be sent: {result.get('error','')}.{detail_hint}{extra_hint}",
-                            f"WhatsApp se nepodařilo odeslat: {result.get('error','')}.{detail_hint}{extra_hint}",
-                            f"Nie udało się wysłać WhatsApp: {result.get('error','')}.{detail_hint}{extra_hint}"
-                        )}
-                    translated = result.get("translated_text", message)
-                    with conn.cursor() as cur:
-                        upsert_communication_message(cur, tenant_id, {
-                            "client_id": client["id"],
-                            "comm_type": "whatsapp",
-                            "source": "whatsapp",
-                            "target_phone": phone,
-                            "phone": phone,
-                            "subject": "WA zpráva",
-                            "message": translated[:500],
-                            "direction": "outbound",
-                            "notes": f"To: {phone} | Original: {message[:200]} | Language: {outgoing_language}",
-                        })
-                    log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']} ({outgoing_language}): {translated[:100]}", tenant_id=tenant_id)
+                    remembered = remember_assistant_memory(conn, tenant_id, current_user_id, content, memory_type)
                     conn.commit()
                     return {"reply_cs": tr(
-                        f"✅ WhatsApp message sent to {client['display_name']} at {phone}.",
-                        f"✅ WhatsApp zpráva odeslána klientovi {client['display_name']} na {phone}.",
-                        f"✅ Wiadomość WhatsApp wysłana do klienta {client['display_name']} na numer {phone}."
-                    ), "action_type":"WHATSAPP_SENT","action_data":{"client_name":client["display_name"],"phone":phone}}
+                        f"I will remember: {content}",
+                        f"Zapamatovala jsem si: {content}",
+                        f"Zapamiętałam: {content}",
+                    ), "action_type": "MEMORY_REMEMBERED", "action_data": remembered}
                 except Exception as e:
+                    conn.rollback()
+                    return error_reply(e)
+                finally:
+                    release_conn(conn)
+
+            if action == "FORGET_MEMORY":
+                query = args.get("query", "").strip()
+                if not query:
+                    return {"reply_cs": tr("What should I forget?", "Co mám zapomenout?", "Co mam zapomnieć?")}
+                conn = get_db_conn()
+                try:
+                    forgotten = forget_assistant_memory(conn, tenant_id, current_user_id, query)
+                    conn.commit()
                     return {"reply_cs": tr(
-                        f"Error sending WhatsApp: {e}",
-                        f"Chyba při odesílání WhatsApp: {e}",
-                        f"Błąd podczas wysyłania WhatsApp: {e}"
-                    )}
-                finally: release_conn(conn)
+                        f"I forgot {forgotten['count']} matching memory item(s).",
+                        f"Zapomněla jsem {forgotten['count']} odpovídající položek paměti.",
+                        f"Zapomniałam {forgotten['count']} pasujących pozycji pamięci.",
+                    ), "action_type": "MEMORY_FORGOTTEN", "action_data": forgotten}
+                except Exception as e:
+                    conn.rollback()
+                    return error_reply(e)
+                finally:
+                    release_conn(conn)
 
             if action == "QUERY_CLIENTS":
                 question = args.get("question", "")
@@ -4886,7 +4950,11 @@ RULES:
                 "MODIFY_CALENDAR_EVENT": tr(f"Updating event {args.get('event_title','')}.", f"Měním událost {args.get('event_title','')}.", f"Zmieniam wydarzenie {args.get('event_title','')}."),
                 "DELETE_CALENDAR_EVENT": tr(f"Deleting event {args.get('event_title','')}.", f"Mažu událost {args.get('event_title','')}.", f"Usuwam wydarzenie {args.get('event_title','')}."),
                 "LIST_CALENDAR_EVENTS": tr("I'll check the calendar.", "Podívám se do kalendáře.", "Sprawdzę kalendarz."),
-                "CALL_CONTACT": tr(f"Dialing {args.get('phone','')}.", f"Vytáčím {args.get('phone','')}.", f"Wybieram numer {args.get('phone','')}."),
+                "CALL_CONTACT": tr(
+                    f"Dialing {args.get('contact_name') or args.get('client_name') or args.get('phone','')}.",
+                    f"Vytáčím {args.get('contact_name') or args.get('client_name') or args.get('phone','')}.",
+                    f"Wybieram {args.get('contact_name') or args.get('client_name') or args.get('phone','')}."
+                ),
                 "SEND_EMAIL": tr(f"Sending email to {args.get('to','')}.", f"Posílám email na {args.get('to','')}.", f"Wysyłam email na {args.get('to','')}."),
             }
             reply = ai_msg.content or human.get(action, tr("Done.", "Hotovo.", "Gotowe."))
@@ -8787,6 +8855,118 @@ def normalize_voice_text(text: str) -> str:
 def voice_tokens(text: str) -> list[str]:
     normalized = normalize_voice_text(text)
     return [token for token in re.split(r"[\s,.;:!?]+", normalized) if token]
+
+def extract_assistant_memory_command(text: str) -> Optional[tuple[str, str, str]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    remember_patterns = [
+        r"^\s*(zapamatuj si|pamatuj si|uloz si|ulož si|zapis si|zapiš si|remember that|remember|zapamietaj|zapamiętaj)\s+(.+)$",
+    ]
+    forget_patterns = [
+        r"^\s*(zapomen na|zapomeň na|zapomen|zapomeň|smaz z pameti|smaž z paměti|forget that|forget|zapomnij)\s+(.+)$",
+    ]
+    for pattern in remember_patterns:
+        match = re.match(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            content = match.group(2).strip()
+            memory_type = "medium" if any(token in normalize_voice_text(raw) for token in ["strednedobe", "stredni", "medium"]) else "long"
+            return ("remember", content, memory_type) if content else None
+    for pattern in forget_patterns:
+        match = re.match(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            query = match.group(2).strip()
+            return ("forget", query, "long") if query else None
+    return None
+
+def load_assistant_memories(conn, tenant_id: int, user_id: Optional[int], limit: int = 30) -> list[dict]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, memory_type, content, updated_at
+            FROM assistant_memory
+            WHERE tenant_id=%s
+              AND is_active=TRUE
+              AND (user_id IS NULL OR user_id IS NOT DISTINCT FROM %s)
+            ORDER BY updated_at DESC, id DESC
+            LIMIT %s
+            """,
+            (tenant_id, user_id, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+def remember_assistant_memory(conn, tenant_id: int, user_id: Optional[int], content: str, memory_type: str = "long") -> dict:
+    clean_content = (content or "").strip()
+    if not clean_content:
+        raise ValueError("memory content is empty")
+    clean_type = memory_type if memory_type in {"medium", "long"} else "long"
+    normalized = normalize_voice_text(clean_content)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id
+            FROM assistant_memory
+            WHERE tenant_id=%s
+              AND user_id IS NOT DISTINCT FROM %s
+              AND normalized_content=%s
+              AND is_active=TRUE
+            LIMIT 1
+            """,
+            (tenant_id, user_id, normalized),
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                "UPDATE assistant_memory SET updated_at=now(), memory_type=%s WHERE id=%s RETURNING id, content, memory_type",
+                (clean_type, existing["id"]),
+            )
+            row = cur.fetchone()
+            return {"id": row["id"], "content": row["content"], "memory_type": row["memory_type"], "created": False}
+        cur.execute(
+            """
+            INSERT INTO assistant_memory (tenant_id, user_id, memory_type, content, normalized_content, source)
+            VALUES (%s, %s, %s, %s, %s, 'voice')
+            RETURNING id, content, memory_type
+            """,
+            (tenant_id, user_id, clean_type, clean_content, normalized),
+        )
+        row = cur.fetchone()
+        return {"id": row["id"], "content": row["content"], "memory_type": row["memory_type"], "created": True}
+
+def forget_assistant_memory(conn, tenant_id: int, user_id: Optional[int], query: str) -> dict:
+    clean_query = (query or "").strip()
+    if not clean_query:
+        raise ValueError("memory forget query is empty")
+    normalized_query = normalize_voice_text(clean_query)
+    forget_all = normalized_query in {"vse", "vsechno", "vsetko", "all", "everything", "wszystko"}
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if forget_all:
+            cur.execute(
+                """
+                UPDATE assistant_memory
+                SET is_active=FALSE, forgotten_at=now(), updated_at=now()
+                WHERE tenant_id=%s
+                  AND user_id IS NOT DISTINCT FROM %s
+                  AND is_active=TRUE
+                RETURNING id, content
+                """,
+                (tenant_id, user_id),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE assistant_memory
+                SET is_active=FALSE, forgotten_at=now(), updated_at=now()
+                WHERE tenant_id=%s
+                  AND user_id IS NOT DISTINCT FROM %s
+                  AND is_active=TRUE
+                  AND (normalized_content LIKE %s OR content ILIKE %s)
+                RETURNING id, content
+                """,
+                (tenant_id, user_id, f"%{normalized_query}%", f"%{clean_query}%"),
+            )
+        rows = [dict(row) for row in cur.fetchall()]
+        return {"count": len(rows), "items": rows[:10]}
 
 def is_voice_negative_response(text: str, *, include_zero: bool = False) -> bool:
     normalized = normalize_voice_text(text)
