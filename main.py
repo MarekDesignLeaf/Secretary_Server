@@ -352,6 +352,11 @@ CREATE TABLE IF NOT EXISTS user_contact_sync (
     display_name TEXT NOT NULL,
     phone_primary TEXT,
     email_primary TEXT,
+    address TEXT,
+    address_line1 TEXT,
+    city TEXT,
+    postcode TEXT,
+    country TEXT,
     normalized_phone TEXT,
     normalized_email TEXT,
     is_client BOOLEAN NOT NULL DEFAULT FALSE,
@@ -380,6 +385,11 @@ CREATE TABLE IF NOT EXISTS shared_contacts (
     company_name TEXT,
     phone_primary TEXT,
     email_primary TEXT,
+    address TEXT,
+    address_line1 TEXT,
+    city TEXT,
+    postcode TEXT,
+    country TEXT,
     notes TEXT,
     source TEXT DEFAULT 'manual',
     normalized_phone TEXT,
@@ -477,6 +487,16 @@ DO $$ BEGIN
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
     ALTER TABLE quote_items ADD COLUMN IF NOT EXISTS total DECIMAL DEFAULT 0;
     ALTER TABLE quote_items ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0;
+    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS address TEXT;
+    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS address_line1 TEXT;
+    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS city TEXT;
+    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS postcode TEXT;
+    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS country TEXT;
+    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS address TEXT;
+    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS address_line1 TEXT;
+    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS city TEXT;
+    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS postcode TEXT;
+    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS country TEXT;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 """
@@ -3195,6 +3215,32 @@ def choose_preferred_value(*values):
             best = candidate
     return best or None
 
+def clean_optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+def extract_contact_address_fields(data: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    address_line1 = clean_optional_text(
+        data.get("address_line1")
+        or data.get("billing_address_line1")
+        or data.get("street")
+    )
+    city = clean_optional_text(data.get("city") or data.get("billing_city"))
+    postcode = clean_optional_text(data.get("postcode") or data.get("billing_postcode"))
+    country = clean_optional_text(data.get("country") or data.get("billing_country"))
+    formatted = clean_optional_text(data.get("address"))
+    if not formatted:
+        formatted = ", ".join(part for part in [address_line1, city, postcode, country] if part) or None
+    return {
+        "address": formatted,
+        "address_line1": address_line1,
+        "city": city,
+        "postcode": postcode,
+        "country": country,
+    }
+
 def client_info_score(row: Dict[str, Any]) -> int:
     keys = [
         "display_name", "first_name", "last_name", "company_name", "phone_primary",
@@ -3243,17 +3289,39 @@ def merge_contact_rows_into_client(conn, tenant_id: int, primary_client_id: int,
         names = [row.get("display_name") for row in selected_rows]
         phones = [row.get("phone_primary") for row in selected_rows]
         emails = [row.get("email_primary") for row in selected_rows]
+        address_lines = [row.get("address_line1") or row.get("address") for row in selected_rows]
+        cities = [row.get("city") for row in selected_rows]
+        postcodes = [row.get("postcode") for row in selected_rows]
+        countries = [row.get("country") for row in selected_rows]
         display_name = choose_preferred_value(existing_client.get("display_name"), *names)
         phone_primary = choose_preferred_value(existing_client.get("phone_primary"), *phones)
         email_primary = choose_preferred_value(existing_client.get("email_primary"), *emails)
+        billing_address_line1 = choose_preferred_value(*address_lines) or existing_client.get("billing_address_line1")
+        billing_city = choose_preferred_value(*cities) or existing_client.get("billing_city")
+        billing_postcode = choose_preferred_value(*postcodes) or existing_client.get("billing_postcode")
+        billing_country = choose_preferred_value(*countries) or existing_client.get("billing_country") or "GB"
         cur.execute("""UPDATE clients
             SET display_name=%s,
                 phone_primary=%s,
                 email_primary=%s,
+                billing_address_line1=%s,
+                billing_city=%s,
+                billing_postcode=%s,
+                billing_country=%s,
                 source=COALESCE(source, 'synced_contact'),
                 updated_at=now()
             WHERE id=%s AND tenant_id=%s""",
-            (display_name, phone_primary, email_primary, primary_client_id, tenant_id))
+            (
+                display_name,
+                phone_primary,
+                email_primary,
+                billing_address_line1,
+                billing_city,
+                billing_postcode,
+                billing_country,
+                primary_client_id,
+                tenant_id,
+            ))
 
 def reconcile_contact_selection(conn, tenant_id: int, user_id: int, contact_key: str):
     with conn.cursor() as cur:
@@ -3287,10 +3355,24 @@ def reconcile_contact_selection(conn, tenant_id: int, user_id: int, contact_key:
         if primary is None:
             code_seed = normalized_phone[-6:] if normalized_phone else uuid.uuid4().hex[:6].upper()
             code = f"CL-SYNC-{code_seed.upper()}"
-            cur.execute("""INSERT INTO clients (tenant_id, client_code, client_type, display_name, phone_primary, email_primary, status, source)
-                VALUES (%s,%s,'individual',%s,%s,%s,'active','synced_contact')
+            address = extract_contact_address_fields(row)
+            cur.execute("""INSERT INTO clients (
+                    tenant_id, client_code, client_type, display_name, phone_primary, email_primary,
+                    billing_address_line1, billing_city, billing_postcode, billing_country, status, source
+                )
+                VALUES (%s,%s,'individual',%s,%s,%s,%s,%s,%s,%s,'active','synced_contact')
                 RETURNING *""",
-                (tenant_id, code, row.get("display_name") or "Client", row.get("phone_primary"), row.get("email_primary")))
+                (
+                    tenant_id,
+                    code,
+                    row.get("display_name") or "Client",
+                    row.get("phone_primary"),
+                    row.get("email_primary"),
+                    address.get("address_line1") or address.get("address"),
+                    address.get("city"),
+                    address.get("postcode"),
+                    address.get("country") or "GB",
+                ))
             primary = dict(cur.fetchone())
         merge_contact_rows_into_client(conn, tenant_id, primary["id"], selected_rows, primary)
         for duplicate in matches:
@@ -3345,6 +3427,7 @@ def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict
     company_name = (data.get("company_name") or "").strip() or None
     phone_primary = (data.get("phone_primary") or data.get("phone") or "").strip() or None
     email_primary = (data.get("email_primary") or data.get("email") or "").strip() or None
+    address_fields = extract_contact_address_fields(data)
     notes = (data.get("notes") or "").strip() or None
     normalized_phone = normalize_phone(phone_primary)
     normalized_email = normalize_email(email_primary)
@@ -3356,6 +3439,11 @@ def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict
                 company_name=%s,
                 phone_primary=%s,
                 email_primary=%s,
+                address=%s,
+                address_line1=%s,
+                city=%s,
+                postcode=%s,
+                country=%s,
                 notes=%s,
                 source=%s,
                 normalized_phone=%s,
@@ -3370,6 +3458,11 @@ def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict
                 choose_preferred_value(existing.get("company_name"), company_name),
                 choose_preferred_value(existing.get("phone_primary"), phone_primary),
                 choose_preferred_value(existing.get("email_primary"), email_primary),
+                address_fields.get("address") or existing.get("address"),
+                address_fields.get("address_line1") or existing.get("address_line1"),
+                address_fields.get("city") or existing.get("city"),
+                address_fields.get("postcode") or existing.get("postcode"),
+                address_fields.get("country") or existing.get("country"),
                 choose_preferred_value(existing.get("notes"), notes),
                 existing.get("source") or source,
                 normalized_phone or existing.get("normalized_phone"),
@@ -3380,12 +3473,30 @@ def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict
             ))
         return dict(cur.fetchone()), False
     cur.execute("""INSERT INTO shared_contacts
-        (tenant_id, section_code, display_name, company_name, phone_primary, email_primary, notes, source,
+        (tenant_id, section_code, display_name, company_name, phone_primary, email_primary,
+         address, address_line1, city, postcode, country, notes, source,
          normalized_phone, normalized_email, created_by, updated_by)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING *""",
-        (tenant_id, section_code, display_name, company_name, phone_primary, email_primary, notes, source,
-         normalized_phone or None, normalized_email or None, user_id, user_id))
+        (
+            tenant_id,
+            section_code,
+            display_name,
+            company_name,
+            phone_primary,
+            email_primary,
+            address_fields.get("address"),
+            address_fields.get("address_line1"),
+            address_fields.get("city"),
+            address_fields.get("postcode"),
+            address_fields.get("country"),
+            notes,
+            source,
+            normalized_phone or None,
+            normalized_email or None,
+            user_id,
+            user_id,
+        ))
     return dict(cur.fetchone()), True
 
 def run_startup_bootstrap():
@@ -3403,12 +3514,27 @@ def run_startup_bootstrap():
         release_conn(conn)
     except Exception as e: print(f"Schema check: {e}")
 
+def ensure_contact_address_schema():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            for table in ("user_contact_sync", "shared_contacts"):
+                for column in ("address", "address_line1", "city", "postcode", "country"):
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} TEXT")
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Contact address schema check: {e}")
+    finally:
+        release_conn(conn)
+
 def close_db_pool():
     if db_pool: db_pool.closeall()
 
 @asynccontextmanager
 async def app_lifespan(_: FastAPI):
     run_startup_bootstrap()
+    ensure_contact_address_schema()
     ensure_quote_items_table()
     ensure_hierarchy_workflow_schema()
     print(
@@ -4413,13 +4539,23 @@ async def sync_contacts(data: dict, request: Request):
                     continue
                 seen_keys.add(contact_key)
                 selected_flag = contact.get("selected_as_client")
+                address_fields = extract_contact_address_fields(contact)
                 cur.execute("""INSERT INTO user_contact_sync
-                    (tenant_id, user_id, contact_key, display_name, phone_primary, email_primary, normalized_phone, normalized_email, is_client, last_seen_at, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, FALSE),now(),now())
+                    (
+                        tenant_id, user_id, contact_key, display_name, phone_primary, email_primary,
+                        address, address_line1, city, postcode, country,
+                        normalized_phone, normalized_email, is_client, last_seen_at, updated_at
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, FALSE),now(),now())
                     ON CONFLICT (tenant_id, user_id, contact_key) DO UPDATE SET
                         display_name=EXCLUDED.display_name,
                         phone_primary=EXCLUDED.phone_primary,
                         email_primary=EXCLUDED.email_primary,
+                        address=EXCLUDED.address,
+                        address_line1=EXCLUDED.address_line1,
+                        city=EXCLUDED.city,
+                        postcode=EXCLUDED.postcode,
+                        country=EXCLUDED.country,
                         normalized_phone=EXCLUDED.normalized_phone,
                         normalized_email=EXCLUDED.normalized_email,
                         is_client=CASE WHEN %s IS NULL THEN user_contact_sync.is_client ELSE %s END,
@@ -4432,6 +4568,11 @@ async def sync_contacts(data: dict, request: Request):
                         name or phone or email or "Contact",
                         phone or None,
                         email or None,
+                        address_fields.get("address"),
+                        address_fields.get("address_line1"),
+                        address_fields.get("city"),
+                        address_fields.get("postcode"),
+                        address_fields.get("country"),
                         normalize_contact_phone(phone) or None,
                         normalize_email(email) or None,
                         selected_flag,
@@ -4454,6 +4595,7 @@ async def sync_contacts(data: dict, request: Request):
 
         with conn.cursor() as cur:
             cur.execute("""SELECT ucs.contact_key, ucs.display_name, ucs.phone_primary, ucs.email_primary,
+                                  ucs.address, ucs.address_line1, ucs.city, ucs.postcode, ucs.country,
                                   ucs.is_client, ucs.linked_client_id, c.display_name AS linked_client_name
                 FROM user_contact_sync ucs
                 LEFT JOIN clients c ON c.id = ucs.linked_client_id AND c.deleted_at IS NULL
@@ -4471,6 +4613,15 @@ async def sync_contacts(data: dict, request: Request):
                     "name": row["display_name"],
                     "phone": row.get("phone_primary"),
                     "email": row.get("email_primary"),
+                    "address": row.get("address"),
+                    "address_line1": row.get("address_line1"),
+                    "city": row.get("city"),
+                    "postcode": row.get("postcode"),
+                    "country": row.get("country"),
+                    "billing_address_line1": row.get("address_line1") or row.get("address"),
+                    "billing_city": row.get("city"),
+                    "billing_postcode": row.get("postcode"),
+                    "billing_country": row.get("country"),
                     "selected_as_client": bool(row.get("is_client")),
                     "linked_client_id": row.get("linked_client_id"),
                     "linked_client_name": row.get("linked_client_name"),
@@ -5168,7 +5319,8 @@ async def get_shared_contacts(request: Request):
     try:
         with conn.cursor() as cur:
             cur.execute("""SELECT c.id, c.section_code, s.display_name AS section_name, c.display_name, c.company_name,
-                                  c.phone_primary, c.email_primary, c.notes, c.source, c.created_at::text, c.updated_at::text
+                                  c.phone_primary, c.email_primary, c.address, c.address_line1, c.city, c.postcode,
+                                  c.country, c.notes, c.source, c.created_at::text, c.updated_at::text
                 FROM shared_contacts c
                 LEFT JOIN contact_sections s ON s.tenant_id=c.tenant_id AND s.section_code=c.section_code
                 WHERE c.tenant_id=%s AND c.deleted_at IS NULL
@@ -5213,12 +5365,18 @@ async def update_shared_contact(contact_id: int, data: dict, request: Request):
                 raise HTTPException(400, "display_name required")
             phone_primary = (data.get("phone_primary") or existing.get("phone_primary") or "").strip() or None
             email_primary = (data.get("email_primary") or existing.get("email_primary") or "").strip() or None
+            address_fields = extract_contact_address_fields({**existing, **data})
             cur.execute("""UPDATE shared_contacts
                 SET section_code=%s,
                     display_name=%s,
                     company_name=%s,
                     phone_primary=%s,
                     email_primary=%s,
+                    address=%s,
+                    address_line1=%s,
+                    city=%s,
+                    postcode=%s,
+                    country=%s,
                     notes=%s,
                     normalized_phone=%s,
                     normalized_email=%s,
@@ -5232,6 +5390,11 @@ async def update_shared_contact(contact_id: int, data: dict, request: Request):
                     (data.get("company_name") if "company_name" in data else existing.get("company_name")) or None,
                     phone_primary,
                     email_primary,
+                    address_fields.get("address"),
+                    address_fields.get("address_line1"),
+                    address_fields.get("city"),
+                    address_fields.get("postcode"),
+                    address_fields.get("country"),
                     (data.get("notes") if "notes" in data else existing.get("notes")) or None,
                     normalize_phone(phone_primary) or None,
                     normalize_email(email_primary) or None,
