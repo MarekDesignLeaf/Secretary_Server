@@ -18,6 +18,7 @@ import jwt as pyjwt
 import json
 import urllib.request
 import unicodedata
+from email.utils import parsedate_to_datetime
 from contextlib import contextmanager, asynccontextmanager
 
 app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
@@ -446,6 +447,12 @@ DO $$ BEGIN
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS comm_type TEXT DEFAULT 'telefon';
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS job_id BIGINT;
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS source TEXT;
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS external_message_id TEXT;
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS source_phone TEXT;
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS target_phone TEXT;
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS conversation_key TEXT;
+    ALTER TABLE communications ADD COLUMN IF NOT EXISTS imported_at TIMESTAMPTZ DEFAULT now();
     ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
@@ -500,6 +507,10 @@ DO $$ BEGIN
     ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS country TEXT;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
+CREATE INDEX IF NOT EXISTS idx_communications_tenant_client_time
+    ON communications(tenant_id, client_id, sent_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_communications_source_external
+    ON communications(tenant_id, source, external_message_id);
 UPDATE users
 SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), email, display_name),
     updated_at = now()
@@ -3196,6 +3207,139 @@ def normalize_contact_phone(phone: Optional[str]) -> str:
         digits = "0" + digits[2:]
     return digits
 
+def normalize_communication_source(source: Optional[str]) -> str:
+    raw = (source or "").strip().lower().replace(" ", "")
+    aliases = {
+        "wa": "whatsapp",
+        "whatsup": "whatsapp",
+        "whatsappmessage": "whatsapp",
+        "text": "sms",
+        "txt": "sms",
+        "smsmessage": "sms",
+        "phone": "telefon",
+        "call": "telefon",
+    }
+    return aliases.get(raw, raw or "manual")
+
+def parse_communication_timestamp(value: Any) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 100000000000:
+                timestamp = timestamp / 1000.0
+            return datetime.fromtimestamp(timestamp, ZoneInfo("UTC"))
+        text = str(value).strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d+(\.\d+)?", text):
+            return parse_communication_timestamp(float(text))
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return parsedate_to_datetime(text)
+    except Exception:
+        return None
+
+def find_client_by_communication_phone(cur, tenant_id: int, phone: Optional[str]) -> Optional[Dict[str, Any]]:
+    wanted = normalize_whatsapp_phone(phone)
+    if not wanted:
+        return None
+    cur.execute("""
+        SELECT id, display_name, phone_primary, phone_secondary
+        FROM clients
+        WHERE tenant_id=%s AND deleted_at IS NULL
+    """, (tenant_id,))
+    for row in cur.fetchall():
+        if normalize_whatsapp_phone(row.get("phone_primary")) == wanted or normalize_whatsapp_phone(row.get("phone_secondary")) == wanted:
+            return dict(row)
+    return None
+
+def upsert_communication_message(cur, tenant_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
+    source = normalize_communication_source(data.get("source") or data.get("comm_type"))
+    comm_type = data.get("comm_type") or ("whatsapp" if source == "whatsapp" else "sms" if source == "sms" else source)
+    direction = (data.get("direction") or "inbound").strip().lower()
+    if direction.startswith("out"):
+        direction = "outbound"
+    elif direction.startswith("in"):
+        direction = "inbound"
+    message = data.get("message") or data.get("message_summary") or data.get("body") or ""
+    source_phone = data.get("source_phone") or data.get("from")
+    target_phone = data.get("target_phone") or data.get("to")
+    peer_phone = data.get("phone")
+    if peer_phone and not source_phone and direction == "inbound":
+        source_phone = peer_phone
+    if peer_phone and not target_phone and direction == "outbound":
+        target_phone = peer_phone
+    if not peer_phone:
+        peer_phone = source_phone if direction == "inbound" else target_phone
+    conversation_key = data.get("conversation_key") or normalize_whatsapp_phone(peer_phone)
+    sent_at = parse_communication_timestamp(data.get("sent_at") or data.get("timestamp") or data.get("date_sent"))
+    external_id = (str(data.get("external_message_id") or data.get("message_id") or data.get("sid") or "").strip() or None)
+    if not external_id and source in ("sms", "whatsapp") and (message or peer_phone or sent_at):
+        seed = f"{source}|{direction}|{source_phone or ''}|{target_phone or ''}|{sent_at.isoformat() if sent_at else ''}|{message}"
+        external_id = "generated-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+    client_id = data.get("client_id")
+    client_match = None
+    if client_id:
+        cur.execute("SELECT id, display_name FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (client_id, tenant_id))
+        row = cur.fetchone()
+        if row:
+            client_match = dict(row)
+        else:
+            client_id = None
+    if not client_id:
+        client_match = find_client_by_communication_phone(cur, tenant_id, peer_phone)
+        client_id = client_match["id"] if client_match else None
+
+    subject = data.get("subject") or f"{source.upper()} {'od' if direction == 'inbound' else 'pro'} {peer_phone or ''}".strip()
+    notes = data.get("notes")
+
+    if external_id:
+        cur.execute("""
+            SELECT id FROM communications
+            WHERE tenant_id=%s AND source=%s AND external_message_id=%s
+            LIMIT 1
+        """, (tenant_id, source, external_id))
+        existing = cur.fetchone()
+        if existing:
+            cur.execute("""
+                UPDATE communications
+                SET client_id=COALESCE(%s, client_id),
+                    job_id=COALESCE(%s, job_id),
+                    comm_type=%s,
+                    subject=%s,
+                    message_summary=%s,
+                    direction=%s,
+                    notes=COALESCE(%s, notes),
+                    sent_at=COALESCE(%s, sent_at),
+                    source_phone=COALESCE(%s, source_phone),
+                    target_phone=COALESCE(%s, target_phone),
+                    conversation_key=COALESCE(%s, conversation_key),
+                    imported_at=now()
+                WHERE id=%s
+                RETURNING id
+            """, (client_id, data.get("job_id"), comm_type, subject, str(message)[:4000], direction,
+                  notes, sent_at, source_phone, target_phone, conversation_key, existing["id"]))
+            row = cur.fetchone()
+            return {"id": row["id"], "created": False, "matched": bool(client_id)}
+
+    cur.execute("""
+        INSERT INTO communications (
+            tenant_id, client_id, job_id, comm_type, source, external_message_id,
+            source_phone, target_phone, conversation_key, subject, message_summary,
+            direction, notes, sent_at, imported_at
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, now()),now())
+        RETURNING id
+    """, (tenant_id, client_id, data.get("job_id"), comm_type, source, external_id,
+          source_phone, target_phone, conversation_key, subject, str(message)[:4000],
+          direction, notes, sent_at))
+    row = cur.fetchone()
+    return {"id": row["id"], "created": True, "matched": bool(client_id)}
+
 def normalize_email(email: Optional[str]) -> str:
     return (email or "").strip().lower()
 
@@ -4180,9 +4324,17 @@ RULES:
                         )}
                     translated = result.get("translated_text", message)
                     with conn.cursor() as cur:
-                        cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                            VALUES (%s,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
-                            (tenant_id, client["id"], translated[:500], f"To: {phone} | Original: {message[:200]} | Language: {outgoing_language}"))
+                        upsert_communication_message(cur, tenant_id, {
+                            "client_id": client["id"],
+                            "comm_type": "whatsapp",
+                            "source": "whatsapp",
+                            "target_phone": phone,
+                            "phone": phone,
+                            "subject": "WA zpráva",
+                            "message": translated[:500],
+                            "direction": "outbound",
+                            "notes": f"To: {phone} | Original: {message[:200]} | Language: {outgoing_language}",
+                        })
                     log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']} ({outgoing_language}): {translated[:100]}", tenant_id=tenant_id)
                     conn.commit()
                     return {"reply_cs": tr(
@@ -4487,7 +4639,15 @@ async def get_client_detail(client_id: int, request: Request):
             props = cur.fetchall()
             cur.execute("SELECT j.*,j.start_date_planned::text as start_date_planned FROM jobs j WHERE j.client_id=%s AND j.deleted_at IS NULL ORDER BY j.created_at DESC LIMIT 10",(client_id,))
             jobs = cur.fetchall()
-            cur.execute("SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes,created_at::text FROM communications WHERE client_id=%s ORDER BY created_at DESC LIMIT 10",(client_id,))
+            cur.execute("""
+                SELECT id,client_id,job_id,comm_type,COALESCE(source, comm_type) AS source,
+                       external_message_id,source_phone,target_phone,conversation_key,
+                       subject,message_summary,sent_at::text,direction,notes,created_at::text,imported_at::text
+                FROM communications
+                WHERE client_id=%s AND tenant_id=%s
+                ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
+                LIMIT 500
+            """,(client_id, tid))
             comms = cur.fetchall()
             cur.execute("SELECT * FROM tasks WHERE client_id=%s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 10",(client_id,))
             tasks = cur.fetchall()
@@ -5909,8 +6069,10 @@ async def get_communications(request: Request, client_id: Optional[int]=None, jo
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = """SELECT c.id, c.client_id, c.job_id, c.comm_type, c.subject, c.message_summary,
-                     c.sent_at::text, c.direction, c.notes, c.created_at::text,
+            sql = """SELECT c.id, c.client_id, c.job_id, c.comm_type, COALESCE(c.source, c.comm_type) AS source,
+                     c.external_message_id, c.source_phone, c.target_phone, c.conversation_key,
+                     c.subject, c.message_summary, c.sent_at::text, c.direction, c.notes,
+                     c.created_at::text, c.imported_at::text,
                      cl.display_name as client_name, j.job_title as job_title
                      FROM communications c
                      LEFT JOIN clients cl ON c.client_id = cl.id
@@ -5920,7 +6082,7 @@ async def get_communications(request: Request, client_id: Optional[int]=None, jo
             if client_id: sql += " AND c.client_id=%s"; params.append(client_id)
             if job_id: sql += " AND c.job_id=%s"; params.append(job_id)
             if comm_type: sql += " AND c.comm_type=%s"; params.append(comm_type)
-            sql += " ORDER BY c.created_at DESC LIMIT 100"
+            sql += " ORDER BY COALESCE(c.sent_at, c.created_at) DESC, c.id DESC LIMIT 1000"
             cur.execute(sql, params); return cur.fetchall()
     finally: release_conn(conn)
 
@@ -5930,18 +6092,107 @@ async def log_communication(request: Request, data: dict):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO communications (tenant_id,client_id,job_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now()) RETURNING id,comm_type,subject,direction""",
-                (tid, data.get("client_id"),data.get("job_id"),data.get("comm_type","telefon"),
-                 data.get("subject"),data.get("message",data.get("message_summary","")),
-                 data.get("direction","outbound"),data.get("notes")))
-            comm = dict(cur.fetchone())
+            comm = upsert_communication_message(cur, tid, {
+                **data,
+                "source": data.get("source") or data.get("comm_type", "manual"),
+                "message": data.get("message", data.get("message_summary", "")),
+            })
             if data.get("client_id"):
-                log_activity(conn,"client",data["client_id"],"communication",f"{comm.get('comm_type','')}: {comm.get('subject','')}")
+                log_activity(conn,"client",data["client_id"],"communication",f"{data.get('comm_type','')}: {data.get('subject','')}")
             conn.commit()
         return comm
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
+
+@app.post("/crm/communications/import")
+async def import_communications(request: Request, data: dict):
+    user = ensure_request_permissions(request, "crm_write")
+    tenant_id = user["tenant_id"]
+    source = normalize_communication_source(data.get("source") or data.get("comm_type") or "sms")
+    messages = data.get("messages") or []
+    if not isinstance(messages, list):
+        raise HTTPException(422, "messages must be a list")
+    messages = messages[:10000]
+    conn = get_db_conn()
+    imported = updated = matched = unmatched = 0
+    try:
+        with conn.cursor() as cur:
+            for item in messages:
+                if not isinstance(item, dict):
+                    continue
+                result = upsert_communication_message(cur, tenant_id, {**item, "source": item.get("source") or source})
+                if result.get("created"):
+                    imported += 1
+                else:
+                    updated += 1
+                if result.get("matched"):
+                    matched += 1
+                else:
+                    unmatched += 1
+            log_activity(conn, "communication", 0, "import", f"Import {source}: {imported} new, {updated} updated", tenant_id=tenant_id, user_id=user.get("user_id"))
+            conn.commit()
+        return {"status": "ok", "summary": {"source": source, "scanned": len(messages), "imported": imported, "updated": updated, "matched": matched, "unmatched": unmatched}}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+@app.post("/crm/communications/provider-history-import")
+async def import_provider_communication_history(request: Request, data: dict):
+    user = ensure_request_permissions(request, "crm_write")
+    tenant_id = user["tenant_id"]
+    provider = get_whatsapp_provider()
+    if provider != "twilio":
+        return {"status": "ok", "summary": {"provider": provider, "scanned": 0, "imported": 0, "updated": 0, "matched": 0, "unmatched": 0, "message": "Server history import is available only for Twilio history. Meta WhatsApp cannot fetch old phone chat history."}}
+    try:
+        limit = max(1, min(int(data.get("limit", 1000)), 5000))
+    except Exception:
+        limit = 1000
+    messages = []
+    next_url = f"{get_twilio_messages_api_url()}?{urlencode({'PageSize': min(limit, 1000)})}"
+    auth = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")).decode("ascii")
+    while next_url and len(messages) < limit:
+        req = urllib.request.Request(next_url, headers={"Authorization": f"Basic {auth}"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            page = json.loads(resp.read().decode("utf-8"))
+        for msg in page.get("messages", []):
+            from_raw = (msg.get("from") or "").replace("whatsapp:", "")
+            to_raw = (msg.get("to") or "").replace("whatsapp:", "")
+            is_whatsapp = str(msg.get("from", "")).startswith("whatsapp:") or str(msg.get("to", "")).startswith("whatsapp:")
+            direction = "outbound" if str(msg.get("direction", "")).startswith("outbound") else "inbound"
+            messages.append({
+                "source": "whatsapp" if is_whatsapp else "sms",
+                "external_message_id": msg.get("sid"),
+                "source_phone": from_raw,
+                "target_phone": to_raw,
+                "phone": from_raw if direction == "inbound" else to_raw,
+                "direction": direction,
+                "message": msg.get("body") or "",
+                "sent_at": msg.get("date_sent") or msg.get("date_created"),
+            })
+            if len(messages) >= limit:
+                break
+        uri = page.get("next_page_uri")
+        next_url = f"https://api.twilio.com{uri}" if uri and len(messages) < limit else None
+    conn = get_db_conn()
+    imported = updated = matched = unmatched = 0
+    try:
+        with conn.cursor() as cur:
+            for item in messages:
+                result = upsert_communication_message(cur, tenant_id, item)
+                imported += 1 if result.get("created") else 0
+                updated += 0 if result.get("created") else 1
+                matched += 1 if result.get("matched") else 0
+                unmatched += 0 if result.get("matched") else 1
+            log_activity(conn, "communication", 0, "provider_import", f"Twilio import: {imported} new, {updated} updated", tenant_id=tenant_id, user_id=user.get("user_id"))
+            conn.commit()
+        return {"status": "ok", "summary": {"provider": provider, "scanned": len(messages), "imported": imported, "updated": updated, "matched": matched, "unmatched": unmatched}}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
 
 @app.post("/crm/communications/whatsapp-address-sync")
 async def sync_whatsapp_addresses(request: Request, data: dict):
@@ -9246,9 +9497,19 @@ async def wa_incoming(request: Request):
                                     client_name = display
                                     log_activity(conn,"client",client_id,"auto_create",f"Klient vytvoren z WhatsApp: {display}")
                         with conn.cursor() as cur:
-                            cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                                VALUES (1,%s,'whatsapp',%s,%s,'inbound',%s,now())""",
-                                (client_id, f"WA od {client_name or '+'+sender}", text[:500], f"Phone: +{sender}"))
+                            upsert_communication_message(cur, 1, {
+                                "client_id": client_id,
+                                "comm_type": "whatsapp",
+                                "source": "whatsapp",
+                                "external_message_id": msg.get("id"),
+                                "source_phone": f"+{sender}",
+                                "phone": f"+{sender}",
+                                "subject": f"WA od {client_name or '+'+sender}",
+                                "message": text[:500],
+                                "direction": "inbound",
+                                "notes": f"Phone: +{sender}",
+                                "sent_at": msg.get("timestamp"),
+                            })
                         log_activity(conn,"communication",0,"whatsapp_in",f"WhatsApp od +{sender}: {text[:100]}")
                         conn.commit()
                     finally: release_conn(conn)
@@ -9279,9 +9540,17 @@ async def wa_send(request: Request, data: dict):
     try:
         translated = result.get("translated_text", message)
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
-                VALUES (%s,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
-                (tenant_id, client_id, translated[:500], f"To: {to} | Original: {message[:200]} | Language: {outgoing_language}"))
+            upsert_communication_message(cur, tenant_id, {
+                "client_id": client_id,
+                "comm_type": "whatsapp",
+                "source": "whatsapp",
+                "target_phone": to,
+                "phone": to,
+                "subject": "WA zpráva",
+                "message": translated[:500],
+                "direction": "outbound",
+                "notes": f"To: {to} | Original: {message[:200]} | Language: {outgoing_language}",
+            })
         log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to} ({outgoing_language}): {translated[:100]}", tenant_id=tenant_id)
         conn.commit()
     finally: release_conn(conn)
