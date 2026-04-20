@@ -14,10 +14,16 @@ import httpx
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import base64
+import imaplib
 import jwt as pyjwt
 import json
+import smtplib
 import urllib.request
 import unicodedata
+from email import policy
+from email.header import decode_header, make_header
+from email.message import EmailMessage
+from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from contextlib import contextmanager, asynccontextmanager
 
@@ -36,6 +42,191 @@ JWT_REFRESH_EXPIRE_DAYS = 30
 DEFAULT_TEMP_PASSWORD = "12345"
 WEATHER_CACHE_TTL_SECONDS = 600
 WEATHER_CACHE: Dict[str, Dict[str, Any]] = {}
+
+MAIL_SEARCH_FETCH_LIMIT = 200
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+def get_mail_config() -> Dict[str, Any]:
+    username = os.getenv("MAIL_IMAP_USERNAME") or os.getenv("MAIL_USERNAME") or os.getenv("SMTP_USERNAME")
+    password = os.getenv("MAIL_IMAP_PASSWORD") or os.getenv("MAIL_PASSWORD") or os.getenv("SMTP_PASSWORD")
+    return {
+        "imap_host": os.getenv("MAIL_IMAP_HOST") or os.getenv("IMAP_HOST"),
+        "imap_port": int(os.getenv("MAIL_IMAP_PORT") or os.getenv("IMAP_PORT") or "993"),
+        "imap_ssl": _env_bool("MAIL_IMAP_SSL", True),
+        "imap_folder": os.getenv("MAIL_IMAP_FOLDER") or "INBOX",
+        "username": username,
+        "password": password,
+        "smtp_host": os.getenv("MAIL_SMTP_HOST") or os.getenv("SMTP_HOST"),
+        "smtp_port": int(os.getenv("MAIL_SMTP_PORT") or os.getenv("SMTP_PORT") or "465"),
+        "smtp_ssl": _env_bool("MAIL_SMTP_SSL", True),
+        "smtp_starttls": _env_bool("MAIL_SMTP_STARTTLS", False),
+        "smtp_username": os.getenv("MAIL_SMTP_USERNAME") or os.getenv("SMTP_USERNAME") or username,
+        "smtp_password": os.getenv("MAIL_SMTP_PASSWORD") or os.getenv("SMTP_PASSWORD") or password,
+        "from_email": os.getenv("MAIL_FROM") or username,
+    }
+
+def ensure_mail_reader_config(cfg: Dict[str, Any]):
+    missing = [name for name in ("imap_host", "username", "password") if not cfg.get(name)]
+    if missing:
+        raise RuntimeError("Mailbox is not configured. Set MAIL_IMAP_HOST, MAIL_IMAP_USERNAME and MAIL_IMAP_PASSWORD on the server.")
+
+def ensure_mail_sender_config(cfg: Dict[str, Any]):
+    missing = [name for name in ("smtp_host", "smtp_username", "smtp_password", "from_email") if not cfg.get(name)]
+    if missing:
+        raise RuntimeError("SMTP is not configured. Set MAIL_SMTP_HOST, MAIL_SMTP_USERNAME, MAIL_SMTP_PASSWORD and MAIL_FROM on the server.")
+
+def decode_mail_header(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value))).strip()
+    except Exception:
+        return str(value).strip()
+
+def extract_mail_text(message) -> str:
+    if message.is_multipart():
+        html_fallback = ""
+        for part in message.walk():
+            if part.get_content_disposition() == "attachment":
+                continue
+            content_type = part.get_content_type()
+            try:
+                content = part.get_content()
+            except Exception:
+                continue
+            if not isinstance(content, str):
+                continue
+            if content_type == "text/plain" and content.strip():
+                return content.strip()
+            if content_type == "text/html" and content.strip() and not html_fallback:
+                html_fallback = re.sub(r"<[^>]+>", " ", content)
+        return re.sub(r"\s+", " ", html_fallback).strip()
+    try:
+        content = message.get_content()
+        return content.strip() if isinstance(content, str) else ""
+    except Exception:
+        return ""
+
+def parse_mail_message(uid: str, raw: bytes, include_body: bool = True) -> Dict[str, Any]:
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    sent_at = ""
+    try:
+        sent = parsedate_to_datetime(message.get("Date"))
+        sent_at = sent.isoformat()
+    except Exception:
+        sent_at = message.get("Date") or ""
+    body = extract_mail_text(message) if include_body else ""
+    return {
+        "uid": uid,
+        "message_id": message.get("Message-ID") or "",
+        "subject": decode_mail_header(message.get("Subject")),
+        "from": decode_mail_header(message.get("From")),
+        "to": decode_mail_header(message.get("To")),
+        "reply_to": decode_mail_header(message.get("Reply-To")),
+        "date": sent_at,
+        "body": body,
+        "summary": re.sub(r"\s+", " ", body).strip()[:350],
+    }
+
+def connect_imap_mailbox(cfg: Dict[str, Any]):
+    ensure_mail_reader_config(cfg)
+    if cfg["imap_ssl"]:
+        mailbox = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"])
+    else:
+        mailbox = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"])
+    mailbox.login(cfg["username"], cfg["password"])
+    mailbox.select(cfg["imap_folder"], readonly=True)
+    return mailbox
+
+def fetch_mail_by_uid(uid: str) -> Optional[Dict[str, Any]]:
+    cfg = get_mail_config()
+    mailbox = connect_imap_mailbox(cfg)
+    try:
+        status, data = mailbox.uid("fetch", uid, "(RFC822)")
+        if status != "OK" or not data:
+            return None
+        for item in data:
+            if isinstance(item, tuple):
+                return parse_mail_message(uid, item[1], include_body=True)
+        return None
+    finally:
+        try: mailbox.close()
+        except Exception: pass
+        try: mailbox.logout()
+        except Exception: pass
+
+def search_mail_messages(query: str = "", sender: str = "", unread_only: bool = False, limit: int = 5) -> List[Dict[str, Any]]:
+    cfg = get_mail_config()
+    mailbox = connect_imap_mailbox(cfg)
+    try:
+        criteria = "UNSEEN" if unread_only else "ALL"
+        status, data = mailbox.uid("search", None, criteria)
+        if status != "OK" or not data:
+            return []
+        uids = data[0].split()[-MAIL_SEARCH_FETCH_LIMIT:]
+        needles = [n.lower() for n in [query.strip(), sender.strip()] if n.strip()]
+        matches: List[Dict[str, Any]] = []
+        for raw_uid in reversed(uids):
+            uid = raw_uid.decode("ascii", errors="ignore")
+            status, msg_data = mailbox.uid("fetch", uid, "(RFC822)")
+            if status != "OK":
+                continue
+            for item in msg_data:
+                if not isinstance(item, tuple):
+                    continue
+                parsed = parse_mail_message(uid, item[1], include_body=True)
+                haystack = " ".join([
+                    parsed.get("subject", ""),
+                    parsed.get("from", ""),
+                    parsed.get("to", ""),
+                    parsed.get("body", ""),
+                ]).lower()
+                if needles and not all(n in haystack for n in needles):
+                    continue
+                matches.append(parsed)
+                break
+            if len(matches) >= max(1, min(limit, 20)):
+                break
+        return matches
+    finally:
+        try: mailbox.close()
+        except Exception: pass
+        try: mailbox.logout()
+        except Exception: pass
+
+def send_mail_reply(original: Dict[str, Any], body: str) -> Dict[str, Any]:
+    cfg = get_mail_config()
+    ensure_mail_sender_config(cfg)
+    to_addr = original.get("reply_to") or original.get("from")
+    if not to_addr:
+        raise RuntimeError("Original email has no sender address to reply to.")
+    subject = original.get("subject") or ""
+    if not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}".strip()
+    message = EmailMessage()
+    message["From"] = cfg["from_email"]
+    message["To"] = to_addr
+    message["Subject"] = subject
+    if original.get("message_id"):
+        message["In-Reply-To"] = original["message_id"]
+        message["References"] = original["message_id"]
+    message.set_content(body.strip())
+    if cfg["smtp_ssl"]:
+        with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"]) as smtp:
+            smtp.login(cfg["smtp_username"], cfg["smtp_password"])
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"]) as smtp:
+            if cfg["smtp_starttls"]:
+                smtp.starttls()
+            smtp.login(cfg["smtp_username"], cfg["smtp_password"])
+            smtp.send_message(message)
+    return {"to": to_addr, "subject": subject}
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
 PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/nature/", "/admin/", "/process", "/voice/", "/work-reports"]
@@ -3915,6 +4106,8 @@ RULES:
 - When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather.
 - When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Find client by name, get their phone, send message.
 - For send_whatsapp: if the user dictates the message in Czech or Polish, keep the meaning but send it in the default customer language. Default customer language is usually English unless the user explicitly requests another language.
+- For email inbox: use search_email to find messages, read_email to read a message or latest matching message aloud, and reply_email to answer an existing email thread.
+- For new outbound email use send_email. For replies to an existing incoming email always use reply_email so the reply goes to the original sender.
 - When user asks about clients database, how many clients, client statistics, sources, types, or any question about CRM data, use query_clients. Examples: 'kolik mam klientu', 'odkud jsou klienti', 'jaci klienti jsou aktivni', 'kolik mam zakazek', 'statistiky', 'prehled databaze'."""
 
         tools = [
@@ -3925,6 +4118,9 @@ RULES:
             {"type":"function","function":{"name":"search_contacts","description":"Hleda v CRM klientech i telefonnich kontaktech","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
             {"type":"function","function":{"name":"call_contact","description":"Vytoci telefonni cislo","parameters":{"type":"object","properties":{"phone":{"type":"string"}},"required":["phone"]}}},
             {"type":"function","function":{"name":"send_email","description":"Posle email","parameters":{"type":"object","properties":{"to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},"required":["to","subject","body"]}}},
+            {"type":"function","function":{"name":"search_email","description":"Vyhleda emaily ve schrankce podle textu, odesilatele nebo neprectenych zprav.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Text hledany v predmetu, odesilateli nebo tele emailu"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"unread_only":{"type":"boolean","default":False},"limit":{"type":"integer","default":5}}}}},
+            {"type":"function","function":{"name":"read_email","description":"Precte posledni nebo konkretni email. Pouzij pro 'precti email', 'otevri email', 'precti posledni email od ...'.","parameters":{"type":"object","properties":{"uid":{"type":"string","description":"UID emailu z vysledku search_email"},"query":{"type":"string","description":"Text pro nalezeni emailu, pokud UID neni znamy"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"unread_only":{"type":"boolean","default":False}}}}},
+            {"type":"function","function":{"name":"reply_email","description":"Odpovi na existujici email. Najde email podle UID nebo dotazu a posle odpoved puvodnimu odesilateli pres SMTP.","parameters":{"type":"object","properties":{"uid":{"type":"string","description":"UID emailu z vysledku search_email/read_email"},"query":{"type":"string","description":"Text pro nalezeni emailu, pokud UID neni znamy"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"body":{"type":"string","description":"Text odpovedi"}},"required":["body"]}}},
             {"type":"function","function":{"name":"create_client","description":"Vytvori noveho klienta v CRM","parameters":{"type":"object","properties":{"name":{"type":"string"},"email":{"type":"string"},"phone":{"type":"string"}},"required":["name"]}}},
             {"type":"function","function":{"name":"create_task","description":"Vytvori ukol. Pouzij pro: zavolat, email, schuzka, objednavka, kalkulace, kontrola, pripomenuti.","parameters":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"task_type":{"type":"string","enum":["volat","email","schuzka","objednat_material","vytvorit_kalkulaci","poslat_kalkulaci","navsteva_klienta","zamereni","realizace","kontrola","reklamace","pripomenout_se","interni_poznamka","fotodokumentace"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"deadline":{"type":"string"},"planned_date":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"assigned_to":{"type":"string"},"planning_note":{"type":"string"},"client_name":{"type":"string"}},"required":["title"]}}},
             {"type":"function","function":{"name":"create_job","description":"Vytvori novou zakazku","parameters":{"type":"object","properties":{"title":{"type":"string"},"client_name":{"type":"string"},"description":{"type":"string"},"start_date":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"assigned_to":{"type":"string"},"handover_note":{"type":"string"}},"required":["title"]}}},
@@ -4157,6 +4353,108 @@ RULES:
             if action == "START_WORK_REPORT":
                 return {"reply_cs":tr("Starting work report.", "Spouštím work report dialog.", "Uruchamiam raport pracy."),
                         "action_type":"START_WORK_REPORT","action_data":{}}
+
+            if action == "SEARCH_EMAIL":
+                try:
+                    query = str(args.get("query") or "").strip()
+                    sender = str(args.get("sender") or "").strip()
+                    unread_only = bool(args.get("unread_only") or False)
+                    try:
+                        limit = int(float(args.get("limit", 5)))
+                    except Exception:
+                        limit = 5
+                    emails = search_mail_messages(query=query, sender=sender, unread_only=unread_only, limit=limit)
+                    if not emails:
+                        return {"reply_cs": tr(
+                            "I did not find any matching emails.",
+                            "Nenašla jsem žádné odpovídající e-maily.",
+                            "Nie znalazłam pasujących e-maili."
+                        )}
+                    lines = []
+                    for idx, email_row in enumerate(emails, start=1):
+                        lines.append(
+                            f"{idx}. UID {email_row.get('uid')}: {email_row.get('from') or 'Unknown'} — "
+                            f"{email_row.get('subject') or tr('No subject', 'Bez předmětu', 'Bez tematu')}. "
+                            f"{email_row.get('summary') or ''}"
+                        )
+                    return {"reply_cs": tr(
+                        "I found these emails:\n" + "\n".join(lines),
+                        "Našla jsem tyto e-maily:\n" + "\n".join(lines),
+                        "Znalazłam te e-maile:\n" + "\n".join(lines)
+                    )}
+                except Exception as e:
+                    return {"reply_cs": tr(
+                        f"Email search is not available: {e}",
+                        f"Vyhledávání e-mailů není dostupné: {e}",
+                        f"Wyszukiwanie e-maili nie jest dostępne: {e}"
+                    )}
+
+            if action == "READ_EMAIL":
+                try:
+                    uid = str(args.get("uid") or "").strip()
+                    email_row = fetch_mail_by_uid(uid) if uid else None
+                    if not email_row:
+                        emails = search_mail_messages(
+                            query=str(args.get("query") or "").strip(),
+                            sender=str(args.get("sender") or "").strip(),
+                            unread_only=bool(args.get("unread_only") or False),
+                            limit=1,
+                        )
+                        email_row = emails[0] if emails else None
+                    if not email_row:
+                        return {"reply_cs": tr(
+                            "I could not find that email.",
+                            "Ten e-mail jsem nenašla.",
+                            "Nie znalazłam tego e-maila."
+                        )}
+                    body = (email_row.get("body") or "").strip()
+                    if len(body) > 1800:
+                        body = body[:1800].rstrip() + "..."
+                    return {"reply_cs": tr(
+                        f"Email from {email_row.get('from')}. Subject: {email_row.get('subject') or 'No subject'}. UID {email_row.get('uid')}. Text: {body}",
+                        f"E-mail od {email_row.get('from')}. Předmět: {email_row.get('subject') or 'Bez předmětu'}. UID {email_row.get('uid')}. Text: {body}",
+                        f"E-mail od {email_row.get('from')}. Temat: {email_row.get('subject') or 'Bez tematu'}. UID {email_row.get('uid')}. Treść: {body}"
+                    )}
+                except Exception as e:
+                    return {"reply_cs": tr(
+                        f"Email reading is not available: {e}",
+                        f"Čtení e-mailů není dostupné: {e}",
+                        f"Czytanie e-maili nie jest dostępne: {e}"
+                    )}
+
+            if action == "REPLY_EMAIL":
+                try:
+                    body = str(args.get("body") or "").strip()
+                    if not body:
+                        return {"reply_cs": tr("What should I write?", "Co mám napsat?", "Co mam napisać?"), "is_question": True}
+                    uid = str(args.get("uid") or "").strip()
+                    original = fetch_mail_by_uid(uid) if uid else None
+                    if not original:
+                        emails = search_mail_messages(
+                            query=str(args.get("query") or "").strip(),
+                            sender=str(args.get("sender") or "").strip(),
+                            unread_only=False,
+                            limit=1,
+                        )
+                        original = emails[0] if emails else None
+                    if not original:
+                        return {"reply_cs": tr(
+                            "I could not find the email to reply to.",
+                            "Nenašla jsem e-mail, na který mám odpovědět.",
+                            "Nie znalazłam e-maila, na który mam odpowiedzieć."
+                        )}
+                    sent = send_mail_reply(original, body)
+                    return {"reply_cs": tr(
+                        f"Reply sent to {sent.get('to')}. Subject: {sent.get('subject')}.",
+                        f"Odpověď odeslána na {sent.get('to')}. Předmět: {sent.get('subject')}.",
+                        f"Odpowiedź wysłana do {sent.get('to')}. Temat: {sent.get('subject')}."
+                    )}
+                except Exception as e:
+                    return {"reply_cs": tr(
+                        f"Email reply is not available: {e}",
+                        f"Odpověď na e-mail není dostupná: {e}",
+                        f"Odpowiedź na e-mail nie jest dostępna: {e}"
+                    )}
 
             if action == "GET_WEATHER":
                 try:
