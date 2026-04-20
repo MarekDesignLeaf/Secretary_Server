@@ -721,6 +721,22 @@ UPDATE users
 SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), email, display_name),
     updated_at = now()
 WHERE display_name LIKE '%*%';
+UPDATE clients
+SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), display_name),
+    updated_at = now()
+WHERE display_name LIKE '%*%';
+UPDATE shared_contacts
+SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), display_name),
+    updated_at = now()
+WHERE display_name LIKE '%*%';
+UPDATE user_contact_sync
+SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), display_name),
+    updated_at = now()
+WHERE display_name LIKE '%*%';
+UPDATE leads
+SET contact_name = COALESCE(NULLIF(btrim(regexp_replace(contact_name, '\\*+', ' ', 'g')), ''), contact_name),
+    updated_at = now()
+WHERE contact_name LIKE '%*%';
 """
 
 # === CONFIG ===
@@ -2165,6 +2181,10 @@ def clean_user_display_name(value: Optional[str]) -> str:
     cleaned = re.sub(r"\*+", " ", value or "")
     return re.sub(r"\s+", " ", cleaned).strip()
 
+def clean_contact_display_name(value: Optional[str]) -> str:
+    cleaned = re.sub(r"\*+", " ", str(value or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
 def clean_user_row_display_name(row: dict) -> dict:
     row["display_name"] = clean_user_display_name(row.get("display_name")) or row.get("email") or row.get("display_name")
     return row
@@ -3552,7 +3572,7 @@ def normalize_email(email: Optional[str]) -> str:
 def build_contact_key(name: Optional[str], phone: Optional[str], email: Optional[str]) -> str:
     normalized_phone = normalize_contact_phone(phone)
     normalized_email = normalize_email(email)
-    normalized_name = (name or "").strip().lower()
+    normalized_name = clean_contact_display_name(name).lower()
     return normalized_phone or normalized_email or normalized_name
 
 def normalize_section_code(value: Optional[str]) -> str:
@@ -3779,14 +3799,14 @@ def merge_contact_rows_into_client(conn, tenant_id: int, primary_client_id: int,
         if existing_client is None:
             cur.execute("SELECT * FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (primary_client_id, tenant_id))
             existing_client = dict(cur.fetchone() or {})
-        names = [row.get("display_name") for row in selected_rows]
+        names = [clean_contact_display_name(row.get("display_name")) for row in selected_rows]
         phones = [row.get("phone_primary") for row in selected_rows]
         emails = [row.get("email_primary") for row in selected_rows]
         address_lines = [row.get("address_line1") or row.get("address") for row in selected_rows]
         cities = [row.get("city") for row in selected_rows]
         postcodes = [row.get("postcode") for row in selected_rows]
         countries = [row.get("country") for row in selected_rows]
-        display_name = choose_preferred_value(existing_client.get("display_name"), *names)
+        display_name = choose_preferred_value(clean_contact_display_name(existing_client.get("display_name")), *names)
         phone_primary = choose_preferred_value(existing_client.get("phone_primary"), *phones)
         email_primary = choose_preferred_value(existing_client.get("email_primary"), *emails)
         billing_address_line1 = choose_preferred_value(*address_lines) or existing_client.get("billing_address_line1")
@@ -3858,7 +3878,7 @@ def reconcile_contact_selection(conn, tenant_id: int, user_id: int, contact_key:
                 (
                     tenant_id,
                     code,
-                    row.get("display_name") or "Client",
+                    clean_contact_display_name(row.get("display_name")) or "Client",
                     row.get("phone_primary"),
                     row.get("email_primary"),
                     address.get("address_line1") or address.get("address"),
@@ -3914,7 +3934,7 @@ def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict
     if not section_code:
         raise HTTPException(400, "section_code required")
     ensure_contact_section(cur, tenant_id, section_code)
-    display_name = (data.get("display_name") or data.get("name") or "").strip()
+    display_name = clean_contact_display_name(data.get("display_name") or data.get("name"))
     if not display_name:
         raise HTTPException(400, "display_name required")
     company_name = (data.get("company_name") or "").strip() or None
@@ -3947,7 +3967,7 @@ def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict
             RETURNING *""",
             (
                 section_code,
-                choose_preferred_value(existing.get("display_name"), display_name),
+                choose_preferred_value(clean_contact_display_name(existing.get("display_name")), display_name),
                 choose_preferred_value(existing.get("company_name"), company_name),
                 choose_preferred_value(existing.get("phone_primary"), phone_primary),
                 choose_preferred_value(existing.get("email_primary"), email_primary),
@@ -4238,10 +4258,11 @@ RULES:
                         return error_reply("No active owner is available for the new client.")
                     code = f"CL-{uuid.uuid4().hex[:6].upper()}"
                     with conn.cursor() as cur:
+                        client_display_name = clean_contact_display_name(args["name"])
                         cur.execute("""INSERT INTO clients (
                                 client_code,client_type,display_name,email_primary,phone_primary,status,tenant_id,owner_user_id,hierarchy_status
                             ) VALUES (%s,%s,%s,%s,%s,'active',%s,%s,'pending') RETURNING id,display_name""",
-                            (code,"domestic",args["name"],args.get("email"),args.get("phone"),tenant_id,int(owner["id"])))
+                            (code,"domestic",client_display_name,args.get("email"),args.get("phone"),tenant_id,int(owner["id"])))
                         client_row = dict(cur.fetchone())
                         cid = client_row['id']
                         first_action = create_workflow_task(
@@ -4257,7 +4278,7 @@ RULES:
                             },
                             actor_name=actor_name,
                             default_client_id=cid,
-                            default_client_name=client_row.get("display_name") or args["name"],
+                            default_client_name=client_row.get("display_name") or client_display_name,
                             source="assistant_client_create",
                         )
                         set_client_next_action(conn, tenant_id, cid, str(first_action["id"]))
@@ -5074,6 +5095,9 @@ async def api_create_client(data: dict, request: Request):
         owner = validate_active_user(conn, tid, owner_user_id, "client owner")
         if not isinstance(first_action, dict):
             raise HTTPException(422, "Client must include first_action")
+        display_name = clean_contact_display_name(data.get("name") or data.get("display_name"))
+        if not display_name:
+            raise HTTPException(400, "display_name required")
         code = f"CL-{uuid.uuid4().hex[:6].upper()}"
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO clients (client_code,client_type,title,first_name,last_name,display_name,
@@ -5084,7 +5108,7 @@ async def api_create_client(data: dict, request: Request):
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,%s,'pending') RETURNING id,display_name""",
                 (code,data.get("type",data.get("client_type","domestic")),
                  data.get("title"),data.get("first_name"),data.get("last_name"),
-                 data.get("name",data.get("display_name","")),
+                 display_name,
                  data.get("company_name"),data.get("company_registration_no"),data.get("vat_no"),
                  data.get("email",data.get("email_primary")),data.get("email_secondary"),
                  data.get("phone",data.get("phone_primary")),data.get("phone_secondary"),
@@ -5100,7 +5124,7 @@ async def api_create_client(data: dict, request: Request):
                 first_action,
                 actor_name=actor_name,
                 default_client_id=cid,
-                default_client_name=client_row.get("display_name") or data.get("name", data.get("display_name", "")),
+                default_client_name=client_row.get("display_name") or display_name,
                 source="client_first_action",
             )
             set_client_next_action(conn, tid, cid, str(next_action["id"]))
@@ -5112,7 +5136,7 @@ async def api_create_client(data: dict, request: Request):
                 "client",
                 cid,
                 "create",
-                f"Klient {data.get('name',data.get('display_name',''))} vytvoren",
+                f"Klient {display_name} vytvoren",
                 tenant_id=tid,
                 user_id=actor_user_id,
                 source_channel="crm",
@@ -5158,7 +5182,9 @@ async def update_client(client_id: int, data: dict, request: Request):
                 raise HTTPException(422, "Client next action must point to an open planned client task")
             sets.append("next_action_task_id=%s"); vals.append(str(data["next_action_task_id"]))
         for k in ["display_name","first_name","last_name","title","client_type","company_name","company_registration_no","vat_no","email_primary","email_secondary","phone_primary","phone_secondary","website","preferred_contact_method","billing_address_line1","billing_city","billing_postcode","billing_country","status","is_commercial"]:
-            if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
+            if k in data:
+                sets.append(f"{k}=%s")
+                vals.append(clean_contact_display_name(data[k]) if k == "display_name" else data[k])
         if not sets:
             raise HTTPException(400,"Zadna data")
         sets.append("updated_at=now()"); vals.extend([tid, client_id])
@@ -5228,7 +5254,7 @@ async def sync_contacts(data: dict, request: Request):
         with conn.cursor() as cur:
             seen_keys = set()
             for contact in contacts:
-                name = (contact.get("name") or "").strip()
+                name = clean_contact_display_name(contact.get("name") or contact.get("display_name"))
                 phone = (contact.get("phone") or "").strip()
                 email = (contact.get("email") or "").strip()
                 if not name and not phone and not email:
@@ -5902,7 +5928,7 @@ async def convert_lead_to_client(lead_id: int, data: dict):
             cur.execute("SELECT * FROM leads WHERE id=%s",(lead_id,))
             lead = cur.fetchone()
             if not lead: raise HTTPException(404,"Lead nenalezen")
-            name = data.get("name",lead.get("contact_name","Nový klient"))
+            name = clean_contact_display_name(data.get("name") or lead.get("contact_name")) or "Nový klient"
             email = data.get("email",lead.get("contact_email"))
             phone = data.get("phone",lead.get("contact_phone"))
             code = f"CL-{uuid.uuid4().hex[:6].upper()}"
@@ -5985,7 +6011,7 @@ async def get_contact_sections(request: Request):
 async def create_contact_section(data: dict, request: Request):
     user = ensure_request_permissions(request, "contacts_write")
     tenant_id = user["tenant_id"]
-    display_name = (data.get("display_name") or "").strip()
+    display_name = clean_contact_display_name(data.get("display_name"))
     if not display_name:
         raise HTTPException(400, "display_name required")
     section_code = normalize_section_code(data.get("section_code") or display_name)
@@ -6061,7 +6087,7 @@ async def update_shared_contact(contact_id: int, data: dict, request: Request):
             existing = dict(existing)
             section_code = normalize_section_code(data.get("section_code") or existing.get("section_code"))
             ensure_contact_section(cur, user["tenant_id"], section_code)
-            display_name = (data.get("display_name") or existing.get("display_name") or "").strip()
+            display_name = clean_contact_display_name(data.get("display_name") or existing.get("display_name"))
             if not display_name:
                 raise HTTPException(400, "display_name required")
             phone_primary = (data.get("phone_primary") or existing.get("phone_primary") or "").strip() or None
@@ -6823,7 +6849,7 @@ async def import_data(data: dict):
                     if table == "clients":
                         code = f"CL-{uuid.uuid4().hex[:6].upper()}"
                         cur.execute("INSERT INTO clients (client_code,client_type,display_name,email_primary,phone_primary,status) VALUES (%s,%s,%s,%s,%s,'active')",
-                            (code,row.get("type","domestic"),row.get("name",row.get("display_name","")),row.get("email",row.get("email_primary")),row.get("phone",row.get("phone_primary"))))
+                            (code,row.get("type","domestic"),clean_contact_display_name(row.get("name") or row.get("display_name")) or row.get("phone", row.get("phone_primary")) or "Client",row.get("email",row.get("email_primary")),row.get("phone",row.get("phone_primary"))))
                     imported += 1
                 except Exception as e: errors.append(f"Row {i+1}: {e}")
         conn.commit()
@@ -8722,7 +8748,7 @@ def parse_new_client_command(text: str) -> tuple[bool, Optional[str]]:
     return False, None
 
 def create_voice_work_report_client(conn, tenant_id: int, actor_user_id: int, client_name: str, lang: str) -> dict:
-    name = (client_name or "").strip()
+    name = clean_contact_display_name(client_name)
     if not name:
         raise HTTPException(422, "Client name is required")
     owner = validate_active_user(conn, tenant_id, actor_user_id, "client owner")
@@ -9995,7 +10021,7 @@ async def wa_incoming(request: Request):
                                 if contact.get("wa_id") == sender:
                                     profile = contact.get("profile", {})
                                     wa_name = profile.get("name", "")
-                            display = wa_name or f"WhatsApp +{sender}"
+                            display = clean_contact_display_name(wa_name) or f"WhatsApp +{sender}"
                             code = f"CL-WA-{sender[-6:]}"
                             with conn.cursor() as cur:
                                 cur.execute("""INSERT INTO clients (client_code,client_type,display_name,phone_primary,source,status,tenant_id)
