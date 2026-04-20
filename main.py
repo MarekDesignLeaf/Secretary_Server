@@ -3241,6 +3241,136 @@ def extract_contact_address_fields(data: Dict[str, Any]) -> Dict[str, Optional[s
         "country": country,
     }
 
+UK_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", re.IGNORECASE)
+ADDRESS_LABEL_RE = re.compile(
+    r"^\s*(?:address|addr|adresa|adres|billing address|client address|zakaznik|klient)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+STREET_HINT_RE = re.compile(
+    r"\b(street|st|road|rd|lane|ln|avenue|ave|drive|dr|close|cl|way|court|ct|"
+    r"crescent|cres|place|pl|terrace|terr|gardens|gdns|green|grove|grv|park|"
+    r"hill|row|mews|yard|house|flat|apartment|apt|unit)\b",
+    re.IGNORECASE,
+)
+PHONE_IN_TEXT_RE = re.compile(r"(?:phone|tel|telephone|whatsapp|wa|from|to)\s*:?\s*(\+?\d[\d\s().-]{6,}\d)", re.IGNORECASE)
+
+def normalize_postcode(value: Optional[str]) -> Optional[str]:
+    match = UK_POSTCODE_RE.search(value or "")
+    if not match:
+        return None
+    compact = re.sub(r"\s+", "", match.group(1).upper())
+    if len(compact) <= 3:
+        return compact
+    return f"{compact[:-3]} {compact[-3:]}"
+
+def clean_address_fragment(value: Optional[str]) -> str:
+    text = (value or "").replace("\r", "\n")
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"\b(?:phone|tel|telephone|whatsapp|wa)\s*:?\s*\+?\d[\d\s().-]{6,}\d\b", " ", text, flags=re.IGNORECASE)
+    text = text.replace("\n", ", ")
+    text = ADDRESS_LABEL_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"(,\s*){2,}", ", ", text)
+    return text.strip(" ,.;")
+
+def score_address_candidate(candidate: str) -> float:
+    if not UK_POSTCODE_RE.search(candidate):
+        return 0.0
+    cleaned = clean_address_fragment(candidate)
+    if len(cleaned) < 10 or len(cleaned) > 240:
+        return 0.0
+    score = 0.45
+    if re.search(r"\b\d+[A-Z]?\b", cleaned, re.IGNORECASE):
+        score += 0.18
+    if STREET_HINT_RE.search(cleaned):
+        score += 0.2
+    if "," in cleaned:
+        score += 0.08
+    if ADDRESS_LABEL_RE.search(candidate):
+        score += 0.08
+    if re.search(r"\b(hours?|hodin|pytl|total|£|invoice|faktura)\b", cleaned, re.IGNORECASE):
+        score -= 0.2
+    return max(0.0, min(0.98, score))
+
+def split_uk_address(raw_address: str, postcode: str) -> Dict[str, Optional[str]]:
+    cleaned = clean_address_fragment(raw_address)
+    cleaned = UK_POSTCODE_RE.sub("", cleaned).strip(" ,.;")
+    parts = [part.strip(" ,.;") for part in cleaned.split(",") if part.strip(" ,.;")]
+    city = None
+    line1 = cleaned or None
+    if len(parts) >= 2:
+        city = parts[-1]
+        line1 = ", ".join(parts[:-1]) or None
+    elif len(parts) == 1:
+        line1 = parts[0]
+    return {
+        "address": ", ".join(part for part in [line1, city, postcode, "GB"] if part),
+        "address_line1": line1,
+        "city": city,
+        "postcode": postcode,
+        "country": "GB",
+    }
+
+def extract_uk_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    raw_lines = [line.strip() for line in str(text).replace("\r", "\n").split("\n")]
+    lines = [line for line in raw_lines if line]
+    candidates: List[str] = []
+    for index, line in enumerate(lines):
+        if UK_POSTCODE_RE.search(line):
+            candidates.append(line)
+            for match in UK_POSTCODE_RE.finditer(line):
+                start = max(0, match.start() - 140)
+                end = min(len(line), match.end() + 80)
+                candidates.append(line[start:end])
+            if index > 0:
+                candidates.append(f"{lines[index - 1]}, {line}")
+            if index > 1:
+                candidates.append(f"{lines[index - 2]}, {lines[index - 1]}, {line}")
+    if not candidates:
+        for chunk in re.split(r"[;\n]", str(text)):
+            if UK_POSTCODE_RE.search(chunk):
+                candidates.append(chunk)
+    best = None
+    best_score = 0.0
+    for candidate in candidates:
+        score = score_address_candidate(candidate)
+        if score > best_score:
+            best = candidate
+            best_score = score
+    if not best or best_score < 0.65:
+        return None
+    postcode = normalize_postcode(best)
+    if not postcode:
+        return None
+    address = split_uk_address(best, postcode)
+    if not address.get("address_line1"):
+        return None
+    address["raw"] = clean_address_fragment(best)
+    address["confidence"] = round(best_score, 2)
+    return address
+
+def extract_whatsapp_phone_from_text(*parts: Optional[str]) -> Optional[str]:
+    text = "\n".join(part for part in parts if part)
+    match = PHONE_IN_TEXT_RE.search(text)
+    return match.group(1) if match else None
+
+def find_client_by_whatsapp_phone(cur, tenant_id: int, phone: Optional[str]) -> Optional[Dict[str, Any]]:
+    normalized = normalize_whatsapp_phone(phone)
+    if not normalized:
+        return None
+    cur.execute("""SELECT id, display_name, phone_primary, billing_address_line1, billing_city,
+                          billing_postcode, billing_country
+                   FROM clients
+                   WHERE tenant_id=%s AND deleted_at IS NULL""", (tenant_id,))
+    for row in cur.fetchall():
+        client = dict(row)
+        if normalize_whatsapp_phone(client.get("phone_primary")) == normalized:
+            return client
+    return None
+
 def client_info_score(row: Dict[str, Any]) -> int:
     keys = [
         "display_name", "first_name", "last_name", "company_name", "phone_primary",
@@ -5800,6 +5930,159 @@ async def log_communication(request: Request, data: dict):
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
+@app.post("/crm/communications/whatsapp-address-sync")
+async def sync_whatsapp_addresses(request: Request, data: dict):
+    user = ensure_request_permissions(request, "crm_write")
+    tenant_id = user["tenant_id"]
+    actor_user_id = user.get("user_id")
+    apply_changes = bool(data.get("apply", False))
+    overwrite = bool(data.get("overwrite", False))
+    try:
+        limit = int(data.get("limit", 2000))
+    except Exception:
+        limit = 2000
+    limit = max(1, min(limit, 10000))
+    conn = get_db_conn()
+    results = []
+    scanned = 0
+    candidates = 0
+    updated = 0
+    skipped = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.id, c.client_id, c.job_id, c.comm_type, c.subject, c.message_summary,
+                       c.direction, c.notes, c.sent_at::text, c.created_at::text,
+                       cl.display_name AS client_name,
+                       cl.billing_address_line1, cl.billing_city, cl.billing_postcode, cl.billing_country
+                FROM communications c
+                LEFT JOIN clients cl ON cl.id=c.client_id AND cl.tenant_id=c.tenant_id AND cl.deleted_at IS NULL
+                WHERE c.tenant_id=%s
+                  AND (
+                    LOWER(COALESCE(c.comm_type,'')) IN ('whatsapp', 'wa')
+                    OR COALESCE(c.subject,'') ILIKE '%%whatsapp%%'
+                    OR COALESCE(c.subject,'') ILIKE '%%wa %%'
+                    OR COALESCE(c.notes,'') ILIKE '%%whatsapp%%'
+                  )
+                ORDER BY COALESCE(c.sent_at, c.created_at) DESC NULLS LAST, c.id DESC
+                LIMIT %s
+            """, (tenant_id, limit))
+            rows = [dict(row) for row in cur.fetchall()]
+            scanned = len(rows)
+            for row in rows:
+                text = "\n".join(
+                    part for part in [
+                        row.get("subject"),
+                        row.get("message_summary"),
+                        row.get("notes"),
+                    ]
+                    if part
+                )
+                address = extract_uk_address_from_text(text)
+                if not address:
+                    continue
+                candidates += 1
+                client = None
+                if row.get("client_id") and row.get("client_name"):
+                    client = {
+                        "id": row.get("client_id"),
+                        "display_name": row.get("client_name"),
+                        "billing_address_line1": row.get("billing_address_line1"),
+                        "billing_city": row.get("billing_city"),
+                        "billing_postcode": row.get("billing_postcode"),
+                        "billing_country": row.get("billing_country"),
+                    }
+                if not client:
+                    phone = extract_whatsapp_phone_from_text(row.get("subject"), row.get("notes"), row.get("message_summary"))
+                    client = find_client_by_whatsapp_phone(cur, tenant_id, phone)
+                result = {
+                    "communication_id": row.get("id"),
+                    "client_id": client.get("id") if client else None,
+                    "client_name": client.get("display_name") if client else None,
+                    "address": address,
+                    "action": "preview",
+                    "reason": None,
+                }
+                if not client:
+                    result["action"] = "skipped"
+                    result["reason"] = "no_client_match"
+                    skipped += 1
+                    results.append(result)
+                    continue
+                existing_address = any(
+                    client.get(key)
+                    for key in ["billing_address_line1", "billing_city", "billing_postcode"]
+                )
+                if existing_address and not overwrite:
+                    result["action"] = "skipped"
+                    result["reason"] = "client_already_has_address"
+                    skipped += 1
+                    results.append(result)
+                    continue
+                new_line1 = address.get("address_line1") if overwrite or not client.get("billing_address_line1") else client.get("billing_address_line1")
+                new_city = address.get("city") if overwrite or not client.get("billing_city") else client.get("billing_city")
+                new_postcode = address.get("postcode") if overwrite or not client.get("billing_postcode") else client.get("billing_postcode")
+                new_country = address.get("country") if overwrite or not client.get("billing_country") else client.get("billing_country")
+                result["action"] = "updated" if apply_changes else "would_update"
+                result["new_values"] = {
+                    "billing_address_line1": new_line1,
+                    "billing_city": new_city,
+                    "billing_postcode": new_postcode,
+                    "billing_country": new_country,
+                }
+                if apply_changes:
+                    cur.execute("""UPDATE clients
+                        SET billing_address_line1=%s,
+                            billing_city=%s,
+                            billing_postcode=%s,
+                            billing_country=%s,
+                            updated_at=now()
+                        WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""",
+                        (new_line1, new_city, new_postcode, new_country, client["id"], tenant_id))
+                    note = (
+                        f"Address imported from WhatsApp communication #{row.get('id')}: "
+                        f"{address.get('address')} (confidence {address.get('confidence')})"
+                    )
+                    cur.execute(
+                        "INSERT INTO client_notes (client_id,note,created_by) VALUES (%s,%s,%s)",
+                        (client["id"], note[:1000], get_user_display_name(conn, tenant_id, actor_user_id) or "system")
+                    )
+                    log_activity(
+                        conn,
+                        "client",
+                        client["id"],
+                        "whatsapp_address_import",
+                        f"Address imported from WhatsApp: {address.get('address')}",
+                        tenant_id=tenant_id,
+                        user_id=actor_user_id,
+                        details={"communication_id": row.get("id"), "address": address, "overwrite": overwrite},
+                        source_channel="whatsapp",
+                    )
+                    updated += 1
+                results.append(result)
+            if apply_changes:
+                conn.commit()
+        return {
+            "apply": apply_changes,
+            "overwrite": overwrite,
+            "summary": {
+                "scanned": scanned,
+                "address_candidates": candidates,
+                "updated": updated,
+                "skipped": skipped,
+                "would_update": sum(1 for item in results if item.get("action") == "would_update"),
+            },
+            "results": results[:300],
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
 # ========== REST API: PHOTOS ==========
 @app.get("/crm/photos")
 async def get_photos(request: Request, entity_type: Optional[str]=None, entity_id: Optional[str]=None):
@@ -7912,6 +8195,7 @@ VOICE_NUMBER_UNITS = {
     "hour", "hours", "godzin", "godzina", "godziny", "godzine",
     "pytel", "pytle", "pytlu", "pytel", "pytle", "bags", "bag", "bulkbag",
     "liber", "pound", "pounds", "ks", "kus", "kusu", "pieces", "piece",
+    "krat", "x", "razy", "times",
 }
 
 VOICE_NUMBER_FILLERS = {
@@ -7923,7 +8207,13 @@ VOICE_NEGATIVE_WORDS = {
     "ne", "nee", "no", "nope", "none", "nothing", "nic", "zadny", "zadna",
     "zadne", "zadnej", "zaden", "zadnou", "bez", "nie", "brak", "zaden",
     "nemam", "nemame", "neni", "nepouzili", "nepouzito", "nebyl", "nebylo",
-    "skip", "preskoc", "preskocit", "dalsi", "dal", "dalej",
+    "skip", "preskoc", "preskocit", "dalsi", "dal", "dalej", "zadnych",
+    "zadneho", "zadne", "zaden", "ani", "niczego",
+}
+
+VOICE_POSITIVE_WORDS = {
+    "ano", "jo", "jasne", "potvrdit", "potvrzuji", "souhlasim", "ulozit",
+    "yes", "yeah", "yep", "confirm", "save", "tak", "potwierdz", "zapisz",
 }
 
 def normalize_voice_text(text: str) -> str:
@@ -7943,13 +8233,20 @@ def is_voice_negative_response(text: str, *, include_zero: bool = False) -> bool
     compact = " ".join(tokens)
     if compact in VOICE_NEGATIVE_WORDS:
         return True
-    if tokens and tokens[0] in VOICE_NEGATIVE_WORDS:
+    if tokens and (tokens[0] in VOICE_NEGATIVE_WORDS or any(token in VOICE_NEGATIVE_WORDS for token in tokens)):
         return True
     if include_zero:
         parsed = parse_voice_number(text)
         if parsed == 0:
             return True
     return False
+
+def is_voice_positive_response(text: str) -> bool:
+    tokens = voice_tokens(text)
+    if not tokens:
+        return False
+    compact = " ".join(tokens)
+    return compact in VOICE_POSITIVE_WORDS or any(token in VOICE_POSITIVE_WORDS for token in tokens)
 
 def _parse_voice_number_tokens(tokens: list[str]) -> Optional[float]:
     current = 0.0
@@ -7958,7 +8255,7 @@ def _parse_voice_number_tokens(tokens: list[str]) -> Optional[float]:
     for token in tokens:
         if not token or token in VOICE_NUMBER_UNITS or token in VOICE_NUMBER_FILLERS:
             continue
-        if token in {"pul", "half"}:
+        if token in {"pul", "pol", "half"}:
             current += 0.5
             found = True
             continue
@@ -7994,15 +8291,34 @@ def parse_voice_number(text: str) -> Optional[float]:
     tokens = voice_tokens(text)
     if not tokens:
         return None
-    if any(token in {"pul", "half"} for token in tokens):
-        half_index = next(i for i, token in enumerate(tokens) if token in {"pul", "half"})
+    half_tokens = {"pul", "pol", "half"}
+    if any(token in half_tokens for token in tokens):
+        half_index = next(i for i, token in enumerate(tokens) if token in half_tokens)
         base_tokens = [token for token in tokens[:half_index] if token not in VOICE_NUMBER_FILLERS]
         if not base_tokens:
             return 0.5
         base = _parse_voice_number_tokens(base_tokens)
         if base is not None:
             return base + 0.5
-    return _parse_voice_number_tokens(tokens)
+    parsed = _parse_voice_number_tokens(tokens)
+    if parsed is not None:
+        return parsed
+    numberish = set(VOICE_NUMBER_WORDS) | set(VOICE_NUMBER_TENS) | {"sto", "hundred", "setka"} | half_tokens | VOICE_NUMBER_FILLERS | VOICE_NUMBER_UNITS
+    best: Optional[float] = None
+    for start in range(len(tokens)):
+        if tokens[start] not in numberish:
+            continue
+        window = []
+        for token in tokens[start:]:
+            if token not in numberish:
+                break
+            window.append(token)
+            candidate = _parse_voice_number_tokens(window)
+            if candidate is not None:
+                best = candidate
+        if best is not None:
+            return best
+    return None
 
 def extract_current_report_day(ctx: dict) -> dict:
     day = {
@@ -8562,8 +8878,9 @@ async def voice_session_input(data: dict, request: Request):
             # === STEP: SUMMARY (edit or confirm) ===
             elif step == "summary":
                 low = text.lower()
+                normalized_low = normalize_voice_text(text)
                 # POTVRDIT
-                if any(x in low for x in ["confirm","potvrdit","potwierdź","yes","ano","tak","uložit","ulozit","save"]):
+                if is_voice_positive_response(text) or any(x in normalized_low for x in ["confirm","potvrdit","potwierdz","yes","ano","tak","ulozit","save"]):
                     next_step = "confirm"
                 elif any(x in low for x in ["another day","next day","add day","další den","dalsi den","další datum","dalsi datum","kolejny dzień","kolejny dzien","następny dzień","nastepny dzien"]):
                     completed_day = append_current_report_day(ctx)
@@ -8577,7 +8894,7 @@ async def voice_session_input(data: dict, request: Request):
                         f"Dzień {completed_day.get('work_date')} dodany. {get_prompt('date', lang)}"
                     )
                 # ZRUSIT / SMAZAT
-                elif any(x in low for x in ["zrušit","zrusit","smazat","cancel","delete","storno","konec","stop"]):
+                elif is_voice_negative_response(text) or any(x in normalized_low for x in ["zrusit","smazat","cancel","delete","storno","konec","stop"]):
                     cur.execute("UPDATE voice_sessions SET state='cancelled',updated_at=now() WHERE id=%s",(sid,))
                     conn.commit()
                     reply = "Report zrušen." if lang=="cs" else "Report cancelled." if lang=="en" else "Raport anulowany."
@@ -8640,7 +8957,7 @@ async def voice_session_input(data: dict, request: Request):
                 "step": step, "next_step": next_step,
                 "input_length": len(text),
                 "input_preview": text[:50].replace("\n", " "),
-                "has_numbers": any(c.isdigit() for c in text) or any(x in text.lower() for x in ["half","quarter","one","two","three"])
+                "has_numbers": parse_voice_number(text) is not None
             })
             log_activity(conn, "voice_session", sid, "voice_input", audit_details, tenant_id=tenant_id, user_id=sess.get("user_id"))
 
