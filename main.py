@@ -450,6 +450,7 @@ DO $$ BEGIN
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
@@ -499,6 +500,10 @@ DO $$ BEGIN
     ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS country TEXT;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
+UPDATE users
+SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), email, display_name),
+    updated_at = now()
+WHERE display_name LIKE '%*%';
 """
 
 # === CONFIG ===
@@ -1939,6 +1944,14 @@ def planning_window_from_values(start_value: Any = None, end_value: Any = None, 
 def format_planning_datetime(value: Optional[datetime]) -> Optional[str]:
     return value.strftime("%Y-%m-%dT%H:%M:%S") if value else None
 
+def clean_user_display_name(value: Optional[str]) -> str:
+    cleaned = re.sub(r"\*+", " ", value or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+def clean_user_row_display_name(row: dict) -> dict:
+    row["display_name"] = clean_user_display_name(row.get("display_name")) or row.get("email") or row.get("display_name")
+    return row
+
 def get_user_display_name(conn, tenant_id: int, user_id: Optional[int]) -> Optional[str]:
     if not user_id:
         return None
@@ -1947,7 +1960,7 @@ def get_user_display_name(conn, tenant_id: int, user_id: Optional[int]) -> Optio
             FROM users
             WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""", (user_id, tenant_id))
         row = cur.fetchone()
-    return row["display_name"] if row else None
+    return clean_user_display_name(row["display_name"]) if row else None
 
 def resolve_assigned_user(conn, tenant_id: int, assigned_user_id: Any = None, assigned_to: Any = None) -> tuple[Optional[int], Optional[str]]:
     if assigned_user_id not in (None, "", 0, "0"):
@@ -1957,7 +1970,7 @@ def resolve_assigned_user(conn, tenant_id: int, assigned_user_id: Any = None, as
                 WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""", (assigned_user_id, tenant_id))
             row = cur.fetchone()
         if row:
-            return int(row["id"]), row["display_name"]
+            return int(row["id"]), clean_user_display_name(row["display_name"])
     assignee_text = (assigned_to or "").strip()
     if assignee_text:
         with conn.cursor() as cur:
@@ -1970,7 +1983,7 @@ def resolve_assigned_user(conn, tenant_id: int, assigned_user_id: Any = None, as
                 LIMIT 1""", (tenant_id, f"%{assignee_text}%", f"%{assignee_text}%", f"%{assignee_text}%"))
             row = cur.fetchone()
         if row:
-            return int(row["id"]), row["display_name"]
+            return int(row["id"]), clean_user_display_name(row["display_name"])
         return None, assignee_text
     return None, None
 
@@ -1988,7 +2001,7 @@ def get_active_user_row(conn, tenant_id: int, user_id: Optional[int]) -> Optiona
               AND COALESCE(u.status, 'active')='active'
         """, (user_id, tenant_id))
         row = cur.fetchone()
-    return dict(row) if row else None
+    return clean_user_row_display_name(dict(row)) if row else None
 
 def validate_active_user(conn, tenant_id: int, user_id: Optional[int], label: str = "assigned user") -> dict:
     row = get_active_user_row(conn, tenant_id, user_id)
@@ -2048,7 +2061,7 @@ def get_default_hierarchy_user(conn, tenant_id: int) -> Optional[dict]:
             LIMIT 1
         """, (tenant_id,))
         row = cur.fetchone()
-    return dict(row) if row else None
+    return clean_user_row_display_name(dict(row)) if row else None
 
 def get_valid_client_next_action_task(conn, tenant_id: int, client_id: int, task_id: Optional[str] = None) -> Optional[dict]:
     params: List[Any] = [tenant_id, client_id]
@@ -7300,6 +7313,7 @@ async def auth_list_users(admin: dict = Depends(require_permission("manage_users
                 ORDER BY u.id""", (admin["tenant_id"],))
             rows = [dict(r) for r in cur.fetchall()]
         for row in rows:
+            clean_user_row_display_name(row)
             user_id = int(row["id"])
             role_name = (row.get("role_name") or "viewer").lower()
             role_permissions = complete_permission_map(role_maps.get(role_name, default_permissions_for_role(role_name)))
@@ -7326,7 +7340,7 @@ async def auth_first_login_users(tenant_id: int = 1):
                   AND COALESCE(u.status, 'active') IN ('active','setup')
                 ORDER BY LOWER(COALESCE(u.display_name, u.email)), u.id
             """, (tenant_id,))
-            return [dict(r) for r in cur.fetchall()]
+            return [clean_user_row_display_name(dict(r)) for r in cur.fetchall()]
     finally:
         release_conn(conn)
 
@@ -7345,7 +7359,7 @@ async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(requi
             updates, params = [], []
             resolved_role = user_row["role_name"] or "viewer"
             if "display_name" in data:
-                updates.append("display_name=%s"); params.append(data["display_name"])
+                updates.append("display_name=%s"); params.append(clean_user_display_name(data["display_name"]))
             if "phone" in data:
                 updates.append("phone=%s"); params.append(data["phone"])
             if "status" in data and data["status"] in ("active","inactive"):
@@ -7448,7 +7462,7 @@ async def auth_register(data: dict, admin: dict = Depends(require_permission("ma
     """Admin-only: register new user."""
     email = data.get("email","").strip().lower()
     password = data.get("password","").strip() or DEFAULT_TEMP_PASSWORD
-    display_name = data.get("display_name","").strip()
+    display_name = clean_user_display_name(data.get("display_name",""))
     if not email or not display_name:
         raise HTTPException(400, "email and display_name required")
     conn = get_db_conn()
@@ -8382,7 +8396,7 @@ def split_voice_worker_fragments(text: str) -> List[str]:
 
 def match_voice_workers(conn, tenant_id: int, text: str, client_id=None, job_id=None) -> tuple[list, list]:
     with conn.cursor() as cur:
-        cur.execute("""SELECT id, display_name
+        cur.execute("""SELECT id, display_name, email
             FROM users
             WHERE tenant_id=%s AND deleted_at IS NULL AND COALESCE(status,'active')='active'
             ORDER BY display_name, id""", (tenant_id,))
@@ -8391,11 +8405,14 @@ def match_voice_workers(conn, tenant_id: int, text: str, client_id=None, job_id=
         return [], []
     users = []
     for row in user_rows:
-        normalized = normalize_voice_name_key(row["display_name"])
+        display_name = clean_user_display_name(row.get("display_name")) or row.get("email") or f"User {row['id']}"
+        normalized_name = normalize_voice_name_key(display_name)
+        normalized = normalize_voice_name_key(f"{display_name} {row.get('email') or ''}")
         tokens = [token for token in normalized.split() if token]
         users.append({
             "id": row["id"],
-            "display_name": row["display_name"],
+            "display_name": display_name,
+            "normalized_name": normalized_name,
             "normalized": normalized,
             "tokens": tokens,
         })
@@ -8408,13 +8425,18 @@ def match_voice_workers(conn, tenant_id: int, text: str, client_id=None, job_id=
         normalized_fragment = normalize_voice_name_key(fragment)
         if not normalized_fragment:
             return None
-        exact = [u for u in users if u["normalized"] == normalized_fragment]
+        exact = [u for u in users if u["normalized_name"] == normalized_fragment or u["normalized"] == normalized_fragment]
         if len(exact) == 1:
             return exact[0]
         token_exact = [u for u in users if normalized_fragment in u["tokens"]]
         if len(token_exact) == 1:
             return token_exact[0]
-        contains = [u for u in users if normalized_fragment in u["normalized"] or u["normalized"] in normalized_fragment]
+        contains = [
+            u for u in users
+            if normalized_fragment in u["normalized"]
+            or u["normalized_name"] in normalized_fragment
+            or u["normalized"] in normalized_fragment
+        ]
         if len(contains) == 1:
             return contains[0]
         if len(contains) > 1:
