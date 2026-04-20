@@ -4171,6 +4171,7 @@ RULES:
 - For leads: create_lead.
 - For calendar: list_calendar_events, add/modify/delete_calendar_event.
 - For contacts: search_contacts, call_contact.
+- For navigation, maps, route, directions, "navigace", "naviguj", "spust mapy", or "nawigacja", use start_navigation. Do not give instructions; return the action so Android opens maps directly.
 - When the user says 'zapamatuj si', 'pamatuj si', 'remember', or 'zapamiętaj', save the fact with remember_memory.
 - When the user says 'zapomeň', 'forget', or 'zapomnij', remove matching facts with forget_memory.
 - When user asks 'what do I have to do' or 'my tasks', use list_tasks.
@@ -4189,6 +4190,7 @@ RULES:
             {"type":"function","function":{"name":"list_calendar_events","description":"Precte kalendar na N dni","parameters":{"type":"object","properties":{"days":{"type":"integer","default":7}}}}},
             {"type":"function","function":{"name":"search_contacts","description":"Hleda v CRM klientech i telefonnich kontaktech","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
             {"type":"function","function":{"name":"call_contact","description":"Vytoci telefonni kontakt. Pokud neni zname cislo, vypln contact_name a Android kontakt dohleda v mobilu/CRM.","parameters":{"type":"object","properties":{"phone":{"type":"string"},"contact_name":{"type":"string"},"client_name":{"type":"string"}}}}},
+            {"type":"function","function":{"name":"start_navigation","description":"Otevre navigaci/mapy v Android telefonu na kontakt, klienta nebo adresu. Pouzij pro prikazy typu naviguj, spust navigaci, spust mapy, route, directions, nawigacja.","parameters":{"type":"object","properties":{"target":{"type":"string","description":"Jmeno kontaktu/klienta nebo adresa"},"address":{"type":"string","description":"Adresa, pokud ji uz znas"},"client_name":{"type":"string","description":"Jmeno CRM klienta"},"contact_name":{"type":"string","description":"Jmeno telefonniho kontaktu"}}}}},
             {"type":"function","function":{"name":"send_email","description":"Posle email","parameters":{"type":"object","properties":{"to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},"required":["to","subject","body"]}}},
             {"type":"function","function":{"name":"search_email","description":"Vyhleda emaily ve schrankce podle textu, odesilatele nebo neprectenych zprav.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Text hledany v predmetu, odesilateli nebo tele emailu"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"unread_only":{"type":"boolean","default":False},"limit":{"type":"integer","default":5}}}}},
             {"type":"function","function":{"name":"read_email","description":"Precte posledni nebo konkretni email. Pouzij pro 'precti email', 'otevri email', 'precti posledni email od ...'.","parameters":{"type":"object","properties":{"uid":{"type":"string","description":"UID emailu z vysledku search_email"},"query":{"type":"string","description":"Text pro nalezeni emailu, pokud UID neni znamy"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"unread_only":{"type":"boolean","default":False}}}}},
@@ -4670,6 +4672,36 @@ RULES:
                         "contact_name": args.get("contact_name") or client_name,
                         "phone": phone,
                         "message": message,
+                    },
+                }
+
+            if action == "START_NAVIGATION":
+                target = (
+                    args.get("address")
+                    or args.get("target")
+                    or args.get("client_name")
+                    or args.get("contact_name")
+                    or args.get("name")
+                    or ""
+                )
+                if not target:
+                    return {"reply_cs": tr(
+                        "Where should I navigate?",
+                        "Kam mám spustit navigaci?",
+                        "Dokąd mam uruchomić nawigację?",
+                    )}
+                return {
+                    "reply_cs": tr(
+                        f"Opening navigation to {target}.",
+                        f"Spouštím navigaci na {target}.",
+                        f"Uruchamiam nawigację do {target}.",
+                    ),
+                    "action_type": "START_NAVIGATION",
+                    "action_data": {
+                        "target": target,
+                        "address": args.get("address") or "",
+                        "client_name": args.get("client_name") or "",
+                        "contact_name": args.get("contact_name") or "",
                     },
                 }
 
