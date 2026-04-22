@@ -229,7 +229,7 @@ def send_mail_reply(original: Dict[str, Any], body: str) -> Dict[str, Any]:
     return {"to": to_addr, "subject": subject}
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
-PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/nature/", "/admin/", "/process", "/voice/", "/work-reports"]
+PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/nature/", "/admin/", "/assistant/", "/process", "/voice/", "/work-reports"]
 PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
 
 PERMISSION_DEFINITIONS = [
@@ -7892,6 +7892,72 @@ def require_permission(*permission_codes):
         finally:
             release_conn(conn)
     return checker
+
+@app.get("/assistant/memory")
+async def list_assistant_memory(request: Request, limit: int = 100):
+    user = get_request_user_payload(request)
+    tenant_id = user.get("tenant_id", 1)
+    user_id = user.get("user_id")
+    safe_limit = max(1, min(int(limit or 100), 200))
+    conn = get_db_conn()
+    try:
+        return load_assistant_memories(conn, tenant_id, user_id, safe_limit)
+    finally:
+        release_conn(conn)
+
+@app.post("/assistant/memory")
+async def create_assistant_memory(data: dict, request: Request):
+    user = get_request_user_payload(request)
+    tenant_id = user.get("tenant_id", 1)
+    user_id = user.get("user_id")
+    content = str(data.get("content") or data.get("text") or "").strip()
+    memory_type = data.get("memory_type") or data.get("type") or "long"
+    if not content:
+        raise HTTPException(400, "content required")
+    conn = get_db_conn()
+    try:
+        remembered = remember_assistant_memory(conn, tenant_id, user_id, content, memory_type)
+        conn.commit()
+        return remembered
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+@app.delete("/assistant/memory/{memory_id}")
+async def delete_assistant_memory(memory_id: int, request: Request):
+    user = get_request_user_payload(request)
+    tenant_id = user.get("tenant_id", 1)
+    user_id = user.get("user_id")
+    conn = get_db_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE assistant_memory
+                SET is_active=FALSE, forgotten_at=now(), updated_at=now()
+                WHERE id=%s
+                  AND tenant_id=%s
+                  AND (user_id IS NULL OR user_id IS NOT DISTINCT FROM %s)
+                  AND is_active=TRUE
+                RETURNING id, content
+                """,
+                (memory_id, tenant_id, user_id),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Memory item not found")
+        conn.commit()
+        return {"status": "deleted", "item": dict(row)}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
 
 @app.post("/auth/login")
 async def auth_login(data: dict):
