@@ -156,10 +156,17 @@ SERVICE_RATE_DEFAULTS = {
 }
 
 DEFAULT_CONTACT_SECTIONS = [
-    ("employee", "Zaměstnanec", 10),
-    ("subcontractor", "Subkontraktor", 20),
-    ("material_supplier", "Dodavatel materiálu", 30),
-    ("equipment_vehicle_rental", "Půjčovny nářadí a aut", 40),
+    # (section_code, display_name, sort_order, parent_section_code)
+    ("zakaznici",             "Zákazníci",      10, None),
+    ("zakaznici_aktivni",     "Aktivní",         11, "zakaznici"),
+    ("zakaznici_stali",       "Stálí",           12, "zakaznici"),
+    ("zakaznici_ztraceni",    "Ztracení",        13, "zakaznici"),
+    ("zakaznici_potencialni", "Potenciální",     14, "zakaznici"),
+    ("dodavatele",            "Dodavatelé",      20, None),
+    ("dodavatele_material",   "Materiál",        21, "dodavatele"),
+    ("dodavatele_pujcovna",   "Půjčovna",        22, "dodavatele"),
+    ("zamestnanci",           "Zaměstnanci",     30, None),
+    ("subkontraktori",        "Subkontraktoři",  40, None),
 ]
 
 @app.middleware("http")
@@ -476,6 +483,9 @@ DO $$ BEGIN
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
     ALTER TABLE quote_items ADD COLUMN IF NOT EXISTS total DECIMAL DEFAULT 0;
     ALTER TABLE quote_items ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0;
+    ALTER TABLE contact_sections ADD COLUMN IF NOT EXISTS parent_section_code TEXT;
+    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS next_contact_at TIMESTAMPTZ;
+    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS next_contact_method TEXT;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 """
@@ -1358,15 +1368,16 @@ def init_pool():
             conn_sections = db_pool.getconn()
             with conn_sections.cursor() as cur:
                 cur.execute("SET search_path TO crm, public")
-                for section_code, display_name, sort_order in DEFAULT_CONTACT_SECTIONS:
-                    cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order)
-                        VALUES (1, %s, %s, TRUE, %s)
+                for section_code, display_name, sort_order, parent_code in DEFAULT_CONTACT_SECTIONS:
+                    cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order, parent_section_code)
+                        VALUES (1, %s, %s, TRUE, %s, %s)
                         ON CONFLICT (tenant_id, section_code) DO UPDATE SET
                             display_name=EXCLUDED.display_name,
                             sort_order=EXCLUDED.sort_order,
+                            parent_section_code=EXCLUDED.parent_section_code,
                             is_active=TRUE,
                             updated_at=now()""",
-                        (section_code, display_name, sort_order))
+                        (section_code, display_name, sort_order, parent_code))
                 conn_sections.commit()
             db_pool.putconn(conn_sections)
             print("Contact sections seeded")
@@ -3615,7 +3626,7 @@ async def get_contact_sections(request: Request):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""SELECT section_code, display_name, is_default, sort_order
+            cur.execute("""SELECT section_code, display_name, is_default, sort_order, parent_section_code
                 FROM contact_sections
                 WHERE tenant_id=%s AND is_active=TRUE
                 ORDER BY sort_order, LOWER(display_name)""", (user["tenant_id"],))
@@ -3633,19 +3644,21 @@ async def create_contact_section(data: dict, request: Request):
     section_code = normalize_section_code(data.get("section_code") or display_name)
     if not section_code:
         raise HTTPException(400, "section_code required")
+    parent_section_code = data.get("parent_section_code") or None
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_sort FROM contact_sections WHERE tenant_id=%s", (tenant_id,))
             max_sort = int((cur.fetchone() or {}).get("max_sort") or 0)
-            cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order, is_active, updated_at)
-                VALUES (%s,%s,%s,FALSE,%s,TRUE,now())
+            cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order, parent_section_code, is_active, updated_at)
+                VALUES (%s,%s,%s,FALSE,%s,%s,TRUE,now())
                 ON CONFLICT (tenant_id, section_code) DO UPDATE SET
                     display_name=EXCLUDED.display_name,
+                    parent_section_code=EXCLUDED.parent_section_code,
                     is_active=TRUE,
                     updated_at=now()
-                RETURNING section_code, display_name, is_default, sort_order""",
-                (tenant_id, section_code, display_name, max_sort + 10))
+                RETURNING section_code, display_name, is_default, sort_order, parent_section_code""",
+                (tenant_id, section_code, display_name, max_sort + 10, parent_section_code))
             row = dict(cur.fetchone())
             conn.commit()
             return row
@@ -3662,7 +3675,8 @@ async def get_shared_contacts(request: Request):
     try:
         with conn.cursor() as cur:
             cur.execute("""SELECT c.id, c.section_code, s.display_name AS section_name, c.display_name, c.company_name,
-                                  c.phone_primary, c.email_primary, c.notes, c.source, c.created_at::text, c.updated_at::text
+                                  c.phone_primary, c.email_primary, c.notes, c.source, c.created_at::text, c.updated_at::text,
+                                  c.next_contact_at::text, c.next_contact_method
                 FROM shared_contacts c
                 LEFT JOIN contact_sections s ON s.tenant_id=c.tenant_id AND s.section_code=c.section_code
                 WHERE c.tenant_id=%s AND c.deleted_at IS NULL
@@ -3707,6 +3721,8 @@ async def update_shared_contact(contact_id: int, data: dict, request: Request):
                 raise HTTPException(400, "display_name required")
             phone_primary = (data.get("phone_primary") or existing.get("phone_primary") or "").strip() or None
             email_primary = (data.get("email_primary") or existing.get("email_primary") or "").strip() or None
+            next_contact_at = data.get("next_contact_at") if "next_contact_at" in data else existing.get("next_contact_at")
+            next_contact_method = data.get("next_contact_method") if "next_contact_method" in data else existing.get("next_contact_method")
             cur.execute("""UPDATE shared_contacts
                 SET section_code=%s,
                     display_name=%s,
@@ -3716,6 +3732,8 @@ async def update_shared_contact(contact_id: int, data: dict, request: Request):
                     notes=%s,
                     normalized_phone=%s,
                     normalized_email=%s,
+                    next_contact_at=%s,
+                    next_contact_method=%s,
                     updated_by=%s,
                     updated_at=now()
                 WHERE id=%s AND tenant_id=%s
@@ -3729,6 +3747,8 @@ async def update_shared_contact(contact_id: int, data: dict, request: Request):
                     (data.get("notes") if "notes" in data else existing.get("notes")) or None,
                     normalize_phone(phone_primary) or None,
                     normalize_email(email_primary) or None,
+                    next_contact_at or None,
+                    next_contact_method or None,
                     user["user_id"],
                     contact_id,
                     user["tenant_id"],
