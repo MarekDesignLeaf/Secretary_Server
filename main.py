@@ -8848,8 +8848,9 @@ VOICE_NUMBER_WORDS = {
     # Czech, normalized without diacritics.
     "nula": 0, "jeden": 1, "jedna": 1, "jedno": 1, "prvni": 1,
     "dva": 2, "dve": 2, "druhy": 2, "druha": 2,
-    "tri": 3, "treti": 3, "ctyri": 4, "ctvrty": 4,
-    "pet": 5, "paty": 5, "sest": 6, "sesty": 6, "sedm": 7,
+    "tri": 3, "treti": 3, "tree": 3, "free": 3, "true": 3, "try": 3,
+    "ctyri": 4, "ctvrty": 4, "four": 4, "for": 4,
+    "pet": 5, "pat": 5, "pad": 5, "pete": 5, "paty": 5, "sest": 6, "sesty": 6, "sedm": 7,
     "osmy": 8, "osm": 8, "devet": 9, "devaty": 9, "deset": 10,
     "jedenact": 11, "dvanact": 12, "trinact": 13, "ctrnact": 14,
     "patnact": 15, "sestnact": 16, "sedmnact": 17, "osmnact": 18,
@@ -8893,7 +8894,7 @@ VOICE_NUMBER_FILLERS = {
 }
 
 VOICE_NEGATIVE_WORDS = {
-    "ne", "nee", "no", "nope", "none", "nothing", "nic", "zadny", "zadna",
+    "ne", "nee", "neee", "nah", "non", "no", "nope", "none", "nothing", "nic", "zadny", "zadna",
     "zadne", "zadnej", "zaden", "zadnou", "bez", "nie", "brak", "zaden",
     "nemam", "nemame", "neni", "nepouzili", "nepouzito", "nebyl", "nebylo",
     "skip", "preskoc", "preskocit", "dalsi", "dal", "dalej", "zadnych",
