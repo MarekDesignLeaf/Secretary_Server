@@ -3754,6 +3754,48 @@ def find_client_by_whatsapp_phone(cur, tenant_id: int, phone: Optional[str]) -> 
             return client
     return None
 
+def find_client_by_voice_name(cur, tenant_id: int, name: Optional[str]) -> Optional[Dict[str, Any]]:
+    normalized_target = normalize_voice_name_key(name)
+    if not normalized_target:
+        return None
+    target_tokens = [token for token in normalized_target.split() if token]
+    cur.execute("""
+        SELECT id, display_name, phone_primary, phone_secondary
+        FROM clients
+        WHERE tenant_id=%s AND deleted_at IS NULL
+    """, (tenant_id,))
+    ranked = []
+    for row in cur.fetchall():
+        client = dict(row)
+        normalized_name = normalize_voice_name_key(client.get("display_name"))
+        if not normalized_name:
+            continue
+        tokens = [token for token in normalized_name.split() if token]
+        score = None
+        if normalized_name == normalized_target:
+            score = 0
+        elif target_tokens and all(token in tokens for token in target_tokens):
+            score = 10 + abs(len(tokens) - len(target_tokens))
+        elif normalized_target in normalized_name or normalized_name in normalized_target:
+            score = 20 + abs(len(normalized_name) - len(normalized_target))
+        elif target_tokens:
+            overlap = sum(1 for token in target_tokens if token in tokens)
+            if overlap:
+                score = 60 - (overlap * 5) + abs(len(tokens) - len(target_tokens))
+        if score is None:
+            continue
+        ranked.append((
+            score,
+            1 if not (client.get("phone_primary") or client.get("phone_secondary")) else 0,
+            abs(len(normalized_name) - len(normalized_target)),
+            len(normalized_name),
+            client,
+        ))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[:4])
+    return ranked[0][4]
+
 def client_info_score(row: Dict[str, Any]) -> int:
     keys = [
         "display_name", "first_name", "last_name", "company_name", "phone_primary",
@@ -4198,7 +4240,7 @@ RULES:
 - When user says 'done' or 'completed' for a task, use complete_task.
 - When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report.
 - When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather.
-- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. The Android app will open WhatsApp on the phone with the resolved contact and message.
+- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Pass the contact plus the message content naturally in the user's current/internal language; the server resolves the contact and translates the outgoing message to the customer's configured language before Android opens WhatsApp.
 - For email inbox: use search_email to find messages, read_email to read a message or latest matching message aloud, and reply_email to answer an existing email thread.
 - For new outbound email use send_email. For replies to an existing incoming email always use reply_email so the reply goes to the original sender.
 - When user asks about clients database, how many clients, client statistics, sources, types, or any question about CRM data, use query_clients. Examples: 'kolik mam klientu', 'odkud jsou klienti', 'jaci klienti jsou aktivni', 'kolik mam zakazek', 'statistiky', 'prehled databaze'."""
@@ -4226,7 +4268,7 @@ RULES:
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
             {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
             {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: Didcot, Oxfordshire"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
-            {"type":"function","function":{"name":"send_whatsapp","description":"Otevre WhatsApp v mobilu s predvyplnenou zpravou pro kontakt nebo klienta.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta nebo kontaktu"},"contact_name":{"type":"string","description":"Jmeno kontaktu, pokud nejde o CRM klienta"},"phone":{"type":"string","description":"Telefonni cislo, pokud je zname"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["message"]}}},
+            {"type":"function","function":{"name":"send_whatsapp","description":"Otevre WhatsApp v mobilu s predvyplnenou zpravou pro kontakt nebo klienta. Message ma byt prirozeny obsah v internim jazyce uzivatele; server ji prelozi do nastaveneho jazyka komunikace se zakaznikem.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta nebo kontaktu"},"contact_name":{"type":"string","description":"Jmeno kontaktu, pokud nejde o CRM klienta"},"phone":{"type":"string","description":"Telefonni cislo, pokud je zname"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["message"]}}},
             {"type":"function","function":{"name":"remember_memory","description":"Ulozi dlouhodobou nebo strednedobou pamet asistenta. Pouzij pro 'zapamatuj si ...', 'pamatuj si ...', 'remember ...'.","parameters":{"type":"object","properties":{"content":{"type":"string","description":"Presny obsah k zapamatovani"},"memory_type":{"type":"string","enum":["medium","long"],"default":"long"}},"required":["content"]}}},
             {"type":"function","function":{"name":"forget_memory","description":"Smaze odpovidajici polozky pameti asistenta. Pouzij pro 'zapomen ...', 'forget ...'.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Co se ma zapomenout"}},"required":["query"]}}},
             {"type":"function","function":{"name":"query_clients","description":"Dotaz na databazi klientu. Pouzij kdyz se uzivatel pta kolik ma klientu, odkud jsou, jake typy, statistiky CRM, prehled databaze, aktivni/neaktivni klienti, zdroje klientu.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"Co chce uzivatel vedet o klientech/databazi. Napr: 'kolik klientu', 'statistiky', 'odkud jsou klienti', 'aktivni klienti', 'posledni klienti'"}},"required":["question"]}}},
@@ -4679,8 +4721,29 @@ RULES:
 
             if action == "SEND_WHATSAPP":
                 client_name = args.get("client_name") or args.get("contact_name") or args.get("name") or ""
-                message = args.get("message") or ""
+                original_message = args.get("message") or ""
                 phone = args.get("phone") or ""
+                resolved_client_id = None
+                if phone or client_name:
+                    conn = get_db_conn()
+                    try:
+                        with conn.cursor() as cur:
+                            if phone:
+                                matched = find_client_by_communication_phone(cur, tenant_id, phone)
+                                if matched:
+                                    resolved_client_id = matched.get("id")
+                                    client_name = matched.get("display_name") or client_name
+                                    phone = matched.get("phone_primary") or matched.get("phone_secondary") or phone
+                            if not phone and client_name:
+                                matched = find_client_by_voice_name(cur, tenant_id, client_name)
+                                if matched:
+                                    resolved_client_id = matched.get("id")
+                                    client_name = matched.get("display_name") or client_name
+                                    phone = matched.get("phone_primary") or matched.get("phone_secondary") or phone
+                    finally:
+                        release_conn(conn)
+                outgoing_language = resolve_customer_language(tenant_config, msg.external_language)
+                translated_message = translate_customer_message(original_message, outgoing_language)
                 return {
                     "reply_cs": tr(
                         f"Opening WhatsApp for {client_name or phone}.",
@@ -4689,10 +4752,13 @@ RULES:
                     ),
                     "action_type": "SEND_WHATSAPP",
                     "action_data": {
+                        "client_id": resolved_client_id,
                         "client_name": client_name,
                         "contact_name": args.get("contact_name") or client_name,
                         "phone": phone,
-                        "message": message,
+                        "message": translated_message,
+                        "original_message": original_message,
+                        "language": outgoing_language,
                     },
                 }
 
@@ -9910,6 +9976,41 @@ async def create_pricing_rule(data: dict):
 
 # ========== WHATSAPP CLOUD API ==========
 
+def translate_customer_message(message: str, target_language: str = "en") -> str:
+    source_text = (message or "").strip()
+    if not source_text:
+        return ""
+    normalized_target_language = normalize_language_code(target_language, default="en")
+    translated = source_text
+    if ai_client:
+        try:
+            target_label = {
+                "en": "English",
+                "cs": "Czech",
+                "pl": "Polish",
+            }.get(normalized_target_language, "English")
+            translation = ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Translate the following customer message to {target_label}. "
+                            f"Return ONLY the translated message, nothing else. "
+                            f"Preserve meaning and tone. If already in {target_label}, return it as-is."
+                        ),
+                    },
+                    {"role": "user", "content": source_text},
+                ],
+                max_tokens=500,
+            )
+            candidate = (translation.choices[0].message.content or "").strip()
+            if candidate:
+                translated = candidate
+        except Exception:
+            translated = source_text
+    return translated
+
 def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
     """Send WhatsApp message via configured provider. By default translates to customer language."""
     provider = get_whatsapp_provider()
@@ -9934,21 +10035,7 @@ def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
         }
 
     normalized_target_language = normalize_language_code(target_language, default="en")
-    translated = message
-    if ai_client:
-        try:
-            target_label = {
-                "en": "English",
-                "cs": "Czech",
-                "pl": "Polish",
-            }.get(normalized_target_language, "English")
-            tr = ai_client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role":"system","content":f"Translate the following customer message to {target_label}. Return ONLY the translated message, nothing else. Preserve meaning and tone. If already in {target_label}, return it as-is."},
-                {"role":"user","content":message}
-            ], max_tokens=500)
-            translated = tr.choices[0].message.content.strip()
-        except:
-            translated = message
+    translated = translate_customer_message(message, normalized_target_language)
     if provider == "twilio":
         sender = TWILIO_WHATSAPP_FROM.strip()
         if not sender.startswith("whatsapp:"):
