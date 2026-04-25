@@ -4209,8 +4209,30 @@ async def process_message(msg: MessageRequest, request: Request):
         memory_conn = get_db_conn()
         try:
             memories = load_assistant_memories(memory_conn, tenant_id, current_user_id)
+            # Also load recent session summaries (last 5)
+            session_memories = []
+            try:
+                cur_mem = memory_conn.cursor()
+                cur_mem.execute(
+                    """SELECT content, created_at FROM crm.assistant_memory
+                       WHERE tenant_id = %s AND user_id IS NOT DISTINCT FROM %s
+                         AND memory_type = 'session' AND is_active = TRUE
+                       ORDER BY created_at DESC LIMIT 5""",
+                    (tenant_id, current_user_id)
+                )
+                session_memories = cur_mem.fetchall()
+            except Exception:
+                pass
+            parts = []
             if memories:
-                memory_ctx = "\n".join(f"- {item['content']}" for item in memories)
+                parts.append("Remembered facts:\n" + "\n".join(f"- {item['content']}" for item in memories))
+            if session_memories:
+                parts.append("Recent conversations:\n" + "\n".join(
+                    f"- [{row[1].strftime('%Y-%m-%d %H:%M') if hasattr(row[1], 'strftime') else str(row[1])[:16]}] {row[0]}"
+                    for row in session_memories
+                ))
+            if parts:
+                memory_ctx = "\n\n".join(parts)
         except Exception as e:
             print(f"Memory load warning: {e}")
         finally:
@@ -8744,6 +8766,85 @@ async def company_setup(data: dict):
         conn.rollback()
         raise HTTPException(500, str(e))
     finally: release_conn(conn)
+
+@app.post("/session/summarize")
+async def summarize_session(request: Request):
+    """Summarize a completed dialog session and store as long-term memory."""
+    try:
+        body = await request.json()
+        history = body.get("history", [])          # [{role, content}, ...]
+        user_id = body.get("user_id")
+        tenant_id = body.get("tenant_id", 1)
+        internal_language = body.get("internal_language", "cs")
+
+        if not history or len(history) < 2:
+            return {"stored": False, "reason": "too_short"}
+
+        if not ai_client:
+            return {"stored": False, "reason": "no_ai"}
+
+        # Build readable transcript
+        transcript = "
+".join(
+            f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
+            for m in history
+            if m.get('content', '').strip()
+        )
+
+        # Ask GPT to summarize
+        lang_label = {"cs": "Czech", "en": "English", "pl": "Polish"}.get(internal_language[:2], "English")
+        summary_resp = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"Summarize the following voice assistant conversation in {lang_label}. "
+                        f"Focus on: what was decided, what was created/edited, important names/dates/numbers, "
+                        f"and any open tasks or follow-ups. Be concise (3-6 sentences max). "
+                        f"Start with the date/time if mentioned."
+                    )
+                },
+                {"role": "user", "content": transcript}
+            ],
+            max_tokens=300
+        )
+        summary = (summary_resp.choices[0].message.content or "").strip()
+        if not summary:
+            return {"stored": False, "reason": "empty_summary"}
+
+        # Store as session memory (type='session')
+        conn = get_db_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO crm.assistant_memory
+                   (tenant_id, user_id, memory_type, content, source, is_active)
+                   VALUES (%s, %s, 'session', %s, 'voice_dialog', TRUE)""",
+                (tenant_id, user_id, summary)
+            )
+            # Keep only last 10 session memories per user to avoid bloat
+            cur.execute(
+                """DELETE FROM crm.assistant_memory
+                   WHERE tenant_id = %s AND user_id IS NOT DISTINCT FROM %s
+                     AND memory_type = 'session'
+                     AND id NOT IN (
+                         SELECT id FROM crm.assistant_memory
+                         WHERE tenant_id = %s AND user_id IS NOT DISTINCT FROM %s
+                           AND memory_type = 'session'
+                         ORDER BY created_at DESC LIMIT 10
+                     )""",
+                (tenant_id, user_id, tenant_id, user_id)
+            )
+            conn.commit()
+            return {"stored": True, "summary": summary}
+        except Exception as e:
+            conn.rollback()
+            return {"stored": False, "error": str(e)}
+        finally:
+            release_conn(conn)
+    except Exception as e:
+        return {"stored": False, "error": str(e)}
 
 @app.post("/translate")
 async def translate_message(request: Request):
