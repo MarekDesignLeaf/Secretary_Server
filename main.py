@@ -8745,6 +8745,20 @@ async def company_setup(data: dict):
         raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
+@app.post("/translate")
+async def translate_message(request: Request):
+    """Translate a customer-facing message to the configured customer language."""
+    try:
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+        target_language = (body.get("target_language") or "en").strip()
+        if not text:
+            return {"translated": "", "target_language": target_language}
+        translated = translate_customer_message(text, target_language)
+        return {"translated": translated, "target_language": target_language}
+    except Exception as e:
+        return {"translated": body.get("text", "") if "body" in dir() else "", "error": str(e)}
+
 @app.get("/health")
 async def health():
     try:
