@@ -6266,6 +6266,252 @@ async def delete_shared_contact(contact_id: int, request: Request):
     finally:
         release_conn(conn)
 
+# ===== CONTACTS TABLE MIGRATION =====
+
+@app.post("/crm/contacts/migrate-from-clients")
+async def migrate_clients_to_contacts(request: Request):
+    """
+    ONE-TIME MIGRATION: Copy all records from clients table into new contacts table.
+    - Default role: unclassified
+    - If client has jobs/invoices/quotes: role = client
+    - Original clients table is NOT modified
+    - Returns audit report
+    """
+    user = ensure_request_permissions(request, "manage_users")  # admin only
+    tenant_id = user.get("tenant_id", 1)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # 1. Create contacts table if not exists
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS crm.contacts (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    tenant_id INT NOT NULL DEFAULT 1,
+                    source_client_id BIGINT,          -- original clients.id reference
+                    contact_role TEXT NOT NULL DEFAULT 'unclassified',
+                    -- Copy of key clients fields
+                    client_code TEXT,
+                    display_name TEXT NOT NULL,
+                    first_name TEXT,
+                    last_name TEXT,
+                    company_name TEXT,
+                    company_registration_no TEXT,
+                    vat_no TEXT,
+                    email_primary TEXT,
+                    email_secondary TEXT,
+                    phone_primary TEXT,
+                    phone_secondary TEXT,
+                    website TEXT,
+                    billing_address_line1 TEXT,
+                    billing_city TEXT,
+                    billing_postcode TEXT,
+                    billing_country TEXT,
+                    notes TEXT,
+                    status TEXT DEFAULT 'active',
+                    is_commercial BOOLEAN DEFAULT FALSE,
+                    owner_user_id BIGINT,
+                    normalized_phone TEXT,
+                    normalized_email TEXT,
+                    migrated_at TIMESTAMPTZ DEFAULT now(),
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now(),
+                    deleted_at TIMESTAMPTZ,
+                    CONSTRAINT uq_contacts_source UNIQUE (tenant_id, source_client_id)
+                )
+            """)
+
+            # 2. Find clients that have jobs, invoices or quotes (= real clients)
+            cur.execute("""
+                SELECT DISTINCT c.id
+                FROM crm.clients c
+                WHERE c.tenant_id = %s AND c.deleted_at IS NULL
+                  AND (
+                    EXISTS (SELECT 1 FROM crm.jobs j WHERE j.client_id = c.id AND j.tenant_id = %s)
+                    OR EXISTS (SELECT 1 FROM crm.invoices i WHERE i.client_id = c.id AND i.tenant_id = %s)
+                    OR EXISTS (SELECT 1 FROM crm.quotes q WHERE q.client_id = c.id AND q.tenant_id = %s)
+                  )
+            """, (tenant_id, tenant_id, tenant_id, tenant_id))
+            confirmed_client_ids = {row[0] for row in cur.fetchall()}
+
+            # 3. Migrate all clients into contacts
+            cur.execute("""
+                SELECT id, client_code, display_name, first_name, last_name,
+                       company_name, company_registration_no, vat_no,
+                       email_primary, email_secondary, phone_primary, phone_secondary,
+                       website, billing_address_line1, billing_city, billing_postcode,
+                       billing_country, status, is_commercial, owner_user_id,
+                       normalized_phone, normalized_email, deleted_at
+                FROM crm.clients
+                WHERE tenant_id = %s
+                ORDER BY id
+            """, (tenant_id,))
+            all_clients = cur.fetchall()
+
+            migrated = 0
+            skipped_existing = 0
+            errors = 0
+
+            for row in all_clients:
+                client_id = row[0]
+                role = 'client' if client_id in confirmed_client_ids else 'unclassified'
+                try:
+                    cur.execute("""
+                        INSERT INTO crm.contacts (
+                            tenant_id, source_client_id, contact_role,
+                            client_code, display_name, first_name, last_name,
+                            company_name, company_registration_no, vat_no,
+                            email_primary, email_secondary, phone_primary, phone_secondary,
+                            website, billing_address_line1, billing_city, billing_postcode,
+                            billing_country, status, is_commercial, owner_user_id,
+                            normalized_phone, normalized_email, deleted_at
+                        ) VALUES (
+                            %s, %s, %s,
+                            %s, %s, %s, %s,
+                            %s, %s, %s,
+                            %s, %s, %s, %s,
+                            %s, %s, %s, %s,
+                            %s, %s, %s, %s,
+                            %s, %s, %s
+                        )
+                        ON CONFLICT (tenant_id, source_client_id) DO NOTHING
+                    """, (
+                        tenant_id, client_id, role,
+                        row[1], row[2], row[3], row[4],
+                        row[5], row[6], row[7],
+                        row[8], row[9], row[10], row[11],
+                        row[12], row[13], row[14], row[15],
+                        row[16], row[17], row[18], row[19],
+                        row[20], row[21], row[22]
+                    ))
+                    if cur.rowcount > 0:
+                        migrated += 1
+                    else:
+                        skipped_existing += 1
+                except Exception as e:
+                    errors += 1
+                    print(f"Migration error for client {client_id}: {e}")
+
+            # 4. Audit counts
+            cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s", (tenant_id,))
+            total_contacts = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND contact_role='client'", (tenant_id,))
+            total_clients = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND contact_role='unclassified'", (tenant_id,))
+            total_unclassified = cur.fetchone()[0]
+
+            cur.execute("""
+                SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s
+                AND (phone_primary IS NULL OR phone_primary='')
+                AND (email_primary IS NULL OR email_primary='')
+            """, (tenant_id,))
+            total_no_contact = cur.fetchone()[0]
+
+            # Duplicates by phone
+            cur.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT normalized_phone FROM crm.contacts
+                    WHERE tenant_id=%s AND normalized_phone IS NOT NULL AND normalized_phone != ''
+                    GROUP BY normalized_phone HAVING COUNT(*) > 1
+                ) dupes
+            """, (tenant_id,))
+            total_phone_dupes = cur.fetchone()[0]
+
+            # Duplicates by name
+            cur.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT lower(display_name) FROM crm.contacts
+                    WHERE tenant_id=%s AND deleted_at IS NULL
+                    GROUP BY lower(display_name) HAVING COUNT(*) > 1
+                ) dupes
+            """, (tenant_id,))
+            total_name_dupes = cur.fetchone()[0]
+
+            conn.commit()
+
+            return {
+                "status": "completed",
+                "audit": {
+                    "total_in_contacts_table": total_contacts,
+                    "migrated_this_run": migrated,
+                    "skipped_already_existed": skipped_existing,
+                    "errors": errors,
+                    "role_client": total_clients,
+                    "role_unclassified": total_unclassified,
+                    "no_phone_no_email": total_no_contact,
+                    "duplicate_phones": total_phone_dupes,
+                    "duplicate_names": total_name_dupes,
+                    "confirmed_client_ids_count": len(confirmed_client_ids)
+                },
+                "note": "Original clients table NOT modified. contacts table created/updated."
+            }
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
+@app.get("/crm/contacts/audit")
+async def contacts_audit(request: Request):
+    """Get audit report for contacts table."""
+    user = ensure_request_permissions(request, "contacts_read")
+    tenant_id = user.get("tenant_id", 1)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Check if table exists
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema='crm' AND table_name='contacts'
+                )
+            """)
+            table_exists = cur.fetchone()[0]
+            if not table_exists:
+                return {"status": "not_migrated", "message": "contacts table does not exist yet"}
+
+            cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s", (tenant_id,))
+            total = cur.fetchone()[0]
+
+            cur.execute("""
+                SELECT contact_role, COUNT(*) as cnt
+                FROM crm.contacts WHERE tenant_id=%s AND deleted_at IS NULL
+                GROUP BY contact_role ORDER BY cnt DESC
+            """, (tenant_id,))
+            by_role = {row[0]: row[1] for row in cur.fetchall()}
+
+            cur.execute("""
+                SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND deleted_at IS NULL
+                AND (phone_primary IS NULL OR phone_primary='')
+                AND (email_primary IS NULL OR email_primary='')
+            """, (tenant_id,))
+            no_contact = cur.fetchone()[0]
+
+            cur.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT normalized_phone FROM crm.contacts
+                    WHERE tenant_id=%s AND normalized_phone IS NOT NULL AND normalized_phone != ''
+                    AND deleted_at IS NULL
+                    GROUP BY normalized_phone HAVING COUNT(*) > 1
+                ) d
+            """, (tenant_id,))
+            phone_dupes = cur.fetchone()[0]
+
+            return {
+                "status": "ok",
+                "total_contacts": total,
+                "by_role": by_role,
+                "no_phone_no_email": no_contact,
+                "duplicate_phones": phone_dupes
+            }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
 @app.get("/crm/contacts/duplicates")
 async def find_contact_duplicates(request: Request):
     """Find duplicate contacts in shared_contacts (same phone or similar name)."""
