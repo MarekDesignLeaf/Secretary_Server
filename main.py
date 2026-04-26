@@ -6339,8 +6339,7 @@ async def migrate_clients_to_contacts(request: Request):
                        company_name, company_registration_no, vat_no,
                        email_primary, email_secondary, phone_primary, phone_secondary,
                        website, billing_address_line1, billing_city, billing_postcode,
-                       billing_country, status, is_commercial, owner_user_id,
-                       normalized_phone, normalized_email, deleted_at
+                       billing_country, status, is_commercial, owner_user_id, deleted_at
                 FROM crm.clients
                 WHERE tenant_id = %s
                 ORDER BY id
@@ -6354,6 +6353,16 @@ async def migrate_clients_to_contacts(request: Request):
             for row in all_clients:
                 client_id = row[0]
                 role = 'client' if client_id in confirmed_client_ids else 'unclassified'
+                # Normalize phone
+                raw_phone = row[10] or ''
+                import re as _re
+                norm_phone = _re.sub(r'[^\d+]', '', raw_phone)
+                if norm_phone.startswith('0') and len(norm_phone) >= 10:
+                    norm_phone = '+44' + norm_phone[1:]
+                norm_phone = norm_phone if norm_phone else None
+                # Normalize email
+                raw_email = row[8] or ''
+                norm_email = raw_email.strip().lower() if raw_email else None
                 try:
                     cur.execute("""
                         INSERT INTO crm.contacts (
@@ -6381,7 +6390,7 @@ async def migrate_clients_to_contacts(request: Request):
                         row[8], row[9], row[10], row[11],
                         row[12], row[13], row[14], row[15],
                         row[16], row[17], row[18], row[19],
-                        row[20], row[21], row[22]
+                        norm_phone, norm_email, row[20]
                     ))
                     if cur.rowcount > 0:
                         migrated += 1
