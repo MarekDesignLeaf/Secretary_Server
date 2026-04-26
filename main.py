@@ -6113,14 +6113,17 @@ async def create_contact_section(data: dict, request: Request):
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_sort FROM contact_sections WHERE tenant_id=%s", (tenant_id,))
             max_sort = int((cur.fetchone() or {}).get("max_sort") or 0)
+            explicit_sort = data.get("sort_order")
+            sort_val = int(explicit_sort) if explicit_sort is not None else (max_sort + 10)
             cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order, is_active, updated_at)
                 VALUES (%s,%s,%s,FALSE,%s,TRUE,now())
                 ON CONFLICT (tenant_id, section_code) DO UPDATE SET
                     display_name=EXCLUDED.display_name,
+                    sort_order=EXCLUDED.sort_order,
                     is_active=TRUE,
                     updated_at=now()
                 RETURNING section_code, display_name, is_default, sort_order""",
-                (tenant_id, section_code, display_name, max_sort + 10))
+                (tenant_id, section_code, display_name, sort_val))
             row = dict(cur.fetchone())
             conn.commit()
             return row
