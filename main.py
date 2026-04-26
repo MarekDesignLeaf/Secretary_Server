@@ -575,6 +575,7 @@ CREATE TABLE IF NOT EXISTS user_contact_sync (
     updated_at TIMESTAMPTZ DEFAULT now(),
     CONSTRAINT uq_user_contact_sync UNIQUE (tenant_id, user_id, contact_key)
 );
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE TABLE IF NOT EXISTS contact_sections (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id INT NOT NULL DEFAULT 1,
@@ -6264,6 +6265,77 @@ async def delete_shared_contact(contact_id: int, request: Request):
         raise HTTPException(500, str(e))
     finally:
         release_conn(conn)
+
+@app.get("/crm/contacts/duplicates")
+async def find_contact_duplicates(request: Request):
+    """Find duplicate contacts in shared_contacts (same phone or similar name)."""
+    user = ensure_request_permissions(request, "contacts_read")
+    tenant_id = user.get("tenant_id", 1)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Find same normalized_phone
+            cur.execute("""
+                SELECT a.id as id1, a.display_name as name1, a.phone_primary as phone1,
+                       a.section_code as section1,
+                       b.id as id2, b.display_name as name2, b.phone_primary as phone2,
+                       b.section_code as section2,
+                       'same_phone' as reason
+                FROM shared_contacts a
+                JOIN shared_contacts b ON b.normalized_phone = a.normalized_phone
+                    AND b.id > a.id
+                    AND b.tenant_id = a.tenant_id
+                WHERE a.tenant_id=%s AND a.deleted_at IS NULL AND b.deleted_at IS NULL
+                  AND a.normalized_phone IS NOT NULL AND a.normalized_phone != ''
+                LIMIT 50
+            """, (tenant_id,))
+            phone_dupes = [dict(r) for r in cur.fetchall()]
+
+            # Find similar names (same first token, length similar)
+            cur.execute("""
+                SELECT a.id as id1, a.display_name as name1, a.phone_primary as phone1,
+                       a.section_code as section1,
+                       b.id as id2, b.display_name as name2, b.phone_primary as phone2,
+                       b.section_code as section2,
+                       'similar_name' as reason
+                FROM shared_contacts a
+                JOIN shared_contacts b ON b.id > a.id AND b.tenant_id = a.tenant_id
+                WHERE a.tenant_id=%s AND a.deleted_at IS NULL AND b.deleted_at IS NULL
+                  AND a.normalized_phone IS DISTINCT FROM b.normalized_phone
+                  AND lower(split_part(a.display_name,' ',1)) = lower(split_part(b.display_name,' ',1))
+                  AND abs(length(a.display_name) - length(b.display_name)) < 8
+                  AND similarity(lower(a.display_name), lower(b.display_name)) > 0.6
+                LIMIT 50
+            """, (tenant_id,))
+            name_dupes = [dict(r) for r in cur.fetchall()]
+
+        all_dupes = phone_dupes + name_dupes
+        return {"duplicates": all_dupes, "count": len(all_dupes)}
+    except Exception as e:
+        conn.rollback()
+        # similarity() requires pg_trgm extension - fallback without it
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT a.id as id1, a.display_name as name1, a.phone_primary as phone1,
+                           a.section_code as section1,
+                           b.id as id2, b.display_name as name2, b.phone_primary as phone2,
+                           b.section_code as section2,
+                           'same_phone' as reason
+                    FROM shared_contacts a
+                    JOIN shared_contacts b ON b.normalized_phone = a.normalized_phone
+                        AND b.id > a.id AND b.tenant_id = a.tenant_id
+                    WHERE a.tenant_id=%s AND a.deleted_at IS NULL AND b.deleted_at IS NULL
+                      AND a.normalized_phone IS NOT NULL AND a.normalized_phone != ''
+                    LIMIT 50
+                """, (tenant_id,))
+                phone_dupes = [dict(r) for r in cur.fetchall()]
+            return {"duplicates": phone_dupes, "count": len(phone_dupes)}
+        except Exception as e2:
+            raise HTTPException(500, str(e2))
+    finally:
+        release_conn(conn)
+
 
 @app.get("/crm/contacts/sort-session")
 async def get_contacts_for_sorting(
