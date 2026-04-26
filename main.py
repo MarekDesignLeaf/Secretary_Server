@@ -349,10 +349,13 @@ SERVICE_RATE_DEFAULTS = {
 }
 
 DEFAULT_CONTACT_SECTIONS = [
-    ("employee", "Zaměstnanec", 10),
-    ("subcontractor", "Subkontraktor", 20),
-    ("material_supplier", "Dodavatel materiálu", 30),
-    ("equipment_vehicle_rental", "Půjčovny nářadí a aut", 40),
+    ("client",                  "Klienti",                    10),
+    ("employee",                "Zaměstnanci",                20),
+    ("subcontractor",           "Subdodavatelé",              30),
+    ("equipment_vehicle_rental","Půjčovny",                   40),
+    ("material_supplier",       "Dodavatelé materiálu",       50),
+    ("private",                 "Soukromé kontakty",          60),
+    ("other",                   "Ostatní",                   100),
 ]
 
 @app.middleware("http")
