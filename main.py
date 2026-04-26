@@ -6331,7 +6331,7 @@ async def migrate_clients_to_contacts(request: Request):
                     OR EXISTS (SELECT 1 FROM crm.quotes q WHERE q.client_id = c.id AND q.tenant_id = %s)
                   )
             """, (tenant_id, tenant_id, tenant_id, tenant_id))
-            confirmed_client_ids = {row[0] for row in cur.fetchall()}
+            confirmed_client_ids = {row["id"] for row in cur.fetchall()}
 
             # 3. Migrate all clients into contacts
             cur.execute("""
@@ -6402,20 +6402,20 @@ async def migrate_clients_to_contacts(request: Request):
 
             # 4. Audit counts
             cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s", (tenant_id,))
-            total_contacts = cur.fetchone()[0]
+            total_contacts = list(cur.fetchone().values())[0]
 
             cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND contact_role='client'", (tenant_id,))
-            total_clients = cur.fetchone()[0]
+            total_clients = list(cur.fetchone().values())[0]
 
             cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND contact_role='unclassified'", (tenant_id,))
-            total_unclassified = cur.fetchone()[0]
+            total_unclassified = list(cur.fetchone().values())[0]
 
             cur.execute("""
                 SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s
                 AND (phone_primary IS NULL OR phone_primary='')
                 AND (email_primary IS NULL OR email_primary='')
             """, (tenant_id,))
-            total_no_contact = cur.fetchone()[0]
+            total_no_contact = list(cur.fetchone().values())[0]
 
             # Duplicates by phone
             cur.execute("""
@@ -6425,7 +6425,7 @@ async def migrate_clients_to_contacts(request: Request):
                     GROUP BY normalized_phone HAVING COUNT(*) > 1
                 ) dupes
             """, (tenant_id,))
-            total_phone_dupes = cur.fetchone()[0]
+            total_phone_dupes = list(cur.fetchone().values())[0]
 
             # Duplicates by name
             cur.execute("""
@@ -6435,7 +6435,7 @@ async def migrate_clients_to_contacts(request: Request):
                     GROUP BY lower(display_name) HAVING COUNT(*) > 1
                 ) dupes
             """, (tenant_id,))
-            total_name_dupes = cur.fetchone()[0]
+            total_name_dupes = list(cur.fetchone().values())[0]
 
             conn.commit()
 
@@ -6483,12 +6483,12 @@ async def contacts_audit(request: Request):
                     WHERE table_schema='crm' AND table_name='contacts'
                 )
             """)
-            table_exists = cur.fetchone()[0]
+            table_exists = list(cur.fetchone().values())[0]
             if not table_exists:
                 return {"status": "not_migrated", "message": "contacts table does not exist yet"}
 
             cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s", (tenant_id,))
-            total = cur.fetchone()[0]
+            total = list(cur.fetchone().values())[0]
 
             cur.execute("""
                 SELECT contact_role, COUNT(*) as cnt
@@ -6502,7 +6502,7 @@ async def contacts_audit(request: Request):
                 AND (phone_primary IS NULL OR phone_primary='')
                 AND (email_primary IS NULL OR email_primary='')
             """, (tenant_id,))
-            no_contact = cur.fetchone()[0]
+            no_contact = list(cur.fetchone().values())[0]
 
             cur.execute("""
                 SELECT COUNT(*) FROM (
@@ -6512,7 +6512,7 @@ async def contacts_audit(request: Request):
                     GROUP BY normalized_phone HAVING COUNT(*) > 1
                 ) d
             """, (tenant_id,))
-            phone_dupes = cur.fetchone()[0]
+            phone_dupes = list(cur.fetchone().values())[0]
 
             return {
                 "status": "ok",
