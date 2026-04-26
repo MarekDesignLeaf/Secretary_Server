@@ -6259,6 +6259,184 @@ async def delete_shared_contact(contact_id: int, request: Request):
     finally:
         release_conn(conn)
 
+@app.get("/crm/contacts/sort-session")
+async def get_contacts_for_sorting(
+    request: Request,
+    sort_by: str = "name",          # "name" or "phone_prefix"
+    phone_prefix: str = "+44",      # used when sort_by=phone_prefix
+    limit: int = 500
+):
+    """Return phone contacts + shared_contacts merged list for voice sorting session."""
+    user = ensure_authenticated(request)
+    tenant_id = user.get("tenant_id", 1)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Get already classified shared contacts
+            cur.execute(
+                """SELECT id, section_code, display_name, phone_primary, normalized_phone, source
+                   FROM shared_contacts
+                   WHERE tenant_id=%s AND deleted_at IS NULL
+                   ORDER BY display_name""",
+                (tenant_id,)
+            )
+            existing = {row["normalized_phone"]: dict(row) for row in cur.fetchall() if row.get("normalized_phone")}
+        return {
+            "sort_by": sort_by,
+            "phone_prefix": phone_prefix,
+            "existing_count": len(existing),
+            "existing": list(existing.values()),
+            "sections": DEFAULT_CONTACT_SECTIONS
+        }
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
+@app.post("/crm/contacts/assign-section")
+async def assign_contact_section(data: dict, request: Request):
+    """Assign a phone contact to a section (create or update shared_contact)."""
+    user = ensure_authenticated(request)
+    tenant_id = user.get("tenant_id", 1)
+    user_id = user.get("user_id")
+    conn = get_db_conn()
+    try:
+        display_name = (data.get("display_name") or "").strip()
+        phone = (data.get("phone") or "").strip()
+        section_code = (data.get("section_code") or "other").strip()
+        contact_id = data.get("contact_id")  # existing shared_contact id if updating
+
+        if not display_name or not phone:
+            raise HTTPException(400, "display_name and phone required")
+
+        norm_phone = re.sub(r"[^\d+]", "", phone)
+        if norm_phone.startswith("0") and len(norm_phone) >= 10:
+            norm_phone = "+44" + norm_phone[1:]
+
+        with conn.cursor() as cur:
+            if contact_id:
+                cur.execute(
+                    """UPDATE shared_contacts
+                       SET section_code=%s, updated_at=now()
+                       WHERE id=%s AND tenant_id=%s
+                       RETURNING id, section_code, display_name""",
+                    (section_code, contact_id, tenant_id)
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(404, "Contact not found")
+                result = dict(row)
+            else:
+                cur.execute(
+                    """INSERT INTO shared_contacts
+                       (tenant_id, section_code, display_name, phone_primary, normalized_phone, source, created_at, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, 'voice_sort', now(), now())
+                       ON CONFLICT DO NOTHING
+                       RETURNING id, section_code, display_name""",
+                    (tenant_id, section_code, display_name, phone, norm_phone)
+                )
+                row = cur.fetchone()
+                if not row:
+                    # Already exists — update section
+                    cur.execute(
+                        """UPDATE shared_contacts SET section_code=%s, updated_at=now()
+                           WHERE tenant_id=%s AND normalized_phone=%s
+                           RETURNING id, section_code, display_name""",
+                        (section_code, tenant_id, norm_phone)
+                    )
+                    row = cur.fetchone()
+                result = dict(row) if row else {"section_code": section_code}
+
+            # Log audit
+            try:
+                cur.execute(
+                    """INSERT INTO audit_log (tenant_id, user_id, action, entity_type, description, created_at)
+                       VALUES (%s,%s,'assign_contact_section','shared_contact',%s,now())""",
+                    (tenant_id, user_id, f"Assigned {display_name} to {section_code}")
+                )
+            except Exception:
+                pass
+            conn.commit()
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
+@app.post("/crm/contacts/merge")
+async def merge_shared_contacts(data: dict, request: Request):
+    """Merge two shared contacts — keep primary, delete secondary, transfer section."""
+    user = ensure_authenticated(request)
+    tenant_id = user.get("tenant_id", 1)
+    user_id = user.get("user_id")
+    conn = get_db_conn()
+    try:
+        primary_id = data.get("primary_id")
+        secondary_id = data.get("secondary_id")
+        if not primary_id or not secondary_id:
+            raise HTTPException(400, "primary_id and secondary_id required")
+
+        with conn.cursor() as cur:
+            # Load both
+            cur.execute(
+                "SELECT * FROM shared_contacts WHERE id IN (%s,%s) AND tenant_id=%s",
+                (primary_id, secondary_id, tenant_id)
+            )
+            rows = {r["id"]: dict(r) for r in cur.fetchall()}
+            if len(rows) < 2:
+                raise HTTPException(404, "One or both contacts not found")
+
+            primary = rows[primary_id]
+            secondary = rows[secondary_id]
+
+            # Merge: fill missing fields from secondary into primary
+            merge_fields = ["phone_primary", "email_primary", "address", "company_name", "notes", "normalized_phone"]
+            updates = {}
+            for field in merge_fields:
+                if not primary.get(field) and secondary.get(field):
+                    updates[field] = secondary[field]
+
+            if updates:
+                set_clause = ", ".join(f"{k}=%s" for k in updates)
+                cur.execute(
+                    f"UPDATE shared_contacts SET {set_clause}, updated_at=now() WHERE id=%s AND tenant_id=%s",
+                    list(updates.values()) + [primary_id, tenant_id]
+                )
+
+            # Soft delete secondary
+            cur.execute(
+                "UPDATE shared_contacts SET deleted_at=now() WHERE id=%s AND tenant_id=%s",
+                (secondary_id, tenant_id)
+            )
+
+            # Audit
+            try:
+                cur.execute(
+                    """INSERT INTO audit_log (tenant_id, user_id, action, entity_type, description, created_at)
+                       VALUES (%s,%s,'merge_contacts','shared_contact',%s,now())""",
+                    (tenant_id, user_id,
+                     f"Merged {secondary.get('display_name')} into {primary.get('display_name')}")
+                )
+            except Exception:
+                pass
+            conn.commit()
+
+        return {"merged": True, "primary_id": primary_id, "deleted_id": secondary_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
 @app.post("/crm/contacts/import")
 async def import_shared_contacts(data: dict, request: Request):
     user = ensure_request_permissions(request, "contacts_write")
