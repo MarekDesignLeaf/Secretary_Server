@@ -6456,8 +6456,9 @@ async def migrate_clients_to_contacts(request: Request):
                 "note": "Original clients table NOT modified. contacts table created/updated."
             }
     except Exception as e:
+        import traceback; tb = traceback.format_exc()
         conn.rollback()
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, f"{type(e).__name__}: {e}: {tb[-300:]}")
     finally:
         release_conn(conn)
 
