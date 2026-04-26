@@ -6351,17 +6351,15 @@ async def migrate_clients_to_contacts(request: Request):
             errors = 0
 
             for row in all_clients:
-                client_id = row[0]
+                client_id = row["id"]
                 role = 'client' if client_id in confirmed_client_ids else 'unclassified'
-                # Normalize phone
-                raw_phone = row[10] or ''
+                raw_phone = (row.get("phone_primary") or '')
                 import re as _re
                 norm_phone = _re.sub(r'[^\d+]', '', raw_phone)
                 if norm_phone.startswith('0') and len(norm_phone) >= 10:
                     norm_phone = '+44' + norm_phone[1:]
                 norm_phone = norm_phone if norm_phone else None
-                # Normalize email
-                raw_email = row[8] or ''
+                raw_email = (row.get("email_primary") or '')
                 norm_email = raw_email.strip().lower() if raw_email else None
                 try:
                     cur.execute("""
@@ -6385,12 +6383,12 @@ async def migrate_clients_to_contacts(request: Request):
                         ON CONFLICT (tenant_id, source_client_id) DO NOTHING
                     """, (
                         tenant_id, client_id, role,
-                        row[1], row[2], row[3], row[4],
-                        row[5], row[6], row[7],
-                        row[8], row[9], row[10], row[11],
-                        row[12], row[13], row[14], row[15],
-                        row[16], row[17], row[18], row[19],
-                        norm_phone, norm_email, row[20]
+                        row.get("client_code"), row.get("display_name"), row.get("first_name"), row.get("last_name"),
+                        row.get("company_name"), row.get("company_registration_no"), row.get("vat_no"),
+                        row.get("email_primary"), row.get("email_secondary"), row.get("phone_primary"), row.get("phone_secondary"),
+                        row.get("website"), row.get("billing_address_line1"), row.get("billing_city"), row.get("billing_postcode"),
+                        row.get("billing_country"), row.get("status"), row.get("is_commercial"), row.get("owner_user_id"),
+                        norm_phone, norm_email, row.get("deleted_at")
                     ))
                     if cur.rowcount > 0:
                         migrated += 1
