@@ -1,4 +1,4 @@
-﻿import os, json, uuid, csv, io, hashlib
+import os, json, uuid, csv, io, hashlib
 import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -9340,8 +9340,7 @@ async def summarize_session(request: Request):
             return {"stored": False, "reason": "no_ai"}
 
         # Build readable transcript
-        transcript = "
-".join(
+        transcript = "\n".join(
             f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
             for m in history
             if m.get('content', '').strip()
