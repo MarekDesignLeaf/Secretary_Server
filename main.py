@@ -6520,7 +6520,9 @@ async def contacts_audit(request: Request):
                 "duplicate_phones": phone_dupes
             }
     except Exception as e:
-        raise HTTPException(500, str(e))
+        import traceback
+        tb = traceback.format_exc()
+        raise HTTPException(500, f"{type(e).__name__}: {e}\n{tb[-500:]}")
     finally:
         release_conn(conn)
 
