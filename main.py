@@ -6493,7 +6493,7 @@ async def contacts_audit(request: Request):
                 FROM crm.contacts WHERE tenant_id=%s AND deleted_at IS NULL
                 GROUP BY contact_role ORDER BY cnt DESC
             """, (tenant_id,))
-            by_role = {row[0]: row[1] for row in cur.fetchall()}
+            by_role = {row["contact_role"]: row["cnt"] for row in cur.fetchall()}
 
             cur.execute("""
                 SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND deleted_at IS NULL
@@ -6601,36 +6601,82 @@ async def get_contacts_for_sorting(
     request: Request,
     sort_by: str = "name",
     phone_prefix: str = "+44",
+    filter_role: str = "unclassified",
     limit: int = 500
 ):
-    """Return existing classified phones so Android can skip already-sorted contacts."""
+    """Return contacts from crm.contacts table for voice sorting session.
+    By default returns unclassified contacts that need to be categorized."""
     user = ensure_request_permissions(request, "contacts_manage")
     tenant_id = user.get("tenant_id", 1)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            # Phones already in clients table
-            cur.execute(
-                "SELECT phone_primary FROM clients WHERE tenant_id=%s AND deleted_at IS NULL AND phone_primary IS NOT NULL",
-                (tenant_id,)
-            )
-            client_phones = {r["phone_primary"] for r in cur.fetchall()}
+            # Check if contacts table exists
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema='crm' AND table_name='contacts'
+                )
+            """)
+            table_exists = list(cur.fetchone().values())[0]
 
-            # Phones already in shared_contacts
-            cur.execute(
-                "SELECT phone_primary, section_code FROM shared_contacts WHERE tenant_id=%s AND deleted_at IS NULL AND phone_primary IS NOT NULL",
-                (tenant_id,)
-            )
-            shared_phones = {r["phone_primary"]: r["section_code"] for r in cur.fetchall()}
+            if not table_exists:
+                return {
+                    "sort_by": sort_by,
+                    "contacts": [],
+                    "total": 0,
+                    "sections": [[code, name, order] for code, name, order in DEFAULT_CONTACT_SECTIONS],
+                    "error": "contacts table not migrated yet - run /crm/contacts/migrate-from-clients first"
+                }
 
-        already_sorted = {
-            **{p: "client" for p in client_phones},
-            **shared_phones
-        }
+            # Build query based on sort_by
+            if sort_by == "phone_prefix":
+                where_extra = """
+                    AND phone_primary IS NOT NULL
+                    AND (
+                        phone_primary LIKE %(prefix)s
+                        OR (phone_primary LIKE '0%%' AND LENGTH(REGEXP_REPLACE(phone_primary, '[^0-9]', '', 'g')) >= 10)
+                    )
+                """
+            else:
+                where_extra = ""
+
+            role_filter = "AND contact_role = %(role)s" if filter_role != "all" else ""
+
+            cur.execute(f"""
+                SELECT id, source_client_id, contact_role,
+                       display_name, first_name, last_name,
+                       company_name, phone_primary, email_primary,
+                       billing_city, billing_postcode, normalized_phone
+                FROM crm.contacts
+                WHERE tenant_id = %(tenant_id)s
+                  AND deleted_at IS NULL
+                  {role_filter}
+                  {where_extra}
+                ORDER BY {'phone_primary' if sort_by == 'phone_prefix' else 'lower(display_name)'}
+                LIMIT %(limit)s
+            """, {
+                "tenant_id": tenant_id,
+                "role": filter_role,
+                "prefix": f"{phone_prefix}%",
+                "limit": limit
+            })
+            contacts = [dict(r) for r in cur.fetchall()]
+
+            # Count by role for info
+            cur.execute("""
+                SELECT contact_role, COUNT(*) as cnt
+                FROM crm.contacts WHERE tenant_id=%s AND deleted_at IS NULL
+                GROUP BY contact_role
+            """, (tenant_id,))
+            role_counts = {r["contact_role"]: r["cnt"] for r in cur.fetchall()}
+
         return {
             "sort_by": sort_by,
-            "phone_prefix": phone_prefix,
-            "already_sorted": already_sorted,
+            "filter_role": filter_role,
+            "contacts": contacts,
+            "total": len(contacts),
+            "role_counts": role_counts,
             "sections": [[code, name, order] for code, name, order in DEFAULT_CONTACT_SECTIONS]
         }
     except Exception as e:
@@ -6642,107 +6688,69 @@ async def get_contacts_for_sorting(
 
 @app.post("/crm/contacts/assign-section")
 async def assign_contact_section(data: dict, request: Request):
-    """Assign a phone contact to a section.
-    If section_code == 'client': creates/updates record in clients table.
-    Otherwise: creates/updates record in shared_contacts table.
-    """
+    """Assign a contact to a role/category in crm.contacts table.
+    Also mirrors to shared_contacts for the contact directory."""
     user = ensure_request_permissions(request, "contacts_manage")
     tenant_id = user.get("tenant_id", 1)
     user_id = user.get("user_id")
     conn = get_db_conn()
     try:
+        contact_id = data.get("contact_id")        # crm.contacts.id
+        section_code = (data.get("section_code") or "other").strip()
         display_name = (data.get("display_name") or "").strip()
         phone = (data.get("phone") or "").strip()
-        section_code = (data.get("section_code") or "other").strip()
-        contact_id = data.get("contact_id")
 
-        if not display_name or not phone:
-            raise HTTPException(400, "display_name and phone required")
+        if not contact_id and not display_name:
+            raise HTTPException(400, "contact_id or display_name required")
 
         import re as _re
-        norm_phone = _re.sub(r"[^\d+]", "", phone)
-        if norm_phone.startswith("0") and len(norm_phone) >= 10:
-            norm_phone = "+44" + norm_phone[1:]
+        norm_phone = _re.sub(r'[^\d+]', '', phone) if phone else None
+        if norm_phone and norm_phone.startswith('0') and len(norm_phone) >= 10:
+            norm_phone = '+44' + norm_phone[1:]
 
         with conn.cursor() as cur:
-            if section_code == "client":
-                # Route into clients table
-                # Parse display_name into first/last
-                parts = display_name.strip().split(" ", 1)
-                first_name = parts[0] if parts else display_name
-                last_name = parts[1] if len(parts) > 1 else ""
-
-                # Check if already exists by phone
-                cur.execute(
-                    "SELECT id FROM clients WHERE tenant_id=%s AND phone_primary=%s AND deleted_at IS NULL LIMIT 1",
-                    (tenant_id, phone)
-                )
-                existing = cur.fetchone()
-                if existing:
-                    result = {"id": existing["id"], "section_code": "client",
-                              "display_name": display_name, "already_existed": True}
-                else:
-                    # Generate client code
-                    cur.execute(
-                        "SELECT COUNT(*) as cnt FROM clients WHERE tenant_id=%s", (tenant_id,)
-                    )
-                    cnt = (cur.fetchone() or {}).get("cnt", 0)
-                    client_code = f"CLI-{str(cnt + 1).zfill(5)}"
-
-                    cur.execute(
-                        """INSERT INTO clients
-                           (tenant_id, client_code, client_type, first_name, last_name,
-                            display_name, phone_primary, status, source, created_at, updated_at)
-                           VALUES (%s,%s,'domestic',%s,%s,%s,%s,'active','voice_sort',now(),now())
-                           RETURNING id, display_name, client_code""",
-                        (tenant_id, client_code, first_name, last_name,
-                         display_name, phone)
-                    )
-                    row = cur.fetchone()
-                    result = dict(row) if row else {}
-                    result["section_code"] = "client"
+            if contact_id:
+                # Update existing contact in crm.contacts
+                cur.execute("""
+                    UPDATE crm.contacts
+                    SET contact_role=%s, updated_at=now()
+                    WHERE id=%s AND tenant_id=%s
+                    RETURNING id, contact_role, display_name, phone_primary
+                """, (section_code, contact_id, tenant_id))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(404, "Contact not found")
+                result = dict(row)
+                if not display_name:
+                    display_name = result.get("display_name", "")
+                if not phone:
+                    phone = result.get("phone_primary", "")
             else:
-                # Route into shared_contacts table
-                if contact_id:
-                    cur.execute(
-                        """UPDATE shared_contacts SET section_code=%s, updated_at=now()
-                           WHERE id=%s AND tenant_id=%s
-                           RETURNING id, section_code, display_name""",
-                        (section_code, contact_id, tenant_id)
-                    )
-                    row = cur.fetchone()
-                    result = dict(row) if row else {"section_code": section_code}
-                else:
-                    cur.execute(
-                        """INSERT INTO shared_contacts
-                           (tenant_id, section_code, display_name, phone_primary,
-                            normalized_phone, source, created_at, updated_at)
-                           VALUES (%s,%s,%s,%s,%s,'voice_sort',now(),now())
-                           ON CONFLICT DO NOTHING
-                           RETURNING id, section_code, display_name""",
-                        (tenant_id, section_code, display_name, phone, norm_phone)
-                    )
-                    row = cur.fetchone()
-                    if not row:
-                        cur.execute(
-                            """UPDATE shared_contacts SET section_code=%s, updated_at=now()
-                               WHERE tenant_id=%s AND normalized_phone=%s
-                               RETURNING id, section_code, display_name""",
-                            (section_code, tenant_id, norm_phone)
-                        )
-                        row = cur.fetchone()
-                    result = dict(row) if row else {"section_code": section_code}
+                result = {"contact_role": section_code, "display_name": display_name}
+
+            # Mirror to shared_contacts for the directory view
+            if section_code not in ('unclassified', 'unknown'):
+                owner_id = user_id if section_code in ('private', 'other') else None
+                cur.execute("""
+                    INSERT INTO shared_contacts
+                    (tenant_id, section_code, display_name, phone_primary, normalized_phone,
+                     source, owner_user_id, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, 'contact_sort', %s, now(), now())
+                    ON CONFLICT (tenant_id, normalized_phone) WHERE normalized_phone IS NOT NULL
+                    DO UPDATE SET section_code=EXCLUDED.section_code, updated_at=now()
+                    RETURNING id
+                """, (tenant_id, section_code, display_name, phone or None,
+                      norm_phone, owner_id))
 
             # Audit
             try:
-                entity = "client" if section_code == "client" else "shared_contact"
-                cur.execute(
-                    """INSERT INTO audit_log (tenant_id, user_id, action, entity_type, description, created_at)
-                       VALUES (%s,%s,'assign_contact_section',%s,%s,now())""",
-                    (tenant_id, user_id, entity, f"Assigned {display_name} to {section_code}")
-                )
+                cur.execute("""
+                    INSERT INTO audit_log (tenant_id, user_id, action, entity_type, description, created_at)
+                    VALUES (%s,%s,'assign_contact_role','contact',%s,now())
+                """, (tenant_id, user_id, f"Assigned {display_name} to {section_code}"))
             except Exception:
                 pass
+
             conn.commit()
         return result
     except HTTPException:
