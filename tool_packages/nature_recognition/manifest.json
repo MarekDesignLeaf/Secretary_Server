@@ -1,0 +1,79 @@
+{
+  "tool_id": "nature_recognition",
+  "tool_name": "Nature Recognition",
+  "description": "AI-powered plant identification, plant health diagnosis and mushroom recognition using camera photos. Adds identify, health and mushroom tiles to the Tools Hub.",
+  "version": "1.0.0",
+  "author": "Secretary CRM",
+  "risk_level": "low",
+  "entry_point": "install.py",
+  "install_script": "install.py",
+  "uninstall_script": "uninstall.py",
+  "license_type": "mit",
+  "supported_platforms": ["all"],
+  "required_permissions": [
+    {
+      "permission_code": "nature.identify",
+      "description": "Identify plants and mushrooms from photos",
+      "scope": "tenant"
+    },
+    {
+      "permission_code": "nature.diagnose",
+      "description": "Diagnose plant health issues from photos",
+      "scope": "tenant"
+    }
+  ],
+  "required_config_slots": [],
+  "required_secret_slots": [
+    {
+      "slot_name": "openai_api_key",
+      "display_name": "OpenAI API Key",
+      "description": "API key for GPT-4o vision model used for plant/mushroom recognition. Requires gpt-4o access.",
+      "required": true,
+      "secret": true,
+      "replaceable": true,
+      "stored_in": "tenant_tool_secret",
+      "validation_type": "text",
+      "source_has_existing_value": false,
+      "export_secret_allowed": false
+    }
+  ],
+  "voice_commands": [
+    {
+      "command_phrase": "identify this plant",
+      "command_type": "trigger",
+      "language_code": "en-GB",
+      "description": "Open plant identification camera"
+    },
+    {
+      "command_phrase": "rozpoznej tuto rostlinu",
+      "command_type": "trigger",
+      "language_code": "cs",
+      "description": "Open plant identification camera (Czech)"
+    },
+    {
+      "command_phrase": "check plant health",
+      "command_type": "trigger",
+      "language_code": "en-GB",
+      "description": "Open plant health diagnosis camera"
+    },
+    {
+      "command_phrase": "zkontroluj zdraví rostliny",
+      "command_type": "trigger",
+      "language_code": "cs",
+      "description": "Open plant health diagnosis camera (Czech)"
+    },
+    {
+      "command_phrase": "identify this mushroom",
+      "command_type": "trigger",
+      "language_code": "en-GB",
+      "description": "Open mushroom identification camera"
+    },
+    {
+      "command_phrase": "rozpoznej tuto houbu",
+      "command_type": "trigger",
+      "language_code": "cs",
+      "description": "Open mushroom identification camera (Czech)"
+    }
+  ],
+  "db_requirements": []
+}

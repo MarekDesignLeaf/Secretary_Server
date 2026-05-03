@@ -1,0 +1,38 @@
+{
+  "slots": [
+    {
+      "slot_name": "api_key",
+      "display_name": "SendGrid API Key",
+      "description": "API key from SendGrid Settings > API Keys. Must have 'Mail Send' permission.",
+      "required": true,
+      "secret": true,
+      "replaceable": true,
+      "stored_in": "tenant_tool_secret",
+      "validation_type": "text",
+      "scope": "tenant"
+    },
+    {
+      "slot_name": "from_email",
+      "display_name": "From Email Address",
+      "description": "Verified sender email address registered in SendGrid",
+      "required": true,
+      "secret": false,
+      "replaceable": true,
+      "stored_in": "tenant_tool_config",
+      "validation_type": "email",
+      "scope": "tenant"
+    },
+    {
+      "slot_name": "from_name",
+      "display_name": "From Display Name",
+      "description": "Name shown as email sender (e.g. 'DesignLeaf Gardens')",
+      "required": false,
+      "secret": false,
+      "replaceable": true,
+      "stored_in": "tenant_tool_config",
+      "validation_type": "text",
+      "default_value": "",
+      "scope": "tenant"
+    }
+  ]
+}

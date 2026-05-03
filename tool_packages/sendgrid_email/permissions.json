@@ -1,0 +1,16 @@
+{
+  "permissions": [
+    {
+      "permission_code": "email.send",
+      "description": "Send emails to contacts on behalf of the tenant",
+      "scope": "tenant",
+      "sort_order": 1
+    },
+    {
+      "permission_code": "email.read_logs",
+      "description": "View email send history and delivery status",
+      "scope": "tenant",
+      "sort_order": 2
+    }
+  ]
+}

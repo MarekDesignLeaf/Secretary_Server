@@ -1,0 +1,20 @@
+{
+  "permissions": [
+    {
+      "permission_code": "nature.identify",
+      "display_name": "Nature Identification",
+      "description": "Identify plants and mushrooms from photos using AI",
+      "category": "tools",
+      "risk_level": "low",
+      "default_for_roles": ["admin", "user"]
+    },
+    {
+      "permission_code": "nature.diagnose",
+      "display_name": "Plant Health Diagnosis",
+      "description": "Diagnose plant diseases and health issues from photos",
+      "category": "tools",
+      "risk_level": "low",
+      "default_for_roles": ["admin", "user"]
+    }
+  ]
+}

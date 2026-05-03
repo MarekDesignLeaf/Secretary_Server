@@ -1,0 +1,8 @@
+{
+  "pricing_model": "freemium",
+  "price_monthly": null,
+  "price_yearly": null,
+  "currency": "USD",
+  "trial_days": null,
+  "notes": "SendGrid free tier: 100 emails/day. Paid plans start at $19.95/month for 50,000 emails. Billing is handled directly by SendGrid — this tool has no additional cost."
+}

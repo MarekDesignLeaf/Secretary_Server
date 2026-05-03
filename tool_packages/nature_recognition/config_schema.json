@@ -1,0 +1,39 @@
+{
+  "slots": [
+    {
+      "slot_name": "openai_api_key",
+      "display_name": "OpenAI API Key",
+      "description": "API key for GPT-4o vision model. Requires gpt-4o access. Get yours at platform.openai.com/api-keys.",
+      "required": true,
+      "secret": true,
+      "replaceable": true,
+      "stored_in": "tenant_tool_secret",
+      "validation_type": "text",
+      "scope": "tenant"
+    },
+    {
+      "slot_name": "model",
+      "display_name": "Vision Model",
+      "description": "OpenAI vision model to use. Default: gpt-4o",
+      "required": false,
+      "secret": false,
+      "replaceable": true,
+      "stored_in": "tenant_tool_config",
+      "validation_type": "text",
+      "default_value": "gpt-4o",
+      "scope": "tenant"
+    },
+    {
+      "slot_name": "max_image_tokens",
+      "display_name": "Max Image Tokens",
+      "description": "Maximum tokens to use per image analysis request. Default: 800",
+      "required": false,
+      "secret": false,
+      "replaceable": true,
+      "stored_in": "tenant_tool_config",
+      "validation_type": "integer",
+      "default_value": "800",
+      "scope": "tenant"
+    }
+  ]
+}

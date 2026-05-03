@@ -1,0 +1,22 @@
+{
+  "tests": [
+    {
+      "test_name": "sendgrid_auth_check",
+      "test_type": "http_get",
+      "test_config_json": {
+        "method": "GET",
+        "endpoint": "https://api.sendgrid.com/v3/user/profile",
+        "headers": {
+          "Authorization": "Bearer {api_key}",
+          "Content-Type": "application/json"
+        },
+        "expected_status": 200,
+        "success_json_path": "username",
+        "timeout_ms": 10000
+      },
+      "required_slots_json": ["api_key"],
+      "failure_message": "SendGrid authentication failed. Check that your API key is valid and has 'Mail Send' or read permissions.",
+      "sort_order": 1
+    }
+  ]
+}

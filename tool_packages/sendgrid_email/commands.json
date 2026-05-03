@@ -1,0 +1,28 @@
+{
+  "commands": [
+    {
+      "command_id": "send_email",
+      "display_name": "Send Email",
+      "description": "Send an email to a contact or list of recipients",
+      "permission_required": "email.send",
+      "input_schema": {
+        "to_email": {"type": "string", "format": "email", "required": true},
+        "subject":  {"type": "string", "required": true},
+        "body_text": {"type": "string", "required": false},
+        "body_html": {"type": "string", "required": false},
+        "template_id": {"type": "string", "required": false}
+      },
+      "voice_triggerable": true
+    },
+    {
+      "command_id": "get_send_status",
+      "display_name": "Get Email Send Status",
+      "description": "Check delivery status of a previously sent email",
+      "permission_required": "email.read_logs",
+      "input_schema": {
+        "message_id": {"type": "string", "required": true}
+      },
+      "voice_triggerable": false
+    }
+  ]
+}

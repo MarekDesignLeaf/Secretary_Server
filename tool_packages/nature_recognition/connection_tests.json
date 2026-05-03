@@ -1,0 +1,23 @@
+{
+  "tests": [
+    {
+      "test_id": "openai_api_key_valid",
+      "display_name": "OpenAI API Key Validation",
+      "description": "Verify the OpenAI API key is valid and has access to the configured vision model",
+      "method": "POST",
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "headers": {
+        "Authorization": "Bearer {openai_api_key}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "model": "{model|gpt-4o}",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 5
+      },
+      "expect_status": [200],
+      "timeout_seconds": 15,
+      "required": true
+    }
+  ]
+}

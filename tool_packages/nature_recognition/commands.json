@@ -1,0 +1,43 @@
+{
+  "commands": [
+    {
+      "command_id": "identify_plant",
+      "display_name": "Identify Plant",
+      "description": "Identify a plant species from a photo using AI vision",
+      "permission_required": "nature.identify",
+      "input_schema": {
+        "image_base64": {"type": "string", "required": true, "description": "Base64-encoded JPEG/PNG photo"},
+        "language": {"type": "string", "required": false, "default": "en", "description": "Response language code (en/cs/pl)"},
+        "tenant_id": {"type": "integer", "required": true}
+      },
+      "api_endpoint": "POST /nature/identify-plant",
+      "voice_triggerable": true
+    },
+    {
+      "command_id": "diagnose_plant",
+      "display_name": "Diagnose Plant Health",
+      "description": "Diagnose plant diseases, pests and deficiencies from a photo",
+      "permission_required": "nature.diagnose",
+      "input_schema": {
+        "image_base64": {"type": "string", "required": true},
+        "language": {"type": "string", "required": false, "default": "en"},
+        "tenant_id": {"type": "integer", "required": true}
+      },
+      "api_endpoint": "POST /nature/diagnose-plant",
+      "voice_triggerable": true
+    },
+    {
+      "command_id": "identify_mushroom",
+      "display_name": "Identify Mushroom",
+      "description": "Identify mushroom species and edibility from a photo",
+      "permission_required": "nature.identify",
+      "input_schema": {
+        "image_base64": {"type": "string", "required": true},
+        "language": {"type": "string", "required": false, "default": "en"},
+        "tenant_id": {"type": "integer", "required": true}
+      },
+      "api_endpoint": "POST /nature/identify-mushroom",
+      "voice_triggerable": true
+    }
+  ]
+}

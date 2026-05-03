@@ -1,0 +1,13 @@
+{
+  "pricing_model": "pay_per_use",
+  "currency": "USD",
+  "notes": "Uses OpenAI API (your key). Typical cost: $0.003–$0.010 per image analysis with gpt-4o.",
+  "tiers": [
+    {
+      "tier_name": "Standard",
+      "requests_per_month": "unlimited",
+      "cost_per_request": "~$0.005",
+      "notes": "Billed directly by OpenAI to your API account"
+    }
+  ]
+}

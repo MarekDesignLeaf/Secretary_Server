@@ -1,0 +1,80 @@
+{
+  "tool_id": "sendgrid_email",
+  "tool_name": "SendGrid Email",
+  "description": "Send transactional and marketing emails via SendGrid. Supports single sends, templates, and bulk campaigns.",
+  "version": "1.0.0",
+  "author": "DesignLeaf CRM",
+  "risk_level": "medium",
+  "entry_point": "install.py",
+  "install_script": "install.py",
+  "uninstall_script": "uninstall.py",
+  "license_type": "proprietary",
+  "supported_platforms": ["all"],
+  "required_permissions": [
+    {
+      "permission_code": "email.send",
+      "description": "Send emails to contacts",
+      "scope": "tenant"
+    },
+    {
+      "permission_code": "email.read_logs",
+      "description": "View email send history and delivery status",
+      "scope": "tenant"
+    }
+  ],
+  "required_config_slots": [
+    {
+      "slot_name": "from_email",
+      "display_name": "From Email Address",
+      "description": "Verified sender email address registered in SendGrid",
+      "required": true,
+      "secret": false,
+      "replaceable": true,
+      "stored_in": "tenant_tool_config",
+      "validation_type": "email",
+      "source_has_existing_value": false,
+      "export_secret_allowed": false
+    },
+    {
+      "slot_name": "from_name",
+      "display_name": "From Display Name",
+      "description": "Name shown as email sender (e.g. 'DesignLeaf Gardens')",
+      "required": false,
+      "secret": false,
+      "replaceable": true,
+      "stored_in": "tenant_tool_config",
+      "validation_type": "text",
+      "source_has_existing_value": false,
+      "export_secret_allowed": false
+    }
+  ],
+  "required_secret_slots": [
+    {
+      "slot_name": "api_key",
+      "display_name": "SendGrid API Key",
+      "description": "API key from SendGrid Settings > API Keys. Must have 'Mail Send' permission.",
+      "required": true,
+      "secret": true,
+      "replaceable": true,
+      "stored_in": "tenant_tool_secret",
+      "validation_type": "text",
+      "source_has_existing_value": false,
+      "export_secret_allowed": false
+    }
+  ],
+  "voice_commands": [
+    {
+      "command_phrase": "send email to",
+      "command_type": "trigger",
+      "language_code": "en-GB",
+      "description": "Initiate email compose flow by voice"
+    },
+    {
+      "command_phrase": "poslat email",
+      "command_type": "trigger",
+      "language_code": "cs",
+      "description": "Initiate email compose flow by voice (Czech)"
+    }
+  ],
+  "db_requirements": []
+}

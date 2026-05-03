@@ -26,8 +26,20 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from contextlib import contextmanager, asynccontextmanager
+from action_executor import (
+    execute_action, register_handler, ActionResult,
+    get_registered_actions, _t as _at,
+)
+from ai_control_bridge import (
+    resolve_voice_command, update_voice_context,
+    get_screen_controls, generate_synonyms_for_control,
+    approve_synonym, reject_synonym,
+    generate_embeddings_for_control,
+    learn_contact_alias,
+    _find_contacts_by_alias,
+)
 
-app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
+app = FastAPI(title="Secretary CRM")
 
 # === JWT CONFIG ===
 JWT_SECRET = os.getenv("JWT_SECRET")
@@ -768,7 +780,7 @@ def env_first(*names: str, default: str = "") -> str:
 WA_PHONE_ID = env_first("WHATSAPP_PHONE_NUMBER_ID", "WA_PHONE_ID", "META_WHATSAPP_PHONE_NUMBER_ID")
 WA_ACCOUNT_ID = env_first("WHATSAPP_BUSINESS_ACCOUNT_ID", "WA_ACCOUNT_ID", "META_WHATSAPP_BUSINESS_ACCOUNT_ID")
 WA_TOKEN = env_first("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOKEN")
-WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="designleaf_webhook_2026")
+WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="secretary_webhook_2026")
 TWILIO_ACCOUNT_SID = env_first("TWILIO_ACCOUNT_SID", "TWILIO_SID")
 TWILIO_AUTH_TOKEN = env_first("TWILIO_AUTH_TOKEN", "TWILIO_TOKEN")
 TWILIO_WHATSAPP_FROM = env_first("TWILIO_WHATSAPP_FROM", "TWILIO_WHATSAPP_NUMBER", "TWILIO_WHATSAPP_SENDER")
@@ -840,61 +852,265 @@ def get_nature_service_status() -> dict:
         "mushroom_api_url": MUSHROOM_ID_API_URL,
     }
 
-def normalize_language_code(language: Optional[str], default: str = "en") -> str:
+DEFAULT_CUSTOMER_LANG = "en-GB"
+DEFAULT_ASSISTANT_LANG = "en-GB"
+DEFAULT_ASSISTANT_TONE = "professional"
+DEFAULT_ASSISTANT_STYLE = "concise"
+
+
+def normalize_language_code(language: Optional[str], default: str = "en-GB") -> str:
     raw = (language or "").strip().lower()
     if not raw:
         return default
     aliases = {
-        "en": "en",
-        "en-gb": "en",
-        "en-us": "en",
-        "english": "en",
-        "anglictina": "en",
-        "angličtina": "en",
-        "cs": "cs",
-        "cs-cz": "cs",
-        "czech": "cs",
-        "cestina": "cs",
-        "čeština": "cs",
-        "pl": "pl",
-        "pl-pl": "pl",
-        "polish": "pl",
-        "polski": "pl",
-        "de": "de",
-        "de-de": "de",
-        "german": "de",
-        "deutsch": "de",
-        "fr": "fr",
-        "fr-fr": "fr",
-        "french": "fr",
-        "francais": "fr",
-        "français": "fr",
-        "es": "es",
-        "es-es": "es",
-        "spanish": "es",
-        "espanol": "es",
-        "español": "es",
-        "sk": "sk",
-        "sk-sk": "sk",
-        "slovak": "sk",
-        "slovencina": "sk",
-        "slovenčina": "sk",
-        "ro": "ro",
-        "ro-ro": "ro",
-        "romanian": "ro",
+        "en": "en-GB",
+        "en-gb": "en-GB",
+        "en-uk": "en-GB",
+        "en-us": "en-GB",
+        "english": "en-GB",
+        "anglictina": "en-GB",
+        "angličtina": "en-GB",
+        "cs": "cs-CZ",
+        "cs-cz": "cs-CZ",
+        "czech": "cs-CZ",
+        "cestina": "cs-CZ",
+        "čeština": "cs-CZ",
+        "pl": "pl-PL",
+        "pl-pl": "pl-PL",
+        "polish": "pl-PL",
+        "polski": "pl-PL",
+        "de": "de-DE",
+        "de-de": "de-DE",
+        "german": "de-DE",
+        "deutsch": "de-DE",
+        "fr": "fr-FR",
+        "fr-fr": "fr-FR",
+        "french": "fr-FR",
+        "francais": "fr-FR",
+        "français": "fr-FR",
+        "es": "es-ES",
+        "es-es": "es-ES",
+        "spanish": "es-ES",
+        "espanol": "es-ES",
+        "español": "es-ES",
+        "sk": "sk-SK",
+        "sk-sk": "sk-SK",
+        "slovak": "sk-SK",
+        "slovencina": "sk-SK",
+        "slovenčina": "sk-SK",
+        "ro": "ro-RO",
+        "ro-ro": "ro-RO",
+        "romanian": "ro-RO",
     }
     if raw in aliases:
         return aliases[raw]
     raw_prefix = raw.split("-")[0]
     if raw_prefix in aliases:
         return aliases[raw_prefix]
-    if raw_prefix in {"en", "cs", "pl", "de", "fr", "es", "sk", "ro"}:
-        return raw_prefix
     return default
+
+
+def normalize_language_short(language: Optional[str], default: str = "en") -> str:
+    return normalize_language_code(language, default).split("-")[0]
+
+
+def get_customer_output_language(customer_id: Optional[int], tenant_id: int) -> str:
+    if not customer_id:
+        return DEFAULT_CUSTOMER_LANG
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT preferred_language_code
+                FROM clients
+                WHERE id=%s
+                """,
+                (customer_id,),
+            )
+            row = cur.fetchone()
+            if row and row.get("preferred_language_code"):
+                return normalize_language_code(row["preferred_language_code"], DEFAULT_CUSTOMER_LANG)
+    except Exception as e:
+        print(f"get_customer_output_language error: {e}")
+    finally:
+        release_conn(conn)
+    return DEFAULT_CUSTOMER_LANG
+
+
+def set_customer_preferred_language(customer_id: int, language_code: str, source: str = "default", confidence: float = 1.0):
+    lang = normalize_language_code(language_code, DEFAULT_CUSTOMER_LANG)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE clients
+                SET preferred_language_code = %s,
+                    preferred_language_name = %s,
+                    language_source = %s,
+                    language_confidence = %s,
+                    language_updated_at = now()
+                WHERE id = %s
+                """,
+                (lang, lang, source, confidence, customer_id),
+            )
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"set_customer_preferred_language error: {e}")
+    finally:
+        release_conn(conn)
+
+
+def get_assistant_internal_language(user_id: Optional[int], tenant_id: int) -> Dict[str, str]:
+    lang = DEFAULT_ASSISTANT_LANG
+    tone = DEFAULT_ASSISTANT_TONE
+    style = DEFAULT_ASSISTANT_STYLE
+    locked = True
+    if not user_id:
+        return {"lang": lang, "tone": tone, "style": style, "locked": locked}
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT assistant_output_language_code, assistant_output_language_name,
+                       assistant_language_locked, assistant_tone, assistant_style
+                FROM users
+                WHERE id=%s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                lang = normalize_language_code(row.get("assistant_output_language_code") or lang, lang)
+                tone = (row.get("assistant_tone") or tone).strip().lower()
+                style = (row.get("assistant_style") or style).strip().lower()
+                locked = bool(row.get("assistant_language_locked") if row.get("assistant_language_locked") is not None else locked)
+    except Exception as e:
+        print(f"get_assistant_internal_language error: {e}")
+    finally:
+        release_conn(conn)
+    return {"lang": lang, "tone": tone, "style": style, "locked": locked}
 
 def tr_lang(lang: str, en: str, cs: str, pl: str) -> str:
     code = normalize_language_code(lang, default="en")
     return cs if code == "cs" else pl if code == "pl" else en
+
+
+# ========== OUTPUT LANGUAGE VALIDATION ==========
+
+# Unique character signatures per language
+_LANG_CHAR_SCORES: list = [
+    # (lang_short, [(char, weight), ...])
+    ("cs", [("ě", 6), ("ř", 6), ("ů", 6), ("š", 3), ("č", 3), ("ž", 3), ("ý", 2), ("í", 1), ("á", 1), ("é", 1)]),
+    ("pl", [("ą", 6), ("ę", 6), ("ł", 6), ("ń", 5), ("ź", 5), ("ż", 5), ("ś", 4), ("ć", 4), ("ó", 2)]),
+    ("de", [("ß", 8), ("ä", 4), ("ö", 4), ("ü", 4)]),
+    ("fr", [("ç", 6), ("œ", 6), ("æ", 5), ("à", 3), ("â", 3), ("ê", 3), ("î", 3), ("ô", 3), ("û", 3), ("è", 2)]),
+    ("es", [("ñ", 8), ("¿", 6), ("¡", 6)]),
+    ("sk", [("ľ", 8), ("ĺ", 8), ("ŕ", 8), ("ď", 4), ("ť", 4)]),
+]
+
+# Common stopwords as tiebreakers for short Latin-only text
+_LANG_STOPWORDS: dict = {
+    "en": {"the", "and", "for", "are", "this", "that", "with", "have", "will", "been", "not", "your", "you", "our"},
+    "cs": {"pro", "není", "nebo", "jako", "jsou", "máte", "byl", "ale", "při", "tak", "jak", "kdy"},
+    "pl": {"jest", "nie", "jak", "ale", "który", "przez", "przy", "oraz", "jego", "tak"},
+    "de": {"ist", "die", "der", "das", "und", "ein", "eine", "nicht", "sind", "mit", "von", "für"},
+    "fr": {"est", "les", "des", "pour", "que", "dans", "une", "avec", "pas", "sur", "qui", "mais"},
+    "es": {"los", "las", "del", "para", "que", "con", "una", "por", "pero", "como", "más", "este"},
+}
+
+
+def detect_reply_language_short(text: str, default: str = "en") -> str:
+    """Lightweight heuristic language detection for en/cs/pl/de/fr/es/sk.
+
+    Uses langdetect if the library is installed; otherwise falls back to
+    Unicode character frequency scoring + stopword counting.
+    Returns an ISO 639-1 short code ('en', 'cs', 'pl', …).
+    """
+    if not text or len(text.strip()) < 8:
+        return default
+
+    # --- optional fast path: langdetect library ---
+    try:
+        from langdetect import detect as _ld_detect  # type: ignore
+        raw = _ld_detect(text)
+        canonical = {"en": "en", "cs": "cs", "pl": "pl", "de": "de", "fr": "fr", "es": "es", "sk": "sk", "ro": "ro"}
+        return canonical.get(raw, raw[:2] if raw else default)
+    except Exception:
+        pass
+
+    # --- heuristic fallback ---
+    t = text.lower()
+    scores: dict[str, float] = {}
+
+    # 1. Unique character scoring
+    for lang, chars in _LANG_CHAR_SCORES:
+        score = sum(t.count(ch) * w for ch, w in chars)
+        if score > 0:
+            scores[lang] = scores.get(lang, 0.0) + score
+
+    # 2. If a clear winner already emerged from character scoring, return it
+    if scores:
+        best = max(scores, key=scores.__getitem__)
+        if scores[best] >= 3:
+            return best
+
+    # 3. Stopword tiebreaker (for Latin-only text like English)
+    words = set(re.findall(r"[a-záéíóúàâäèêëîïôùûüýÿœæçñ]+", t))
+    sw_hits: dict[str, int] = {
+        lang: len(words & stops)
+        for lang, stops in _LANG_STOPWORDS.items()
+    }
+    best_sw = max(sw_hits, key=sw_hits.__getitem__)
+    if sw_hits[best_sw] > 0:
+        return best_sw
+
+    return default
+
+
+def log_language_mismatch(
+    tenant_id: int,
+    user_id: Optional[int],
+    customer_id: Optional[int],
+    expected_lang_short: str,
+    detected_lang_short: str,
+    reply_excerpt: str,
+    source: str = "process",
+) -> None:
+    """Persist a language mismatch event to activity_timeline. Non-blocking — errors are swallowed."""
+    try:
+        conn = get_db_conn()
+        try:
+            log_activity(
+                conn,
+                entity_type="language_validation",
+                entity_id=customer_id or 0,
+                action="language_mismatch",
+                description=(
+                    f"Reply language '{detected_lang_short}' does not match "
+                    f"expected '{expected_lang_short}' (source={source})"
+                ),
+                tenant_id=tenant_id,
+                user_id=user_id,
+                source_channel=source,
+                details={
+                    "expected_language": expected_lang_short,
+                    "detected_language": detected_lang_short,
+                    "customer_id": customer_id,
+                    "reply_excerpt": (reply_excerpt or "")[:150],
+                },
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            release_conn(conn)
+    except Exception as e:
+        print(f"log_language_mismatch failed: {e}")
+
 
 def plant_guidance_labels(language: str) -> dict:
     code = normalize_language_code(language, default="en")
@@ -907,7 +1123,7 @@ def plant_guidance_labels(language: str) -> dict:
             "needs": "Nároky",
             "best_place": "Vhodné místo",
             "note": "Poznámka",
-            "instruction": "Piš česky. Buď stručný a praktický pro zahradníka.",
+            "instruction": "Piš česky. Buď stručný a praktický.",
         }
     if code == "pl":
         return {
@@ -940,7 +1156,7 @@ def plant_health_labels(language: str) -> dict:
             "treatment": "Léčba",
             "prevention": "Prevence",
             "healthy": "Rostlina podle fotek působí spíš zdravě.",
-            "instruction": "Piš česky. Buď stručný a praktický pro zahradníka. Zaměř se na diagnózu, léčbu a prevenci.",
+            "instruction": "Piš česky. Buď stručný a praktický. Zaměř se na diagnózu, léčbu a prevenci.",
         }
     if code == "pl":
         return {
@@ -1839,6 +2055,285 @@ def release_conn(conn):
         try: conn.close()
         except: pass
 
+def _get_tenant_settings(conn, tenant_id: int) -> dict:
+    """Return tenant_settings row as dict. Falls back to empty dict on error."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT company_name, contact_name, phone, default_location,
+                          industry_description, currency, app_version, logo_url,
+                          whatsapp_footer, invoice_footer
+                   FROM crm.tenant_settings WHERE tenant_id = %s LIMIT 1""",
+                (tenant_id,)
+            )
+            row = cur.fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ACTION HANDLERS — registered with action_executor
+# These are the canonical implementations. Both voice and manual UI must
+# call execute_action(action_code, ...) instead of inline SQL.
+#
+# Pattern: @register_handler("module.verb")
+#          def handle_xxx(args, conn, tenant_id, user_id, lang, **kw):
+#              ...
+#              return ActionResult(ok=True, reply="...", action_type="REFRESH")
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── task.create ──────────────────────────────────────────────────────────────
+@register_handler("task.create")
+def handle_task_create(args, conn, tenant_id, user_id, lang, **kw):
+    title       = (args.get("title") or "").strip()
+    client_name = args.get("client_name") or args.get("client") or ""
+    due_date    = args.get("due_date")
+    assigned_to = args.get("assigned_to")
+    priority    = args.get("priority", "normal")
+    notes       = args.get("notes") or args.get("description") or ""
+    if not title:
+        return ActionResult(ok=False,
+            reply=_at("Task title is required.", "Název úkolu je povinný.", "Tytuł zadania jest wymagany.", lang),
+            error="missing_title")
+    try:
+        with conn.cursor() as cur:
+            client_id = None
+            if client_name:
+                cur.execute("""SELECT id FROM clients WHERE tenant_id=%s AND display_name ILIKE %s
+                               AND deleted_at IS NULL LIMIT 1""", (tenant_id, f"%{client_name}%"))
+                r = cur.fetchone()
+                if r: client_id = r["id"]
+            cur.execute("""INSERT INTO tasks (tenant_id,title,client_id,due_date,priority,notes,
+                               status,created_by,assigned_to,is_completed)
+                           VALUES (%s,%s,%s,%s,%s,%s,'nova',%s,%s,FALSE) RETURNING id""",
+                (tenant_id, title, client_id, due_date, priority, notes, user_id, assigned_to))
+            row = cur.fetchone()
+            task_id = row["id"]
+            log_activity(conn, "task", task_id, "create", f"Vytvoren ukol: {title}",
+                         tenant_id=tenant_id, user_id=user_id)
+        conn.commit()
+        reply = _at(f"Task '{title}' created.", f"Úkol '{title}' vytvořen.", f"Zadanie '{title}' utworzone.", lang)
+        return ActionResult(ok=True, reply=reply, action_type="REFRESH", action_data={"task_id": task_id})
+    except Exception as e:
+        conn.rollback()
+        return ActionResult(ok=False, reply=str(e), error=str(e))
+
+
+# ── task.complete ─────────────────────────────────────────────────────────────
+@register_handler("task.complete")
+def handle_task_complete(args, conn, tenant_id, user_id, lang, **kw):
+    title_q = (args.get("title") or "").strip()
+    result  = args.get("result") or _at("Completed", "Dokončeno", "Ukończono", lang)
+    if not title_q:
+        return ActionResult(ok=False,
+            reply=_at("Specify which task.", "Uveď který úkol.", "Podaj które zadanie.", lang),
+            error="missing_title")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,title FROM tasks
+                            WHERE tenant_id=%s AND title ILIKE %s
+                              AND is_completed=FALSE
+                            ORDER BY created_at DESC LIMIT 1""",
+                (tenant_id, f"%{title_q}%"))
+            row = cur.fetchone()
+            if not row:
+                return ActionResult(ok=False,
+                    reply=_at(f"Task '{title_q}' not found.", f"Úkol '{title_q}' nenalezen.", f"Zadanie '{title_q}' nie znalezione.", lang),
+                    error="not_found")
+            cur.execute("""UPDATE tasks SET status='hotovo',is_completed=TRUE,
+                                result=%s,updated_at=now()
+                            WHERE id=%s""", (result, row["id"]))
+            log_activity(conn, "task", row["id"], "complete",
+                         f"Ukol '{row['title']}' dokoncen: {result}",
+                         tenant_id=tenant_id, user_id=user_id)
+        conn.commit()
+        reply = _at(f"Task '{row['title']}' completed.",
+                    f"Úkol '{row['title']}' dokončen.",
+                    f"Zadanie '{row['title']}' ukończone.", lang)
+        return ActionResult(ok=True, reply=reply, action_type="REFRESH",
+                            action_data={"task_id": row["id"]})
+    except Exception as e:
+        conn.rollback()
+        return ActionResult(ok=False, reply=str(e), error=str(e))
+
+
+# ── task.list ─────────────────────────────────────────────────────────────────
+@register_handler("task.list")
+def handle_task_list(args, conn, tenant_id, user_id, lang, **kw):
+    status      = args.get("status")
+    client_name = args.get("client_name") or args.get("client")
+    only_active = args.get("only_active", False)
+    try:
+        with conn.cursor() as cur:
+            q = """SELECT t.id, t.title, t.status, t.priority, t.due_date,
+                          c.display_name as client_name
+                     FROM tasks t
+                     LEFT JOIN clients c ON c.id = t.client_id AND c.deleted_at IS NULL
+                    WHERE t.tenant_id=%s AND t.is_completed=FALSE"""
+            params = [tenant_id]
+            if status:
+                q += " AND t.status=%s"; params.append(status)
+            if client_name:
+                q += " AND c.display_name ILIKE %s"; params.append(f"%{client_name}%")
+            if only_active:
+                q += " AND t.status NOT IN ('hotovo','zruseno')"
+            q += " ORDER BY t.due_date NULLS LAST, t.created_at DESC LIMIT 20"
+            cur.execute(q, params)
+            tasks = [dict(r) for r in cur.fetchall()]
+        for t in tasks:
+            if t.get("due_date"):
+                t["due_date"] = str(t["due_date"])
+        if not tasks:
+            reply = _at("No tasks found.", "Žádné úkoly nenalezeny.", "Nie znaleziono zadań.", lang)
+        else:
+            lines = [_at("Your tasks:", "Tvoje úkoly:", "Twoje zadania:", lang)]
+            for t in tasks[:5]:
+                dd = f" ({t['due_date']})" if t.get("due_date") else ""
+                cl = f" — {t['client_name']}" if t.get("client_name") else ""
+                lines.append(f"- {t['title']}{cl}{dd}")
+            if len(tasks) > 5:
+                lines.append(f"... +{len(tasks)-5} more")
+            reply = "\n".join(lines)
+        return ActionResult(ok=True, reply=reply, action_type="SHOW_TASKS",
+                            action_data={"tasks": tasks, "count": len(tasks)})
+    except Exception as e:
+        return ActionResult(ok=False, reply=str(e), error=str(e))
+
+
+# ── contact.create ────────────────────────────────────────────────────────────
+@register_handler("contact.create")
+def handle_contact_create(args, conn, tenant_id, user_id, lang, **kw):
+    name  = (args.get("name") or "").strip()
+    email = args.get("email") or ""
+    phone = args.get("phone") or ""
+    if not name:
+        return ActionResult(ok=False,
+            reply=_at("Contact name is required.", "Jméno kontaktu je povinné.", "Imię kontaktu jest wymagane.", lang),
+            error="missing_name")
+    try:
+        with conn.cursor() as cur:
+            owner_row = get_active_user_row(conn, tenant_id, user_id) or get_default_hierarchy_user(conn, tenant_id)
+            if not owner_row:
+                return ActionResult(ok=False, reply=_at("No active owner available.", "Není dostupný vlastník.", "Brak dostępnego właściciela.", lang), error="no_owner")
+            code = f"CL-{uuid.uuid4().hex[:6].upper()}"
+            display = clean_contact_display_name(name)
+            cur.execute("""INSERT INTO clients
+                               (client_code,client_type,display_name,email_primary,phone_primary,
+                                status,tenant_id,owner_user_id,hierarchy_status)
+                           VALUES (%s,'domestic',%s,%s,%s,'active',%s,%s,'pending')
+                           RETURNING id,display_name""",
+                (code, display, email or None, phone or None, tenant_id, int(owner_row["id"])))
+            row = cur.fetchone()
+            log_activity(conn, "client", row["id"], "create", f"Klient {display} vytvoren",
+                         tenant_id=tenant_id, user_id=user_id)
+        conn.commit()
+        reply = _at(f"Contact '{display}' created.", f"Kontakt '{display}' vytvořen.", f"Kontakt '{display}' utworzony.", lang)
+        return ActionResult(ok=True, reply=reply, action_type="REFRESH",
+                            action_data={"client_id": row["id"], "display_name": row["display_name"]})
+    except Exception as e:
+        conn.rollback()
+        return ActionResult(ok=False, reply=str(e), error=str(e))
+
+
+# ── contact.search ────────────────────────────────────────────────────────────
+@register_handler("contact.search")
+def handle_contact_search(args, conn, tenant_id, user_id, lang, **kw):
+    query = (args.get("query") or args.get("name") or "").strip()
+    if not query:
+        return ActionResult(ok=False,
+            reply=_at("Search term required.", "Zadej hledaný výraz.", "Podaj szukaną frazę.", lang),
+            error="missing_query")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,display_name,email_primary,phone_primary,status
+                             FROM clients
+                            WHERE tenant_id=%s AND deleted_at IS NULL
+                              AND (display_name ILIKE %s OR email_primary ILIKE %s OR phone_primary ILIKE %s)
+                            ORDER BY display_name LIMIT 10""",
+                (tenant_id, f"%{query}%", f"%{query}%", f"%{query}%"))
+            results = [dict(r) for r in cur.fetchall()]
+        if not results:
+            reply = _at(f"No contacts found for '{query}'.", f"Kontakt '{query}' nenalezen.", f"Nie znaleziono kontaktu '{query}'.", lang)
+        else:
+            lines = [_at(f"Found {len(results)} contact(s):", f"Nalezeno {len(results)} kontakt(ů):", f"Znaleziono {len(results)} kontakt(ów):", lang)]
+            for c in results[:5]:
+                ph = f" {c['phone_primary']}" if c.get("phone_primary") else ""
+                lines.append(f"- {c['display_name']}{ph}")
+            reply = "\n".join(lines)
+        return ActionResult(ok=True, reply=reply, action_type="SHOW_CONTACTS",
+                            action_data={"contacts": results, "count": len(results)})
+    except Exception as e:
+        return ActionResult(ok=False, reply=str(e), error=str(e))
+
+
+# ── note.add ──────────────────────────────────────────────────────────────────
+@register_handler("note.add")
+def handle_note_add(args, conn, tenant_id, user_id, lang, **kw):
+    entity_type = args.get("entity_type", "client")
+    entity_name = args.get("entity_name") or args.get("client_name") or ""
+    content_txt = (args.get("content") or args.get("note") or "").strip()
+    if not content_txt:
+        return ActionResult(ok=False,
+            reply=_at("Note content is required.", "Obsah poznámky je povinný.", "Treść notatki jest wymagana.", lang),
+            error="missing_content")
+    try:
+        with conn.cursor() as cur:
+            entity_id = None
+            if entity_name:
+                table = "clients" if entity_type == "client" else "jobs"
+                cur.execute(f"""SELECT id FROM {table} WHERE tenant_id=%s AND display_name ILIKE %s
+                               AND deleted_at IS NULL LIMIT 1""",
+                    (tenant_id, f"%{entity_name}%"))
+                r = cur.fetchone()
+                if r: entity_id = r["id"]
+            cur.execute("""INSERT INTO notes (tenant_id,entity_type,entity_id,content,created_by)
+                           VALUES (%s,%s,%s,%s,%s) RETURNING id""",
+                (tenant_id, entity_type, entity_id, content_txt, user_id))
+            note_id = cur.fetchone()["id"]
+            log_activity(conn, entity_type, entity_id or 0, "add_note",
+                         content_txt[:100], tenant_id=tenant_id, user_id=user_id)
+        conn.commit()
+        reply = _at("Note saved.", "Poznámka uložena.", "Notatka zapisana.", lang)
+        return ActionResult(ok=True, reply=reply, action_type="REFRESH",
+                            action_data={"note_id": note_id})
+    except Exception as e:
+        conn.rollback()
+        return ActionResult(ok=False, reply=str(e), error=str(e))
+
+
+# ── lead.create ───────────────────────────────────────────────────────────────
+@register_handler("lead.create")
+def handle_lead_create(args, conn, tenant_id, user_id, lang, **kw):
+    name    = (args.get("name") or args.get("contact_name") or "").strip()
+    source  = args.get("source", "voice")
+    notes   = args.get("notes") or ""
+    phone   = args.get("phone") or ""
+    email   = args.get("email") or ""
+    if not name:
+        return ActionResult(ok=False,
+            reply=_at("Lead name required.", "Jméno leadu je povinné.", "Imię leada jest wymagane.", lang),
+            error="missing_name")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO leads (tenant_id,display_name,phone_primary,email_primary,
+                               source,status,notes,created_by)
+                           VALUES (%s,%s,%s,%s,%s,'new',%s,%s) RETURNING id""",
+                (tenant_id, name, phone or None, email or None, source, notes or None, user_id))
+            lead_id = cur.fetchone()["id"]
+            log_activity(conn, "lead", lead_id, "create", f"Lead {name} vytvoren",
+                         tenant_id=tenant_id, user_id=user_id)
+        conn.commit()
+        reply = _at(f"Lead '{name}' created.", f"Lead '{name}' vytvořen.", f"Lead '{name}' utworzony.", lang)
+        return ActionResult(ok=True, reply=reply, action_type="REFRESH",
+                            action_data={"lead_id": lead_id})
+    except Exception as e:
+        conn.rollback()
+        return ActionResult(ok=False, reply=str(e), error=str(e))
+
+
 @contextmanager
 def db_conn():
     """Context manager that auto-releases connection back to pool."""
@@ -2127,29 +2622,28 @@ def get_tenant_config(conn, tenant_id):
     return config
 
 def resolve_response_language(config, request_lang=None):
-    """Determine which language the AI should respond in."""
+    """Determine which internal language the AI should work in (assistant side)."""
     if request_lang:
-        code = request_lang.split("-")[0].lower()
-        if code in ("cs","en","pl","de","fr","es","sk","ro"): return code
+        return normalize_language_code(request_lang, default=DEFAULT_ASSISTANT_LANG)
     if config.get("found"):
-        return config.get("default_internal_lang", "en")
-    return "en"
+        return normalize_language_code(config.get("default_internal_lang"), default=DEFAULT_ASSISTANT_LANG)
+    return DEFAULT_ASSISTANT_LANG
 
 def resolve_customer_language(config, request_lang=None):
-    """Determine default outgoing customer language."""
+    """Determine default outgoing customer language (fallback)."""
     if request_lang:
-        return normalize_language_code(request_lang, default="en")
+        return normalize_language_code(request_lang, default=DEFAULT_CUSTOMER_LANG)
     if config.get("found"):
-        return normalize_language_code(config.get("default_customer_lang", "en"), default="en")
-    return "en"
+        return normalize_language_code(config.get("default_customer_lang"), default=DEFAULT_CUSTOMER_LANG)
+    return DEFAULT_CUSTOMER_LANG
 
 def resolve_voice_language(config, request_lang=None):
     """Determine voice session language from config."""
-    if request_lang and request_lang != "en":
-        return request_lang.split("-")[0].lower()
+    if request_lang:
+        return normalize_language_code(request_lang, default=DEFAULT_ASSISTANT_LANG)
     if config.get("found"):
-        return config.get("default_internal_lang", "en")
-    return "en"
+        return normalize_language_code(config.get("default_internal_lang"), default=DEFAULT_ASSISTANT_LANG)
+    return DEFAULT_ASSISTANT_LANG
 
 def parse_planning_datetime(value: Any) -> Optional[datetime]:
     if value is None:
@@ -3428,8 +3922,14 @@ def normalize_whatsapp_phone(phone: Optional[str]) -> str:
     digits = normalize_phone(phone)
     if digits.startswith("00"):
         digits = digits[2:]
-    if digits.startswith("0") and len(digits) == 11:
-        digits = "44" + digits[1:]
+    if digits.startswith("0"):
+        if len(digits) == 11:
+            digits = "44" + digits[1:]
+        elif len(digits) == 10:
+            digits = "420" + digits[1:]
+    elif len(digits) == 9:
+        # Likely Czech local number
+        digits = "420" + digits
     return digits
 
 def normalize_contact_phone(phone: Optional[str]) -> str:
@@ -3632,26 +4132,31 @@ def extract_contact_address_fields(data: Dict[str, Any]) -> Dict[str, Optional[s
     }
 
 UK_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", re.IGNORECASE)
+CZ_POSTCODE_RE = re.compile(r"\b(\d{3}\s?\d{2})\b")
 ADDRESS_LABEL_RE = re.compile(
-    r"^\s*(?:address|addr|adresa|adres|billing address|client address|zakaznik|klient)\s*[:\-]\s*",
+    r"^\s*(?:address|addr|adresa|adres|billing address|client address|zakaznik|klient|bydliště|bydliste)\s*[:\-]\s*",
     re.IGNORECASE,
 )
 STREET_HINT_RE = re.compile(
     r"\b(street|st|road|rd|lane|ln|avenue|ave|drive|dr|close|cl|way|court|ct|"
     r"crescent|cres|place|pl|terrace|terr|gardens|gdns|green|grove|grv|park|"
-    r"hill|row|mews|yard|house|flat|apartment|apt|unit)\b",
+    r"hill|row|mews|yard|house|flat|apartment|apt|unit|ulice|ul\.|náměstí|nám\.|třída|tr\.|nábřeží|nábř\.|č\.p\.|č\.|popisné)\b",
     re.IGNORECASE,
 )
 PHONE_IN_TEXT_RE = re.compile(r"(?:phone|tel|telephone|whatsapp|wa|from|to)\s*:?\s*(\+?\d[\d\s().-]{6,}\d)", re.IGNORECASE)
 
 def normalize_postcode(value: Optional[str]) -> Optional[str]:
-    match = UK_POSTCODE_RE.search(value or "")
-    if not match:
-        return None
-    compact = re.sub(r"\s+", "", match.group(1).upper())
-    if len(compact) <= 3:
-        return compact
-    return f"{compact[:-3]} {compact[-3:]}"
+    if not value: return None
+    uk_match = UK_POSTCODE_RE.search(value)
+    if uk_match:
+        compact = re.sub(r"\s+", "", uk_match.group(1).upper())
+        if len(compact) <= 3: return compact
+        return f"{compact[:-3]} {compact[-3:]}"
+    cz_match = CZ_POSTCODE_RE.search(value)
+    if cz_match:
+        compact = re.sub(r"\s+", "", cz_match.group(1))
+        return f"{compact[:3]} {compact[3:]}"
+    return None
 
 def clean_address_fragment(value: Optional[str]) -> str:
     text = (value or "").replace("\r", "\n")
@@ -3665,13 +4170,13 @@ def clean_address_fragment(value: Optional[str]) -> str:
     return text.strip(" ,.;")
 
 def score_address_candidate(candidate: str) -> float:
-    if not UK_POSTCODE_RE.search(candidate):
+    if not UK_POSTCODE_RE.search(candidate) and not CZ_POSTCODE_RE.search(candidate):
         return 0.0
     cleaned = clean_address_fragment(candidate)
     if len(cleaned) < 10 or len(cleaned) > 240:
         return 0.0
     score = 0.45
-    if re.search(r"\b\d+[A-Z]?\b", cleaned, re.IGNORECASE):
+    if re.search(r"\b\d+[A-Z/]?\b", cleaned, re.IGNORECASE):
         score += 0.18
     if STREET_HINT_RE.search(cleaned):
         score += 0.2
@@ -3702,9 +4207,72 @@ def split_uk_address(raw_address: str, postcode: str) -> Dict[str, Optional[str]
         "country": "GB",
     }
 
-def extract_uk_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not text:
+def split_cz_address(raw_address: str, postcode: str) -> Dict[str, Optional[str]]:
+    cleaned = clean_address_fragment(raw_address)
+    cleaned = CZ_POSTCODE_RE.sub("", cleaned).strip(" ,.;")
+    # Czech address: Street 123, City
+    parts = [part.strip(" ,.;") for part in cleaned.split(",") if part.strip(" ,.;")]
+    city = None
+    line1 = cleaned or None
+    if len(parts) >= 2:
+        city = parts[-1]
+        line1 = ", ".join(parts[:-1]) or None
+    elif len(parts) == 1:
+        # Try to find city if it's near postcode but regex took it out
+        line1 = parts[0]
+    return {
+        "address": ", ".join(part for part in [line1, city, postcode, "CZ"] if part),
+        "address_line1": line1,
+        "city": city,
+        "postcode": postcode,
+        "country": "CZ",
+    }
+
+def extract_cz_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not text: return None
+    print(f"DEBUG ADDR: Scanning text for CZ address: {text[:100]}...")
+    raw_lines = [line.strip() for line in str(text).replace("\r", "\n").split("\n")]
+    lines = [line for line in raw_lines if line]
+    candidates: List[str] = []
+    for index, line in enumerate(lines):
+        if CZ_POSTCODE_RE.search(line):
+            candidates.append(line)
+            if index > 0: candidates.append(f"{lines[index - 1]}, {line}")
+            if index > 1: candidates.append(f"{lines[index - 2]}, {lines[index - 1]}, {line}")
+    if not candidates:
+        for chunk in re.split(r"[;\n]", str(text)):
+            if CZ_POSTCODE_RE.search(chunk): candidates.append(chunk)
+
+    print(f"DEBUG ADDR: Found {len(candidates)} candidates with CZ postcode.")
+    best = None
+    best_score = 0.0
+    for candidate in candidates:
+        score = score_address_candidate(candidate)
+        print(f"DEBUG ADDR: Candidate [{candidate}] score: {score}")
+        if score > best_score:
+            best = candidate
+            best_score = score
+    if not best or best_score < 0.6:
+        if best: print(f"DEBUG ADDR: Best candidate [{best}] rejected due to low score {best_score}")
         return None
+    postcode = normalize_postcode(best)
+    if not postcode: return None
+    address = split_cz_address(best, postcode)
+    if not address.get("address_line1"): return None
+    address["raw"] = clean_address_fragment(best)
+    address["confidence"] = round(best_score, 2)
+    print(f"DEBUG ADDR: Extracted CZ address: {address}")
+    return address
+
+def extract_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    # Prioritize UK addresses for English context
+    res = extract_uk_address_from_text(text)
+    if res: return res
+    return extract_cz_address_from_text(text)
+
+def extract_uk_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not text: return None
+    print(f"DEBUG ADDR UK: Scanning text: {text[:100]}...")
     raw_lines = [line.strip() for line in str(text).replace("\r", "\n").split("\n")]
     lines = [line for line in raw_lines if line]
     candidates: List[str] = []
@@ -3723,23 +4291,27 @@ def extract_uk_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]
         for chunk in re.split(r"[;\n]", str(text)):
             if UK_POSTCODE_RE.search(chunk):
                 candidates.append(chunk)
+
+    print(f"DEBUG ADDR UK: Found {len(candidates)} candidates.")
     best = None
     best_score = 0.0
     for candidate in candidates:
         score = score_address_candidate(candidate)
+        print(f"DEBUG ADDR UK: Candidate [{candidate}] score: {score}")
         if score > best_score:
             best = candidate
             best_score = score
+
     if not best or best_score < 0.65:
+        if best: print(f"DEBUG ADDR UK: Rejected [{best}] due to low score {best_score}")
         return None
     postcode = normalize_postcode(best)
-    if not postcode:
-        return None
+    if not postcode: return None
     address = split_uk_address(best, postcode)
-    if not address.get("address_line1"):
-        return None
+    if not address.get("address_line1"): return None
     address["raw"] = clean_address_fragment(best)
     address["confidence"] = round(best_score, 2)
+    print(f"DEBUG ADDR UK: Extracted: {address}")
     return address
 
 def extract_whatsapp_phone_from_text(*parts: Optional[str]) -> Optional[str]:
@@ -4117,7 +4689,9 @@ class MessageRequest(BaseModel):
     text: str; history: List[ChatMessage] = []
     context_entity_id: Optional[int] = None; context_type: Optional[str] = None
     calendar_context: Optional[str] = None; current_datetime: Optional[str] = None
-    internal_language: Optional[str] = None; external_language: Optional[str] = None
+    internal_language: Optional[str] = None  # assistant-side override (rare)
+    external_language: Optional[str] = None  # customer override (rare)
+    customer_id: Optional[int] = None
 
 # === AI PROCESS ===
 @app.post("/process")
@@ -4152,24 +4726,34 @@ async def process_message(msg: MessageRequest, request: Request):
         request_user = getattr(request.state, "user", {}) or {}
         current_user_id = request_user.get("user_id")
 
-        # Language from tenant config + request override
+        # Language: resolve internal (assistant) + external (customer)
         tenant_conn = get_db_conn()
         try:
             tenant_config = get_tenant_config(tenant_conn, tenant_id)
         finally:
             release_conn(tenant_conn)
-        lang = resolve_response_language(tenant_config, msg.internal_language)
-        if lang == "cs":
-            lang_instruction = "JAZYK: Odpovídej VÝHRADNĚ česky. Celá tvoje odpověď musí být v češtině. Nikdy nepřepínej do jiného jazyka. Uživatel může psát česky, anglicky nebo polsky — ty VŽDY odpovídáš POUZE česky."
-        elif lang == "en":
-            lang_instruction = "LANGUAGE: You MUST respond EXCLUSIVELY in English. Your entire response must be in English. Never switch to another language. The user may write in Czech, English or Polish — you ALWAYS respond ONLY in English."
-        elif lang == "pl":
-            lang_instruction = "JĘZYK: Odpowiadaj WYŁĄCZNIE po polsku. Cała twoja odpowiedź musi być po polsku. Nigdy nie przełączaj się na inny język. Użytkownik może pisać po czesku, angielsku lub polsku — ty ZAWSZE odpowiadasz TYLKO po polsku."
-        else:
-            lang_instruction = "LANGUAGE: Respond in English only."
+
+        customer_lang = get_customer_output_language(msg.customer_id, tenant_id)
+        assistant_lang_info = get_assistant_internal_language(current_user_id, tenant_id)
+        assistant_lang  = assistant_lang_info.get("lang",  DEFAULT_ASSISTANT_LANG)
+        assistant_tone  = assistant_lang_info.get("tone",  DEFAULT_ASSISTANT_TONE)
+        assistant_style = assistant_lang_info.get("style", DEFAULT_ASSISTANT_STYLE)
+
+        internal_lang = assistant_lang if assistant_lang_info.get("locked", True) else normalize_language_code(msg.internal_language, assistant_lang)
+        external_lang = normalize_language_code(customer_lang, DEFAULT_CUSTOMER_LANG)
+
+        lang_instruction = (
+            "Always work internally in {internal}. "
+            "Always respond to the customer in {external}. "
+            "If no customer language is stored, use English UK (en-GB) with British spelling. "
+            "Never switch language based only on the input message. "
+            "Tone: {tone}. Style: {style}."
+        ).format(internal=internal_lang, external=external_lang,
+                 tone=assistant_tone, style=assistant_style)
 
         def tr(en: str, cs: str, pl: str) -> str:
-            return cs if lang == "cs" else en if lang == "en" else pl if lang == "pl" else en
+            short = normalize_language_short(external_lang, "en")
+            return cs if short == "cs" else en if short == "en" else pl if short == "pl" else en
 
         def error_reply(e: Exception, prefix_en: str = "Error", prefix_cs: str = "Chyba", prefix_pl: str = "Błąd"):
             return {"reply_cs": f"{tr(prefix_en, prefix_cs, prefix_pl)}: {e}"}
@@ -4245,7 +4829,20 @@ async def process_message(msg: MessageRequest, request: Request):
         finally:
             release_conn(memory_conn)
 
-        system_prompt = f"""You are an intelligent VOICE secretary of DesignLeaf company (landscaping services, Oxfordshire UK).
+        # Load tenant settings for dynamic voice prompt
+        _ts_conn2 = get_db_conn()
+        try:
+            _ts = _get_tenant_settings(_ts_conn2, tenant_id)
+        except Exception:
+            _ts = {}
+        finally:
+            release_conn(_ts_conn2)
+        _ts_company   = _ts.get("company_name") or "the company"
+        _ts_industry  = _ts.get("industry_description") or "business services"
+        _ts_location  = _ts.get("default_location") or ""
+        _ts_loc_str   = f", {_ts_location}" if _ts_location else ""
+
+        system_prompt = f"""You are an intelligent VOICE secretary of {_ts_company} ({_ts_industry}{_ts_loc_str}).
 {lang_instruction}
 TIME: {now}. CONTEXT: {entity_ctx or 'None.'}
 CALENDAR: {msg.calendar_context or 'None.'}
@@ -4295,8 +4892,8 @@ RULES:
             {"type":"function","function":{"name":"update_job","description":"Zmeni stav, plan nebo predani zakazky","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev zakazky"},"status":{"type":"string","enum":["nova","v_reseni","ceka_na_klienta","ceka_na_material","naplanovano","v_realizaci","dokonceno","vyfakturovano","uzavreno","pozastaveno","zruseno"]},"assigned_to":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"handover_note":{"type":"string"}},"required":["title"]}}},
             {"type":"function","function":{"name":"list_tasks","description":"Vypise ukoly podle filtru","parameters":{"type":"object","properties":{"status":{"type":"string"},"client_name":{"type":"string"},"only_active":{"type":"boolean"}}}}},
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
-            {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
-            {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: Didcot, Oxfordshire"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
+            {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz uzivatel rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
+            {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: tenant default_location"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
             {"type":"function","function":{"name":"send_whatsapp","description":"Otevre WhatsApp v mobilu s predvyplnenou zpravou pro kontakt nebo klienta. Message ma byt prirozeny obsah v internim jazyce uzivatele; server ji prelozi do nastaveneho jazyka komunikace se zakaznikem.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta nebo kontaktu"},"contact_name":{"type":"string","description":"Jmeno kontaktu, pokud nejde o CRM klienta"},"phone":{"type":"string","description":"Telefonni cislo, pokud je zname"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["message"]}}},
             {"type":"function","function":{"name":"remember_memory","description":"Ulozi dlouhodobou nebo strednedobou pamet asistenta. Pouzij pro 'zapamatuj si ...', 'pamatuj si ...', 'remember ...'.","parameters":{"type":"object","properties":{"content":{"type":"string","description":"Presny obsah k zapamatovani"},"memory_type":{"type":"string","enum":["medium","long"],"default":"long"}},"required":["content"]}}},
             {"type":"function","function":{"name":"forget_memory","description":"Smaze odpovidajici polozky pameti asistenta. Pouzij pro 'zapomen ...', 'forget ...'.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Co se ma zapomenout"}},"required":["query"]}}},
@@ -4627,7 +5224,7 @@ RULES:
             if action == "GET_WEATHER":
                 try:
                     import urllib.request, urllib.parse, urllib.error
-                    loc = str(args.get("location") or "Didcot").strip() or "Didcot"
+                    loc = str(args.get("location") or _ts.get("default_location","") or "London").strip() or "London"
                     try:
                         days = int(float(args.get("days", 3)))
                     except Exception:
@@ -4771,7 +5368,11 @@ RULES:
                                     phone = matched.get("phone_primary") or matched.get("phone_secondary") or phone
                     finally:
                         release_conn(conn)
-                outgoing_language = resolve_customer_language(tenant_config, msg.external_language)
+                outgoing_language = (
+                    get_customer_output_language(resolved_client_id, tenant_id)
+                    if resolved_client_id
+                    else DEFAULT_CUSTOMER_LANG
+                )
                 translated_message = translate_customer_message(original_message, outgoing_language)
                 return {
                     "reply_cs": tr(
@@ -5106,10 +5707,38 @@ RULES:
                 "SEND_EMAIL": tr(f"Sending email to {args.get('to','')}.", f"Posílám email na {args.get('to','')}.", f"Wysyłam email na {args.get('to','')}."),
             }
             reply = ai_msg.content or human.get(action, tr("Done.", "Hotovo.", "Gotowe."))
+            # Validate reply language only when the LLM wrote the text itself
+            if ai_msg.content:
+                _expected_short = normalize_language_short(external_lang, "en")
+                _detected_short = detect_reply_language_short(ai_msg.content, _expected_short)
+                if _detected_short != _expected_short:
+                    log_language_mismatch(
+                        tenant_id=tenant_id,
+                        user_id=current_user_id,
+                        customer_id=msg.customer_id,
+                        expected_lang_short=_expected_short,
+                        detected_lang_short=_detected_short,
+                        reply_excerpt=ai_msg.content,
+                        source="process_action",
+                    )
             return {"reply_cs":reply,"action_type":action,"action_data":args}
 
         # No tool call — plain text reply
         reply = ai_msg.content or tr("Understood.", "Rozumím.", "Rozumiem.")
+        # Validate reply language only when the LLM wrote the text itself
+        if ai_msg.content:
+            _expected_short = normalize_language_short(external_lang, "en")
+            _detected_short = detect_reply_language_short(ai_msg.content, _expected_short)
+            if _detected_short != _expected_short:
+                log_language_mismatch(
+                    tenant_id=tenant_id,
+                    user_id=current_user_id,
+                    customer_id=msg.customer_id,
+                    expected_lang_short=_expected_short,
+                    detected_lang_short=_detected_short,
+                    reply_excerpt=ai_msg.content,
+                    source="process_plain",
+                )
         # Fallback: if reply mentions work report but GPT didn't call tool, force it
         wr_kw = ["work report","výkaz","vykaz","nahlášení práce","nahlaseni prace","zapsat práci","zapsat praci","raport pracy","zahajuji proces"]
         if any(kw in (reply + " " + msg.text).lower() for kw in wr_kw):
@@ -6747,9 +7376,9 @@ async def assign_contact_section(data: dict, request: Request):
             # Audit
             try:
                 cur.execute("""
-                    INSERT INTO audit_log (tenant_id, user_id, action, entity_type, description, created_at)
-                    VALUES (%s,%s,'assign_contact_role','contact',%s,now())
-                """, (tenant_id, user_id, f"Assigned {display_name} to {section_code}"))
+                    INSERT INTO audit_log (tenant_id, user_id, action, entity_type, new_values, created_at)
+                    VALUES (%s,%s,'assign_contact_role','contact',%s::jsonb,now())
+                """, (tenant_id, user_id, json.dumps({"display_name": display_name, "section_code": section_code})))
             except Exception:
                 pass
 
@@ -6813,10 +7442,12 @@ async def merge_shared_contacts(data: dict, request: Request):
             # Audit
             try:
                 cur.execute(
-                    """INSERT INTO audit_log (tenant_id, user_id, action, entity_type, description, created_at)
-                       VALUES (%s,%s,'merge_contacts','shared_contact',%s,now())""",
-                    (tenant_id, user_id,
-                     f"Merged {secondary.get('display_name')} into {primary.get('display_name')}")
+                    """INSERT INTO audit_log (tenant_id, user_id, action, entity_type, new_values, created_at)
+                       VALUES (%s,%s,'merge_contacts','shared_contact',%s::jsonb,now())""",
+                    (tenant_id, user_id, json.dumps({
+                        "merged": secondary.get("display_name"),
+                        "into": primary.get("display_name")
+                    }))
                 )
             except Exception:
                 pass
@@ -7333,7 +7964,7 @@ async def sync_whatsapp_addresses(request: Request, data: dict):
                     ]
                     if part
                 )
-                address = extract_uk_address_from_text(text)
+                address = extract_address_from_text(text)
                 if not address:
                     continue
                 candidates += 1
@@ -7553,13 +8184,14 @@ async def get_settings():
             op = cur.fetchone() or {}
             cur.execute("SELECT max_users FROM subscription_limits WHERE tenant_id=1")
             sl = cur.fetchone() or {}
-            return {"company_name":"DesignLeaf","version":"1.2a","database":"PostgreSQL",
+            ts = _get_tenant_settings(conn, 1)
+            return {"company_name": ts.get("company_name","Secretary CRM"), "version": ts.get("app_version","1.0.0"), "database":"PostgreSQL",
                     "clients_count":cc,"jobs_count":jc,"tasks_count":tc,"leads_count":lc,
                     "users_count":uc,
                     "workspace_mode":op.get("workspace_mode","solo"),
                     "max_active_users":sl.get("max_users", op.get("max_active_users",1)),
                     "ai_configured":bool(OPENAI_API_KEY),"environment":os.getenv("RAILWAY_ENVIRONMENT","local")}
-    except Exception as e: return {"company_name":"DesignLeaf","version":"1.2a","error":str(e)}
+    except Exception as e: return {"company_name":"Secretary CRM","version":"1.0.0","error":str(e)}
     finally: release_conn(conn)
 
 
@@ -7594,7 +8226,7 @@ async def repair_schema():
                     results.append({"sql": "CREATE TABLE FAIL", "ok": False, "err": str(e)})
                     conn.rollback()
             try:
-                cur.execute("INSERT INTO tenants (name,slug) VALUES ('DesignLeaf','designleaf') ON CONFLICT (slug) DO NOTHING")
+                cur.execute("INSERT INTO tenants (name,slug) VALUES ('New Company','new-company') ON CONFLICT (slug) DO NOTHING")
                 cur.execute("INSERT INTO roles (role_name,description) VALUES ('admin','Full access') ON CONFLICT (role_name) DO NOTHING")
                 cur.execute("INSERT INTO migration_log (filename) VALUES ('001_full_repair.sql') ON CONFLICT (filename) DO NOTHING")
                 results.append({"sql": "SEED data", "ok": True})
@@ -8277,6 +8909,281 @@ async def get_admin_activity_log(
             return [map_admin_activity_entry(dict(row)) for row in cur.fetchall()]
     finally:
         release_conn(conn)
+
+# ========== ADMIN: LANGUAGE SETTINGS ==========
+
+@app.get("/admin/clients/{client_id}/language")
+async def admin_get_client_language(client_id: int, request: Request):
+    """Return stored language preferences for a specific client."""
+    admin = ensure_request_permissions(request, "manage_users")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, display_name,
+                       preferred_language_code,
+                       preferred_language_name,
+                       language_source,
+                       language_confidence,
+                       language_updated_at::text
+                FROM clients
+                WHERE id = %s AND tenant_id = %s
+                """,
+                (client_id, admin["tenant_id"]),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Client not found")
+            return {
+                "client_id": row["id"],
+                "display_name": row["display_name"],
+                "preferred_language_code": row["preferred_language_code"] or DEFAULT_CUSTOMER_LANG,
+                "preferred_language_name": row["preferred_language_name"],
+                "language_source": row["language_source"],
+                "language_confidence": row["language_confidence"],
+                "language_updated_at": row["language_updated_at"],
+            }
+    finally:
+        release_conn(conn)
+
+
+@app.put("/admin/clients/{client_id}/language")
+async def admin_set_client_language(client_id: int, data: dict, request: Request):
+    """Set preferred language for a client.
+
+    Body: { "language_code": "cs-CZ", "source": "admin", "confidence": 1.0 }
+    """
+    admin = ensure_request_permissions(request, "manage_users")
+    language_code = data.get("language_code")
+    if not language_code:
+        raise HTTPException(400, "language_code is required")
+    source = data.get("source", "admin")
+    try:
+        confidence = float(data.get("confidence", 1.0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "confidence must be a number")
+
+    normalized = normalize_language_code(language_code, DEFAULT_CUSTOMER_LANG)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, display_name FROM clients WHERE id=%s AND tenant_id=%s",
+                        (client_id, admin["tenant_id"]))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Client not found")
+            prev_lang = None
+            cur.execute("SELECT preferred_language_code FROM clients WHERE id=%s", (client_id,))
+            prev_row = cur.fetchone()
+            if prev_row:
+                prev_lang = prev_row.get("preferred_language_code")
+            cur.execute(
+                """
+                UPDATE clients
+                SET preferred_language_code = %s,
+                    preferred_language_name = %s,
+                    language_source = %s,
+                    language_confidence = %s,
+                    language_updated_at = now()
+                WHERE id = %s
+                """,
+                (normalized, normalized, source, confidence, client_id),
+            )
+            log_activity(
+                conn,
+                entity_type="client",
+                entity_id=client_id,
+                action="language_changed",
+                description=f"Language updated: {prev_lang} → {normalized} (source={source})",
+                tenant_id=admin["tenant_id"],
+                user_id=admin.get("user_id"),
+                source_channel="admin",
+                details={
+                    "prev_language": prev_lang,
+                    "new_language": normalized,
+                    "source": source,
+                    "confidence": confidence,
+                },
+            )
+            conn.commit()
+        return {
+            "client_id": client_id,
+            "display_name": row["display_name"],
+            "preferred_language_code": normalized,
+            "language_source": source,
+            "language_confidence": confidence,
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
+@app.get("/admin/users/{user_id}/assistant-settings")
+async def admin_get_user_assistant_settings(user_id: int, request: Request):
+    """Return assistant language / tone / style settings for a user."""
+    admin = ensure_request_permissions(request, "manage_users")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, display_name, email,
+                       assistant_output_language_code,
+                       assistant_output_language_name,
+                       assistant_language_locked,
+                       assistant_tone,
+                       assistant_style
+                FROM users
+                WHERE id = %s AND tenant_id = %s
+                """,
+                (user_id, admin["tenant_id"]),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "User not found")
+            return {
+                "user_id": row["id"],
+                "display_name": row["display_name"],
+                "email": row["email"],
+                "assistant_language": normalize_language_code(
+                    row.get("assistant_output_language_code") or DEFAULT_ASSISTANT_LANG,
+                    DEFAULT_ASSISTANT_LANG,
+                ),
+                "assistant_language_name": row.get("assistant_output_language_name"),
+                "assistant_language_locked": bool(
+                    row.get("assistant_language_locked")
+                    if row.get("assistant_language_locked") is not None
+                    else True
+                ),
+                "assistant_tone": (row.get("assistant_tone") or DEFAULT_ASSISTANT_TONE).strip().lower(),
+                "assistant_style": (row.get("assistant_style") or DEFAULT_ASSISTANT_STYLE).strip().lower(),
+            }
+    finally:
+        release_conn(conn)
+
+
+VALID_TONES = {"professional", "friendly", "formal", "casual", "empathetic"}
+VALID_STYLES = {"concise", "detailed", "balanced"}
+
+
+@app.put("/admin/users/{user_id}/assistant-settings")
+async def admin_set_user_assistant_settings(user_id: int, data: dict, request: Request):
+    """Update assistant language / tone / style / locked flag for a user.
+
+    Body (all fields optional):
+    {
+      "language": "en-GB",
+      "locked": true,
+      "tone": "professional",
+      "style": "concise"
+    }
+    """
+    admin = ensure_request_permissions(request, "manage_users")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, display_name,
+                       assistant_output_language_code,
+                       assistant_language_locked,
+                       assistant_tone,
+                       assistant_style
+                FROM users
+                WHERE id = %s AND tenant_id = %s
+                """,
+                (user_id, admin["tenant_id"]),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "User not found")
+
+            # Resolve each field — keep existing value if not provided
+            new_lang = row.get("assistant_output_language_code") or DEFAULT_ASSISTANT_LANG
+            new_locked = bool(row.get("assistant_language_locked") if row.get("assistant_language_locked") is not None else True)
+            new_tone = (row.get("assistant_tone") or DEFAULT_ASSISTANT_TONE).strip().lower()
+            new_style = (row.get("assistant_style") or DEFAULT_ASSISTANT_STYLE).strip().lower()
+
+            changes = {}
+            if "language" in data:
+                new_lang = normalize_language_code(data["language"], DEFAULT_ASSISTANT_LANG)
+                changes["language"] = new_lang
+            if "locked" in data:
+                new_locked = bool(data["locked"])
+                changes["locked"] = new_locked
+            if "tone" in data:
+                tone_input = str(data["tone"]).strip().lower()
+                if tone_input not in VALID_TONES:
+                    raise HTTPException(400, f"tone must be one of: {sorted(VALID_TONES)}")
+                new_tone = tone_input
+                changes["tone"] = new_tone
+            if "style" in data:
+                style_input = str(data["style"]).strip().lower()
+                if style_input not in VALID_STYLES:
+                    raise HTTPException(400, f"style must be one of: {sorted(VALID_STYLES)}")
+                new_style = style_input
+                changes["style"] = new_style
+
+            if not changes:
+                raise HTTPException(400, "Nothing to update — provide at least one of: language, locked, tone, style")
+
+            cur.execute(
+                """
+                UPDATE users
+                SET assistant_output_language_code = %s,
+                    assistant_output_language_name = %s,
+                    assistant_language_locked = %s,
+                    assistant_tone = %s,
+                    assistant_style = %s
+                WHERE id = %s
+                """,
+                (new_lang, new_lang, new_locked, new_tone, new_style, user_id),
+            )
+            log_activity(
+                conn,
+                entity_type="user",
+                entity_id=user_id,
+                action="assistant_settings_changed",
+                description=f"Assistant settings updated: {changes}",
+                tenant_id=admin["tenant_id"],
+                user_id=admin.get("user_id"),
+                source_channel="admin",
+                details={
+                    "user_id": user_id,
+                    "changes": changes,
+                    "prev": {
+                        "language": row.get("assistant_output_language_code"),
+                        "locked": row.get("assistant_language_locked"),
+                        "tone": row.get("assistant_tone"),
+                        "style": row.get("assistant_style"),
+                    },
+                },
+            )
+            conn.commit()
+        return {
+            "user_id": user_id,
+            "display_name": row["display_name"],
+            "assistant_language": new_lang,
+            "assistant_language_locked": new_locked,
+            "assistant_tone": new_tone,
+            "assistant_style": new_style,
+            "updated_fields": list(changes.keys()),
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
 
 @app.post("/crm/jobs/{job_id}/audit")
 async def add_job_audit(job_id: int, data: dict, request: Request):
@@ -10128,7 +11035,7 @@ def generate_batch_summary(ctx, lang="en"):
     lines.extend(["", footer])
     return "\n".join(lines)
 
-def generate_batch_whatsapp(ctx, lang="en"):
+def generate_batch_whatsapp(ctx, lang="en", footer=None):
     days = list(ctx.get("report_days") or [])
     current = extract_current_report_day(ctx)
     if current.get("entries"):
@@ -10151,7 +11058,7 @@ def generate_batch_whatsapp(ctx, lang="en"):
         grand_total += float(day.get("grand_total") or 0)
         lines.append("")
     lines.append(f"Total: £{grand_total:.2f}")
-    lines.append("\nMarek\nDesignLeaf\n07395 813008")
+    if footer: lines.append(f"\n{footer}")
     return "\n".join(lines)
 
 def save_voice_work_report_day(conn, tenant_id: int, actor_user_id: Optional[int], day_ctx: dict) -> int:
@@ -10205,7 +11112,7 @@ def generate_summary(ctx, lang="en"):
     if c.get("notes"): lines.append(f"Notes: {c['notes']}")
     return "\n".join(lines)
 
-def generate_whatsapp(ctx):
+def generate_whatsapp(ctx, footer=None):
     c = ctx
     lines = [f"Hello {c.get('client_name','')},", "", "Here is the summary of today's work:", ""]
     for e in c.get("entries",[]):
@@ -10216,7 +11123,7 @@ def generate_whatsapp(ctx):
     for m in c.get("materials",[]):
         lines.append(f"Material - {m.get('name','')}: {m.get('qty',0)} × £{m.get('price',0):.2f} = £{m.get('total',0):.2f}")
     lines.append(f"\nTotal: £{c.get('grand_total',0):.2f}")
-    lines.append(f"\nMarek\nDesignLeaf\n07395 813008")
+    if footer: lines.append(f"\n{footer}")
     return "\n".join(lines)
 
 # ========== VOICE SESSION API ==========
@@ -10227,8 +11134,11 @@ async def voice_session_start(data: dict, request: Request):
         sid = str(uuid.uuid4())
         tenant_id = data.get("tenant_id",1)
         tenant_config = get_tenant_config(conn, tenant_id)
-        lang = resolve_voice_language(tenant_config, data.get("language"))
         actor_user_id = request.state.user.get("user_id")
+        lang = normalize_language_short(
+            get_assistant_internal_language(actor_user_id, tenant_id).get("lang", DEFAULT_ASSISTANT_LANG),
+            "en",
+        )
         with conn.cursor() as cur:
             ctx = json.dumps({
                 "language": lang,
@@ -10573,7 +11483,7 @@ async def voice_session_input(data: dict, request: Request):
                     ctx["saved_work_report_ids"] = report_ids
                     cur.execute("UPDATE voice_sessions SET state='completed',context=%s,updated_at=now() WHERE id=%s",(json.dumps(ctx),sid))
                     conn.commit()
-                    whatsapp = generate_batch_whatsapp(ctx, lang)
+                    _ts_wr = _get_tenant_settings(conn, tenant_id); whatsapp = generate_batch_whatsapp(ctx, lang, footer=_ts_wr.get("whatsapp_footer"))
                     reply = get_prompt("confirm",lang)
                     return {
                         "session_id":sid,
@@ -10643,6 +11553,120 @@ async def voice_session_resume(data: dict):
             conn.commit()
         return {"session_id": sid, "step": step, "prompt": get_prompt(step, lang), "context": ctx}
     except HTTPException: raise
+    except Exception as e: raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+# ── VOICE SESSION: INTERRUPT (barge-in) ──────────────────────────────────────
+@app.post("/voice/session/interrupt")
+async def voice_session_interrupt(data: dict, request: Request):
+    """
+    Called by Android when barge-in is detected (VAD trigger or interrupt phrase).
+    Server records the interruption; Android is responsible for stopping TTS playback.
+
+    Request body:
+        session_id       (str, required)
+        tenant_id        (int, default 1)
+        phrase           (str, optional)  — detected phrase that triggered interrupt
+        interruption_type (str, default 'phrase') — phrase | vad | barge_in | manual
+        tts_position_ms  (int, optional)  — ms into TTS playback when interrupted
+
+    Response:
+        {session_id, status:'interrupted', previous_state, dialog_step}
+    """
+    sid               = data.get("session_id")
+    tenant_id         = int(data.get("tenant_id", 1))
+    phrase            = data.get("phrase", "") or ""
+    interruption_type = data.get("interruption_type", "phrase")
+    tts_position_ms   = data.get("tts_position_ms")
+
+    if not sid:
+        raise HTTPException(400, "session_id required")
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM crm.voice_sessions WHERE id=%s AND tenant_id=%s",
+                (sid, tenant_id)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, f"Session {sid} not found")
+
+            previous_state = row["state"]
+            step           = row.get("dialog_step", "unknown")
+            actor_user_id  = (
+                request.state.user.get("user_id")
+                if hasattr(request, "state") and hasattr(request.state, "user")
+                else row.get("user_id")
+            )
+
+            cur.execute("""
+                UPDATE crm.voice_sessions
+                   SET state              = 'interrupted',
+                       interrupted        = TRUE,
+                       interrupted_at     = NOW(),
+                       interrupted_text   = %s,
+                       interruption_reason = %s,
+                       previous_state     = %s,
+                       updated_at         = NOW()
+                 WHERE id = %s
+            """, (phrase or None, interruption_type, previous_state, sid))
+
+            cur.execute("""
+                INSERT INTO crm.voice_interrupt_logs
+                    (tenant_id, user_id, voice_session_id, detected_phrase,
+                     interruption_type, previous_state, new_state, tts_position_ms, session_step)
+                VALUES (%s, %s, %s, %s, %s, %s, 'interrupted', %s, %s)
+            """, (
+                tenant_id,
+                actor_user_id or row.get("user_id"),
+                sid,
+                phrase or None,
+                interruption_type,
+                previous_state,
+                tts_position_ms,
+                step,
+            ))
+
+            conn.commit()
+
+        return {
+            "session_id":     sid,
+            "status":         "interrupted",
+            "previous_state": previous_state,
+            "dialog_step":    step,
+        }
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+
+# ── VOICE INTERRUPT COMMANDS: fetch for Android VAD phrase detector ──────────
+@app.get("/voice/interrupt-commands")
+async def list_voice_interrupt_commands(tenant_id: int = 1, language_code: str = "cs"):
+    """
+    Returns interrupt phrases for the given tenant + language.
+    Android fetches this at session start to build its local phrase detector.
+    Response can be cached on device between sessions.
+
+    Query params:
+        tenant_id      (int, default 1)
+        language_code  (str, default 'cs') — BCP-47: cs, en, en-GB, pl
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT phrase, command_type, sort_order
+                  FROM crm.voice_interrupt_commands
+                 WHERE tenant_id    = %s
+                   AND language_code = %s
+                   AND is_active    = TRUE
+                 ORDER BY sort_order
+            """, (tenant_id, language_code))
+            cmds = [{"phrase": r["phrase"], "command_type": r["command_type"]} for r in cur.fetchall()]
+        return {"tenant_id": tenant_id, "language_code": language_code, "commands": cmds}
     except Exception as e: raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
@@ -10789,42 +11813,50 @@ def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
         "type": "text",
         "text": {"body": translated}
     }).encode("utf-8")
+    print(f"DEBUG WA: Sending to Meta API: {get_wa_api_url()}")
+    print(f"DEBUG WA: Payload: {payload.decode()}")
     req = urllib.request.Request(get_wa_api_url(), data=payload, method="POST",
         headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read().decode())
+            print(f"DEBUG WA: Meta API Success: {result}")
             result["translated_text"] = translated
             result["original_text"] = message
             result["target_language"] = normalized_target_language
             result["normalized_phone"] = normalized_phone
-            result["provider"] = "meta"
             return result
     except urllib.error.HTTPError as e:
         body = e.read().decode()
+        print(f"DEBUG WA: Meta API HTTP Error {e.code}: {body}")
         meta_error = None
         try:
-            parsed = json.loads(body)
-            meta_error = parsed.get("error") if isinstance(parsed, dict) else None
+            meta_error = json.loads(body)
         except Exception:
             meta_error = None
-        human_error = f"WhatsApp API {e.code}"
+        human_error = "Meta WhatsApp request failed"
         if e.code == 401:
-            human_error = "WhatsApp authorization failed"
+            human_error = "WhatsApp token (WHATSAPP_ACCESS_TOKEN) is invalid or expired."
         elif e.code == 403:
-            human_error = "WhatsApp access forbidden"
-        elif e.code == 400 and meta_error:
-            meta_message = meta_error.get("message") if isinstance(meta_error, dict) else None
-            human_error = f"WhatsApp rejected the request: {meta_message or 'invalid request'}"
+            human_error = "Permission denied. Check if the token has 'whatsapp_business_messaging' scope."
+        elif e.code == 404:
+            human_error = "Endpoint not found. Check WHATSAPP_PHONE_NUMBER_ID."
+        elif e.code == 400 and isinstance(meta_error, dict):
+            err = meta_error.get("error", {})
+            msg = err.get("message") or "Unknown Meta error"
+            human_error = f"WhatsApp Cloud API error: {msg}"
+            if "24-hour window" in msg or err.get("code") == 131047:
+                human_error = "Cannot send free-text message. The 24-hour conversation window has closed. You must wait for the customer to message you first or use a Template."
         return {
             "error": human_error,
             "meta_status": e.code,
             "detail": body,
             "meta_error": meta_error,
             "provider": "meta",
-            "config_hint": "Check Railway env vars WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID." if e.code in (401, 403) else None,
+            "config_hint": "Check Railway env vars WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID." if e.code in (400, 401, 403, 404) else None,
         }
     except Exception as e:
+        print(f"DEBUG WA: Meta API Exception: {e}")
         return {"error": str(e), "provider": "meta"}
 
 def wa_find_client_by_phone(conn, phone: str):
@@ -10951,11 +11983,1012 @@ async def wa_status():
         "twilio_sender": TWILIO_WHATSAPP_FROM or None,
     }
 
+# ========== TOOL PACKAGE SYSTEM ==========
+
+def _tool_db_conn():
+    """Return a psycopg2 RealDictCursor connection for tool operations."""
+    import psycopg2
+    import psycopg2.extras
+    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL not configured")
+    conn = psycopg2.connect(db_url, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = False
+    return conn
+
+
+@app.get("/tools/packages")
+async def list_tool_packages(
+    tenant_id: int = 1,
+    install_status: str = None,
+    request: Request = None,
+):
+    """
+    List all tools registered for a tenant with their install status.
+    Optional filter: ?install_status=enabled
+    """
+    conn = _tool_db_conn()
+    try:
+        query = """
+            SELECT tr.tool_id, tr.tool_name, tr.description, tr.version,
+                   tr.author, tr.risk_level, tr.install_status,
+                   tr.installed_at, tr.updated_at,
+                   (
+                       SELECT COUNT(*) FROM crm.tool_config_slots tcs
+                        WHERE tcs.tool_id = tr.tool_id AND tcs.required = TRUE
+                   ) AS required_slot_count,
+                   (
+                       SELECT COUNT(*) FROM crm.tenant_tool_secret tts
+                        WHERE tts.tenant_id = tr.tenant_id
+                          AND tts.tool_id = tr.tool_id
+                          AND tts.is_active = TRUE
+                   ) AS secret_slots_filled
+              FROM crm.tool_registry tr
+             WHERE tr.tenant_id = %s
+        """
+        params = [tenant_id]
+        if install_status:
+            query += " AND tr.install_status = %s"
+            params.append(install_status)
+        query += " ORDER BY tr.tool_name"
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            tools = [dict(r) for r in cur.fetchall()]
+        for t in tools:
+            for k in ("installed_at", "updated_at"):
+                if t.get(k):
+                    t[k] = t[k].isoformat()
+        return {"tenant_id": tenant_id, "tools": tools, "count": len(tools)}
+    finally:
+        conn.close()
+
+
+@app.get("/tools/hub-tiles")
+async def get_tool_hub_tiles(tenant_id: int = 1, request: Request = None):
+    """
+    Return the tool hub tiles for a tenant from crm.tool_hub_tiles.
+    Used by Android ToolsHubScreen to dynamically show installed plugin tiles.
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT tile_key, tile_title_en, tile_title_cs, tile_title_pl,
+                          tile_hint_en, tile_hint_cs, tile_hint_pl,
+                          icon, sort_order
+                     FROM crm.tool_hub_tiles
+                    WHERE tenant_id = %s AND is_active = TRUE
+                    ORDER BY sort_order, tile_title_en""",
+                (tenant_id,)
+            )
+            tiles = [dict(r) for r in cur.fetchall()]
+        return {"tenant_id": tenant_id, "tiles": tiles, "count": len(tiles)}
+    except Exception as e:
+        return {"tenant_id": tenant_id, "tiles": [], "count": 0, "error": str(e)}
+    finally:
+        release_conn(conn)
+
+
+@app.post("/tools/install")
+async def install_tool_endpoint(request: Request):
+    """
+    Install a tool package from a .zip upload.
+    Multipart form fields: file (required), tenant_id, slot_values (JSON), skip_test, force.
+    """
+    import tempfile as _tmp2
+    from tool_installer import install_tool as _install_tool
+    from tool_installer import InstallError, ManifestError, ChecksumError, CompatibilityError
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="'file' field is required")
+
+    tenant_id   = int(form.get("tenant_id", 1))
+    skip_test   = str(form.get("skip_test", "false")).lower() == "true"
+    force       = str(form.get("force", "false")).lower() == "true"
+    slot_values = {}
+    sv_raw = form.get("slot_values")
+    if sv_raw:
+        try:
+            slot_values = json.loads(sv_raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="slot_values must be valid JSON")
+
+    import os as _os2
+    with _tmp2.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    conn = _tool_db_conn()
+    try:
+        result = _install_tool(
+            conn, zip_path=tmp_path, tenant_id=tenant_id,
+            slot_values=slot_values, skip_connection_test=skip_test, force_reinstall=force,
+        )
+        conn.commit()
+        return result
+    except (InstallError, ManifestError, ChecksumError, CompatibilityError) as e:
+        conn.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Install error: {e}")
+    finally:
+        conn.close()
+        try:
+            _os2.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+@app.post("/tools/export")
+async def export_tool_endpoint(data: dict, request: Request):
+    """
+    Export an installed tool to a downloadable .zip package.
+    Body: {tool_id, tenant_id, export_mode}
+    """
+    from fastapi.responses import FileResponse
+    from tool_exporter import export_tool as _export_tool
+    import tempfile as _tmp3, os as _os3
+
+    tool_id     = data.get("tool_id")
+    tenant_id   = int(data.get("tenant_id", 1))
+    export_mode = data.get("export_mode", "empty_slots")
+
+    if not tool_id:
+        raise HTTPException(status_code=400, detail="'tool_id' is required")
+
+    output_dir = _os3.path.join(_tmp3.gettempdir(), "tool_exports")
+    _os3.makedirs(output_dir, exist_ok=True)
+
+    conn = _tool_db_conn()
+    try:
+        result = _export_tool(conn, tool_id=tool_id, tenant_id=tenant_id,
+                               output_dir=output_dir, export_mode=export_mode)
+        conn.commit()
+    except ValueError as e:
+        conn.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Export error: {e}")
+    finally:
+        conn.close()
+
+    pkg_path = result["package_path"]
+    filename = _os3.path.basename(pkg_path)
+    return FileResponse(
+        pkg_path, media_type="application/zip", filename=filename,
+        headers={
+            "X-Tool-Id":          tool_id,
+            "X-Tool-Version":     result["version"],
+            "X-Export-Mode":      export_mode,
+            "X-Package-Checksum": result["checksum"],
+        },
+    )
+
+
+@app.put("/tools/{tool_id}/config/{slot_name}")
+async def update_tool_config_slot(
+    tool_id: str,
+    slot_name: str,
+    data: dict,
+    request: Request,
+):
+    """
+    Set or update a single config/secret slot. Re-runs connection tests if all slots filled.
+    Body: {value, tenant_id, run_test}
+    """
+    from tool_installer import update_tool_slot as _update_slot
+    from tool_installer import InstallError
+
+    value     = data.get("value")
+    tenant_id = int(data.get("tenant_id", 1))
+    run_test  = bool(data.get("run_test", True))
+
+    if value is None:
+        raise HTTPException(status_code=400, detail="'value' is required")
+
+    conn = _tool_db_conn()
+    try:
+        result = _update_slot(conn, tool_id=tool_id, tenant_id=tenant_id,
+                               slot_name=slot_name, plain_value=value,
+                               run_connection_test=run_test)
+        conn.commit()
+        return result
+    except InstallError as e:
+        conn.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Slot update error: {e}")
+    finally:
+        conn.close()
+
+
+@app.post("/tools/{tool_id}/test-connection")
+async def test_tool_connection(
+    tool_id: str,
+    data: dict,
+    request: Request,
+):
+    """
+    Run connection tests for an installed tool.
+    Body: {tenant_id, slot_overrides}
+    """
+    from tool_connection_test import run_tool_connection_tests
+
+    tenant_id      = int(data.get("tenant_id", 1))
+    slot_overrides = data.get("slot_overrides")
+
+    conn = _tool_db_conn()
+    try:
+        result = run_tool_connection_tests(tool_id, tenant_id, conn,
+                                            override_slot_values=slot_overrides)
+        conn.commit()
+        return result
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Connection test error: {e}")
+    finally:
+        conn.close()
+
+
+@app.delete("/tools/{tool_id}")
+async def uninstall_tool_endpoint(
+    tool_id: str,
+    data: dict,
+    request: Request,
+):
+    """
+    Uninstall a tool. DESTRUCTIVE — requires confirmation phrase.
+    Body: {tenant_id, purge_secrets, confirmation}
+    confirmation must equal: "Potvrzuji odinstalaci nastroje: {tool_id}"
+    """
+    from tool_installer import uninstall_tool as _uninstall_tool
+
+    tenant_id     = int(data.get("tenant_id", 1))
+    purge_secrets = bool(data.get("purge_secrets", False))
+    confirmation  = data.get("confirmation", "")
+    required_phrase = f"Potvrzuji odinstalaci nastroje: {tool_id}"
+
+    if confirmation != required_phrase:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Confirmation phrase required. Send confirmation='{required_phrase}'"
+        )
+
+    conn = _tool_db_conn()
+    try:
+        result = _uninstall_tool(conn, tool_id=tool_id, tenant_id=tenant_id,
+                                  purge_secrets=purge_secrets)
+        conn.commit()
+        return result
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Uninstall error: {e}")
+    finally:
+        conn.close()
+
+
+
+
+@app.get("/tools/{tool_id}/slots")
+async def get_tool_slots(
+    tool_id: str,
+    tenant_id: int = 1,
+    request: Request = None,
+):
+    """
+    Return config slots for a tool with fill status (no secret values).
+    """
+    conn = _tool_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT tcs.slot_name, tcs.display_name, tcs.description,
+                       tcs.slot_type, tcs.is_secret, tcs.required,
+                       tcs.default_value, tcs.sort_order,
+                       CASE WHEN tts.id IS NOT NULL AND tts.is_active THEN TRUE ELSE FALSE END AS is_filled
+                  FROM crm.tool_config_slots tcs
+                  LEFT JOIN crm.tenant_tool_secret tts
+                         ON tts.tool_id = tcs.tool_id
+                        AND tts.slot_name = tcs.slot_name
+                        AND tts.tenant_id = %s
+                        AND tts.is_active = TRUE
+                 WHERE tcs.tool_id = %s
+                 ORDER BY tcs.sort_order, tcs.slot_name
+            """, [tenant_id, tool_id])
+            slots = [dict(r) for r in cur.fetchall()]
+        return {"tool_id": tool_id, "tenant_id": tenant_id, "slots": slots}
+    finally:
+        conn.close()
+
+
+# ========== IMPORT SYSTEM ==========
+
+class _ImportSessionCreate(BaseModel):
+    source_type: str
+    target_table: str
+    import_mode: str = "semi_automatic"
+    session_name: str = ""
+    source_config: dict = {}
+    options: dict = {}
+
+class _ImportMappingItem(BaseModel):
+    source_column: str
+    target_field: Optional[str] = None
+    transform_type: str = "direct"
+    transform_config_json: dict = {}
+    required: bool = False
+    default_value: Optional[str] = None
+    sort_order: int = 0
+
+class _ImportMappingsSave(BaseModel):
+    mappings: List[_ImportMappingItem]
+
+class _ImportApproveRequest(BaseModel):
+    confirmation: str  # must equal "Potvrzuji import dat do {target_table}"
+
+def _import_db_conn():
+    import psycopg2
+    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+    if not db_url:
+        raise HTTPException(status_code=500, detail="DATABASE_URL not set")
+    return psycopg2.connect(db_url)
+
+
+@app.get("/import/sessions")
+async def import_list_sessions(
+    status: Optional[str] = None,
+    target_table: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    tenant_id: int = 1,
+):
+    """List import sessions for a tenant."""
+    from data_importer import list_sessions as _list_sessions
+    conn = _import_db_conn()
+    try:
+        return _list_sessions(conn, tenant_id=tenant_id, status=status,
+                               target_table=target_table, limit=limit, offset=offset)
+    finally:
+        conn.close()
+
+
+@app.post("/import/sessions")
+async def import_create_session(body: _ImportSessionCreate, tenant_id: int = 1,
+                                 user_id: Optional[int] = None):
+    """Create a new import session."""
+    from data_importer import create_session as _create_session
+    conn = _import_db_conn()
+    try:
+        session = _create_session(
+            conn,
+            tenant_id=tenant_id,
+            source_type=body.source_type,
+            target_table=body.target_table,
+            import_mode=body.import_mode,
+            session_name=body.session_name,
+            source_config=body.source_config,
+            options=body.options,
+            created_by=user_id,
+        )
+        conn.commit()
+        return session
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/import/sessions/{session_id}")
+async def import_get_session(session_id: str, tenant_id: int = 1):
+    """Get a single import session by ID."""
+    from data_importer import _get_session
+    conn = _import_db_conn()
+    try:
+        return _get_session(conn, session_id=session_id, tenant_id=tenant_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/import/sessions/{session_id}/upload")
+async def import_upload_file(
+    session_id: str,
+    file: UploadFile,
+    tenant_id: int = 1,
+    user_id: Optional[int] = None,
+):
+    """Upload and parse a source file (CSV, Excel, JSON). Loads raw rows into import_staging."""
+    from data_importer import upload_and_parse as _upload_and_parse, ParseError
+    conn = _import_db_conn()
+    try:
+        data = await file.read()
+        session = _upload_and_parse(
+            conn,
+            session_id=session_id,
+            tenant_id=tenant_id,
+            file_data=data,
+            filename=file.filename or "upload",
+            actor_user_id=user_id,
+        )
+        return session
+    except ParseError as e:
+        conn.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.put("/import/sessions/{session_id}/mappings")
+async def import_save_mappings(
+    session_id: str,
+    body: _ImportMappingsSave,
+    tenant_id: int = 1,
+    user_id: Optional[int] = None,
+):
+    """Save field mappings and re-apply transforms to all staging rows."""
+    from data_importer import save_mappings as _save_mappings, MappingError
+    conn = _import_db_conn()
+    try:
+        session = _save_mappings(
+            conn,
+            session_id=session_id,
+            tenant_id=tenant_id,
+            mappings=[m.dict() for m in body.mappings],
+            actor_user_id=user_id,
+        )
+        return session
+    except MappingError as e:
+        conn.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/import/sessions/{session_id}/validate")
+async def import_validate(
+    session_id: str,
+    tenant_id: int = 1,
+    user_id: Optional[int] = None,
+):
+    """Run validation on all staged rows and set session to preview_ready."""
+    from data_importer import validate as _validate
+    conn = _import_db_conn()
+    try:
+        session = _validate(conn, session_id=session_id, tenant_id=tenant_id,
+                             actor_user_id=user_id)
+        return session
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/import/sessions/{session_id}/preview")
+async def import_preview(
+    session_id: str,
+    tenant_id: int = 1,
+    page: int = 1,
+    page_size: int = 50,
+    filter_status: Optional[str] = None,
+):
+    """Return a paginated preview of staging rows."""
+    from data_importer import get_preview as _get_preview
+    conn = _import_db_conn()
+    try:
+        return _get_preview(conn, session_id=session_id, tenant_id=tenant_id,
+                             page=page, page_size=page_size, filter_status=filter_status)
+    finally:
+        conn.close()
+
+
+@app.post("/import/sessions/{session_id}/approve")
+async def import_approve(
+    session_id: str,
+    body: _ImportApproveRequest,
+    tenant_id: int = 1,
+    user_id: Optional[int] = None,
+):
+    """Approve a previewed import. Requires: confirmation='Potvrzuji import dat do {target_table}'"""
+    from data_importer import approve as _approve, _get_session
+    conn = _import_db_conn()
+    try:
+        session = _get_session(conn, session_id=session_id, tenant_id=tenant_id)
+        expected = f"Potvrzuji import dat do {session['target_table']}"
+        if body.confirmation != expected:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Confirmation phrase mismatch. Expected: \"{expected}\"",
+            )
+        result = _approve(conn, session_id=session_id, tenant_id=tenant_id,
+                           actor_user_id=user_id)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/import/sessions/{session_id}/apply")
+async def import_apply(
+    session_id: str,
+    tenant_id: int = 1,
+    user_id: Optional[int] = None,
+):
+    """Apply an approved import session to production tables. Only valid rows are written."""
+    from data_importer import apply_import as _apply_import, ApplyError
+    conn = _import_db_conn()
+    try:
+        session = _apply_import(conn, session_id=session_id, tenant_id=tenant_id,
+                                 actor_user_id=user_id)
+        return session
+    except ApplyError as e:
+        conn.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/import/sessions/{session_id}/rollback")
+async def import_rollback(
+    session_id: str,
+    tenant_id: int = 1,
+    user_id: Optional[int] = None,
+):
+    """Rollback a completed or partially-failed import. Deletes all inserted production rows."""
+    from data_importer import rollback_import as _rollback_import, RollbackError
+    conn = _import_db_conn()
+    try:
+        session = _rollback_import(conn, session_id=session_id, tenant_id=tenant_id,
+                                    actor_user_id=user_id)
+        return session
+    except RollbackError as e:
+        conn.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/import/sessions/{session_id}/audit")
+async def import_audit_log(
+    session_id: str,
+    tenant_id: int = 1,
+    limit: int = 100,
+):
+    """Return the full audit log for an import session."""
+    from data_importer import get_audit_log as _get_audit_log
+    conn = _import_db_conn()
+    try:
+        return _get_audit_log(conn, session_id=session_id, tenant_id=tenant_id, limit=limit)
+    finally:
+        conn.close()
+
+
+# ========== ACTIONS ==========
+
+
+# ========== ACTIONS ==========
+
+class ExecuteActionRequest(BaseModel):
+    action_code: str
+    args: dict = {}
+    tenant_id: int = 1
+    source: str = "api"
+    session_id: Optional[str] = None
+    lang: str = "en"
+    confirmed: bool = False
+    confirmation_token: Optional[str] = None
+
+@app.post("/actions/execute")
+async def api_execute_action(
+    req: ExecuteActionRequest,
+    user_id: int = Query(default=1),
+    conn=Depends(get_db),
+):
+    """Universal action executor. Manual UI, voice, API and automation all call this."""
+    result = await execute_action(
+        action_code=req.action_code,
+        args=req.args,
+        conn=conn,
+        tenant_id=req.tenant_id,
+        user_id=user_id,
+        source=req.source,
+        session_id=req.session_id,
+        lang=req.lang,
+        confirmed=req.confirmed,
+        confirmation_token=req.confirmation_token,
+    )
+    return {
+        "ok": result.ok,
+        "reply": result.reply,
+        "action_type": result.action_type,
+        "action_data": result.action_data,
+        "requires_confirmation": result.requires_confirmation,
+        "confirmation_token": result.confirmation_token,
+        "error": result.error,
+    }
+
+@app.get("/actions/registered")
+async def api_get_registered_actions():
+    return {"actions": get_registered_actions()}
+
+
+# ========== VOICE RESOLVE ==========
+
+class VoiceResolveRequest(BaseModel):
+    text: str
+    tenant_id: int = 1
+    user_id: int = 1
+    lang: str = "en"
+    session_id: Optional[str] = None
+
+@app.post("/voice/resolve")
+async def api_voice_resolve(req: VoiceResolveRequest, conn=Depends(get_db)):
+    """
+    Resolve a voice utterance to control_code + action_code.
+    Resolution order: screen context -> exact synonym -> entity alias
+    -> embedding -> AI -> clarification.
+    Does NOT execute the action.
+    """
+    openai_key = os.getenv("OPENAI_API_KEY")
+    result = resolve_voice_command(
+        text=req.text,
+        conn=conn,
+        tenant_id=req.tenant_id,
+        user_id=req.user_id,
+        lang=req.lang,
+        session_id=req.session_id,
+        openai_api_key=openai_key,
+    )
+    return {
+        "resolved": result.resolved,
+        "control_code": result.control_code,
+        "action_code": result.action_code,
+        "confidence": result.confidence,
+        "resolution_method": result.resolution_method,
+        "requires_clarification": result.requires_clarification,
+        "clarification_question": result.clarification_question,
+        "candidates": result.candidates,
+        "args": result.args,
+        "risk_level": result.risk_level,
+        "error": result.error,
+    }
+
+class VoiceContextRequest(BaseModel):
+    tenant_id: int = 1
+    user_id: int = 1
+    screen_code: Optional[str] = None
+    module_name: Optional[str] = None
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    session_id: Optional[str] = None
+    extra: Optional[dict] = None
+
+@app.post("/voice/context")
+async def api_update_voice_context(req: VoiceContextRequest, conn=Depends(get_db)):
+    """Called by Android whenever user changes screen or selects an entity."""
+    update_voice_context(
+        conn=conn,
+        tenant_id=req.tenant_id,
+        user_id=req.user_id,
+        screen_code=req.screen_code,
+        module_name=req.module_name,
+        entity_type=req.entity_type,
+        entity_id=req.entity_id,
+        session_id=req.session_id,
+        extra=req.extra or {},
+    )
+    return {"ok": True}
+
+
+# ========== UI CONTROLS ==========
+
+@app.get("/ui/controls")
+async def api_get_screen_controls(
+    screen_code: str,
+    tenant_id: int = Query(default=1),
+    lang: str = Query(default="en"),
+    conn=Depends(get_db),
+):
+    """Returns all voice-enabled controls for a given screen."""
+    controls = get_screen_controls(conn, tenant_id, screen_code, lang)
+    return {
+        "screen_code": screen_code,
+        "lang": lang,
+        "controls": [
+            {
+                "control_code": c.control_code,
+                "label": c.label,
+                "action_code": c.action_code,
+                "risk_level": c.risk_level,
+                "voice_enabled": c.voice_enabled,
+                "example_phrases": c.example_phrases,
+                "short_help": c.short_help,
+            }
+            for c in controls
+        ],
+        "count": len(controls),
+    }
+
+@app.get("/ui/controls/registry")
+async def api_get_controls_registry(
+    tenant_id: int = Query(default=1),
+    module_name: Optional[str] = Query(default=None),
+    screen_code: Optional[str] = Query(default=None),
+    conn=Depends(get_db),
+):
+    """Return raw ui_control_registry rows for admin/debug."""
+    with conn.cursor() as cur:
+        filters = ["tenant_id IN (%s, 0)"]
+        params: list = [tenant_id]
+        if module_name:
+            filters.append("module_name = %s")
+            params.append(module_name)
+        if screen_code:
+            filters.append("screen_code = %s")
+            params.append(screen_code)
+        where = " AND ".join(filters)
+        cur.execute(
+            f"""SELECT control_code, screen_code, module_name, control_type,
+                       label, action_code, risk_level, voice_enabled, enabled
+                  FROM crm.ui_control_registry
+                 WHERE {where}
+                 ORDER BY tenant_id DESC, screen_code, sort_order""",
+            params,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"controls": rows, "count": len(rows)}
+
+
+# ========== SYNONYM MANAGEMENT ==========
+
+class SynonymApproveRequest(BaseModel):
+    suggestion_id: str
+    tenant_id: int = 1
+    user_id: int = 1
+
+@app.post("/synonyms/approve")
+async def api_approve_synonym(req: SynonymApproveRequest, conn=Depends(get_db)):
+    """Approve an AI-suggested synonym from the review queue."""
+    ok = approve_synonym(conn, req.tenant_id, req.suggestion_id, req.user_id)
+    return {"ok": ok}
+
+@app.post("/synonyms/reject")
+async def api_reject_synonym(
+    suggestion_id: str = Body(...),
+    tenant_id: int = Body(default=1),
+    user_id: int = Body(default=1),
+    note: Optional[str] = Body(default=None),
+    conn=Depends(get_db),
+):
+    """Reject an AI-suggested synonym."""
+    ok = reject_synonym(conn, tenant_id, suggestion_id, user_id, note)
+    return {"ok": ok}
+
+@app.get("/synonyms/pending")
+async def api_get_pending_synonyms(
+    tenant_id: int = Query(default=1),
+    target_code: Optional[str] = Query(default=None),
+    limit: int = Query(default=50),
+    conn=Depends(get_db),
+):
+    """Get AI suggestions waiting for admin review."""
+    with conn.cursor() as cur:
+        params: list = [tenant_id]
+        extra = ""
+        if target_code:
+            extra = "AND target_code = %s"
+            params.append(target_code)
+        params.append(limit)
+        cur.execute(
+            f"""SELECT id, suggestion_type, target_type, target_code,
+                       language_code, suggested_value, reason, confidence, created_at
+                  FROM crm.ai_suggestion_review_queue
+                 WHERE tenant_id = %s AND status = 'pending'
+                       {extra}
+                 ORDER BY created_at DESC
+                 LIMIT %s""",
+            params,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"suggestions": rows, "count": len(rows)}
+
+class GenerateSynonymsRequest(BaseModel):
+    control_code: str
+    tenant_id: int = 1
+    user_id: int = 1
+    language_codes: list = ["en", "cs", "pl"]
+
+@app.post("/synonyms/generate")
+async def api_generate_synonyms(req: GenerateSynonymsRequest, conn=Depends(get_db)):
+    """Queue AI synonym generation for a UI control. Drafts require admin approval."""
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+    job_id = generate_synonyms_for_control(
+        conn=conn,
+        tenant_id=req.tenant_id,
+        control_code=req.control_code,
+        language_codes=req.language_codes,
+        openai_api_key=openai_key,
+        user_id=req.user_id,
+    )
+    return {"ok": bool(job_id), "job_id": job_id}
+
+@app.post("/synonyms/embed")
+async def api_generate_embeddings(
+    control_code: str = Body(...),
+    tenant_id: int = Body(default=1),
+    conn=Depends(get_db),
+):
+    """Generate/refresh semantic embeddings for a control's synonyms."""
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+    count = generate_embeddings_for_control(conn, tenant_id, control_code, openai_key)
+    return {"ok": True, "embeddings_created": count}
+
+
+
+# ========== CONTACT VOICE ALIASES ==========
+
+@app.get("/contacts/{contact_id}/aliases")
+async def api_get_contact_aliases(
+    contact_id: int,
+    tenant_id: int = Query(default=1),
+    conn=Depends(get_db),
+):
+    """Return all voice aliases for a contact."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT id, alias_text, alias_type, language_code,
+                      confidence, source, is_active, created_at
+                 FROM crm.contact_voice_aliases
+                WHERE tenant_id = %s AND contact_id = %s
+                ORDER BY confidence DESC, created_at DESC""",
+            (tenant_id, contact_id),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"contact_id": contact_id, "aliases": rows, "count": len(rows)}
+
+
+class AliasAddRequest(BaseModel):
+    alias_text: str
+    alias_type: str = "user_defined"
+    language_code: Optional[str] = None
+    tenant_id: int = 1
+    contact_id: int
+
+
+@app.post("/contacts/aliases/add")
+async def api_add_contact_alias(req: AliasAddRequest, conn=Depends(get_db)):
+    """Manually add a voice alias for a contact (admin)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO crm.contact_voice_aliases
+                       (tenant_id, contact_id, language_code, alias_text,
+                        alias_type, source, confidence)
+                   VALUES (%s, %s, %s, %s, %s, 'admin_manual', 1.0)
+                   ON CONFLICT (tenant_id, contact_id, alias_text)
+                   DO UPDATE SET is_active = TRUE, alias_type = EXCLUDED.alias_type,
+                                 updated_at = now()
+                   RETURNING id""",
+                (req.tenant_id, req.contact_id, req.language_code,
+                 req.alias_text.lower().strip(), req.alias_type),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return {"ok": True, "id": str(row[0]) if row else None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/contacts/aliases/{alias_id}")
+async def api_delete_contact_alias(
+    alias_id: str,
+    tenant_id: int = Query(default=1),
+    conn=Depends(get_db),
+):
+    """Disable a contact alias."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE crm.contact_voice_aliases
+                  SET is_active = FALSE, updated_at = now()
+                WHERE id = %s AND tenant_id = %s""",
+            (alias_id, tenant_id),
+        )
+    conn.commit()
+    return {"ok": True}
+
+
+class AliasLearnRequest(BaseModel):
+    contact_id: int
+    alias_text: str
+    alias_type: str = "learned_from_voice"
+    language_code: Optional[str] = None
+    tenant_id: int = 1
+    user_id: int = 1
+    voice_session_id: Optional[str] = None
+    raw_text: Optional[str] = None
+    candidates: Optional[list] = None
+
+
+@app.post("/contacts/aliases/learn")
+async def api_learn_contact_alias(req: AliasLearnRequest, conn=Depends(get_db)):
+    """
+    Called after voice disambiguation: user confirmed which contact they meant.
+    Saves a learned_from_voice alias so next time resolves immediately.
+    """
+    ok = learn_contact_alias(
+        conn=conn,
+        tenant_id=req.tenant_id,
+        contact_id=req.contact_id,
+        alias_text=req.alias_text,
+        alias_type=req.alias_type,
+        language_code=req.language_code,
+        voice_session_id=req.voice_session_id,
+        user_id=req.user_id,
+        raw_text=req.raw_text,
+        candidates_json=req.candidates or [],
+    )
+    return {"ok": ok}
+
+
+@app.get("/contacts/aliases/search")
+async def api_search_contact_aliases(
+    q: str,
+    tenant_id: int = Query(default=1),
+    lang: str = Query(default="en"),
+    limit: int = Query(default=10),
+    conn=Depends(get_db),
+):
+    """
+    Search contacts by voice alias.
+    Returns candidates with disambiguation hints.
+    """
+    matches = _find_contacts_by_alias(conn, tenant_id, q, lang)
+    return {
+        "query": q,
+        "candidates": [
+            {
+                "contact_id": c["id"],
+                "display_name": c["display_name"],
+                "company_name": c.get("company_name"),
+                "matched_alias": c.get("matched_alias", q),
+                "match_confidence": float(c.get("match_confidence", 0.75)),
+                "disambiguation_hint": c.get("disambiguation_hint", ""),
+                "alias_type": c.get("alias_type", ""),
+            }
+            for c in matches[:limit]
+        ],
+        "count": len(matches[:limit]),
+    }
+
+
 # ========== SYSTEM ==========
 @app.get("/")
 async def root():
-    return {"app":"Secretary DesignLeaf","version":"1.2a","ai_configured":bool(OPENAI_API_KEY),"docs":"/docs"}
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT",8000))
-    uvicorn.run(app,host="0.0.0.0",port=port)
+    return {"service": "Secretary CRM", "status": "running"}
