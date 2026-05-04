@@ -10464,6 +10464,96 @@ async def health():
         return {"status":"ok","version":"1.2a","ai":bool(OPENAI_API_KEY)}
     except: return {"status":"error"}
 
+@app.get("/version")
+async def get_version():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT filename, applied_at FROM migration_log ORDER BY id DESC LIMIT 1")
+            m = cur.fetchone()
+        return {
+            "server_version": "1.2a",
+            "latest_migration": m["filename"] if m else None,
+            "applied_at": m["applied_at"].isoformat() if m and m["applied_at"] else None
+        }
+    except Exception as e:
+        return {"server_version": "1.2a", "error": str(e)}
+    finally:
+        release_conn(conn)
+
+@app.get("/tenant/profile")
+async def get_tenant_profile():
+    conn = get_db_conn()
+    tenant_id = 1
+    try:
+        with conn.cursor() as cur:
+            result = {"found": False, "tenant_id": tenant_id}
+            cur.execute("SELECT name, slug FROM tenants WHERE id=%s", (tenant_id,))
+            t = cur.fetchone()
+            if t:
+                result["tenant_name"] = t["name"]
+                result["tenant_slug"] = t["slug"]
+            cur.execute("SELECT workspace_mode, internal_language_mode, customer_language_mode, default_internal_language_code, default_customer_language_code, voice_input_strategy, voice_output_strategy, max_active_users FROM tenant_operating_profile WHERE tenant_id=%s", (tenant_id,))
+            op = cur.fetchone()
+            if op:
+                result["found"] = True
+                result["workspace_mode"] = op["workspace_mode"]
+                result["internal_language_mode"] = op["internal_language_mode"]
+                result["customer_language_mode"] = op["customer_language_mode"]
+                result["default_internal_lang"] = op["default_internal_language_code"]
+                result["default_customer_lang"] = op["default_customer_language_code"]
+                result["voice_input_strategy"] = op["voice_input_strategy"]
+                result["voice_output_strategy"] = op["voice_output_strategy"]
+                result["max_active_users"] = op["max_active_users"]
+            cur.execute("SELECT max_users, max_clients, max_jobs_per_month, max_voice_minutes FROM subscription_limits WHERE tenant_id=%s", (tenant_id,))
+            sl = cur.fetchone()
+            if sl:
+                result["limits"] = {
+                    "max_users": sl["max_users"],
+                    "max_clients": sl["max_clients"],
+                    "max_jobs_per_month": sl["max_jobs_per_month"],
+                    "max_voice_minutes": sl["max_voice_minutes"]
+                }
+            try:
+                cur.execute("SELECT company_name, contact_name, phone, default_location, industry_description, currency FROM crm.tenant_settings WHERE tenant_id=%s LIMIT 1", (tenant_id,))
+                ts = cur.fetchone()
+                if ts:
+                    result["company_name"] = ts["company_name"]
+                    result["contact_name"] = ts["contact_name"]
+                    result["phone"] = ts["phone"]
+                    result["currency"] = ts["currency"]
+                    result["location"] = ts["default_location"]
+                    result["industry"] = ts["industry_description"]
+            except Exception:
+                pass
+        return result
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+    finally:
+        release_conn(conn)
+
+@app.get("/tenant/languages")
+async def get_tenant_languages():
+    conn = get_db_conn()
+    tenant_id = 1
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT language_code, language_scope, is_default FROM tenant_languages WHERE tenant_id=%s AND is_active=true ORDER BY language_scope, sort_order",
+                (tenant_id,)
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        return {
+            "found": len(rows) > 0,
+            "languages": [{"code": r["language_code"], "scope": r["language_scope"], "is_default": r["is_default"]} for r in rows],
+            "internal_langs": [r["language_code"] for r in rows if r["language_scope"] == "internal"],
+            "customer_langs": [r["language_code"] for r in rows if r["language_scope"] == "customer"]
+        }
+    except Exception as e:
+        return {"found": False, "languages": [], "error": str(e)}
+    finally:
+        release_conn(conn)
+
 @app.get("/debug/test-ai")
 async def test_ai():
     if not ai_client: return {"status":"error","message":"OPENAI_API_KEY not set"}
