@@ -13095,7 +13095,7 @@ async def root():
 
 
 # ========== TEMP ADMIN BOOTSTRAP (REMOVE AFTER USE) ==========
-@app.get("/admin/users-list")
+@app.get("/bootstrap/users-list")
 async def admin_list_users(secret: str = ""):
     if secret != JWT_SECRET:
         raise HTTPException(403, "Forbidden")
@@ -13108,7 +13108,7 @@ async def admin_list_users(secret: str = ""):
     finally:
         release_conn(conn)
 
-@app.post("/admin/create-user")
+@app.post("/bootstrap/create-user")
 async def admin_create_user(data: dict, secret: str = ""):
     if secret != JWT_SECRET:
         raise HTTPException(403, "Forbidden")
