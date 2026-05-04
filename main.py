@@ -4,7 +4,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
 from urllib.parse import urlparse, urlencode
-from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, UploadFile, File, Form, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
