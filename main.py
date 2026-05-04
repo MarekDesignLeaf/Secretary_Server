@@ -2592,6 +2592,12 @@ def get_tenant_config(conn, tenant_id):
     config = {"tenant_id": tenant_id, "found": False}
     try:
         with conn.cursor() as cur:
+            # Basic tenant info from tenants table
+            cur.execute("SELECT name, slug FROM tenants WHERE id=%s", (tenant_id,))
+            t_row = cur.fetchone()
+            if t_row:
+                config["tenant_name"] = t_row["name"]
+                config["tenant_slug"] = t_row["slug"]
             cur.execute("SELECT * FROM tenant_operating_profile WHERE tenant_id=%s", (tenant_id,))
             profile = cur.fetchone()
             if profile:
@@ -2614,9 +2620,13 @@ def get_tenant_config(conn, tenant_id):
             cur.execute("SELECT * FROM subscription_limits WHERE tenant_id=%s", (tenant_id,))
             limits = cur.fetchone()
             config["limits"] = dict(limits) if limits else None
-            cur.execute("SELECT * FROM tenant_settings WHERE tenant_id=%s", (tenant_id,))
-            settings = cur.fetchone()
-            config["settings"] = dict(settings) if settings else None
+            # Try crm schema first (correct schema), fall back to public
+            try:
+                cur.execute("SELECT * FROM crm.tenant_settings WHERE tenant_id=%s", (tenant_id,))
+                settings = cur.fetchone()
+                config["settings"] = dict(settings) if settings else None
+            except Exception:
+                config["settings"] = None
     except Exception: pass
     _tenant_config_cache[tenant_id] = config
     return config
@@ -10079,7 +10089,9 @@ async def get_tenant_config_endpoint(tenant_id: int):
         _tenant_config_cache.pop(tenant_id, None)
         config = get_tenant_config(conn, tenant_id)
         if not config.get("found"):
-            raise HTTPException(404, "Tenant config not found. Run onboarding first.")
+            config["error"] = "Tenant config not found. Run onboarding first."
+            config["warnings"] = []
+            return config
         # Soft limit warnings
         warnings = []
         limits = config.get("limits")
