@@ -5870,6 +5870,8 @@ async def api_create_client(data: dict, request: Request):
                 },
             )
             conn.commit()
+        # Auto-sync to crm.contacts + generate voice aliases (non-critical)
+        _upsert_contact_for_client(conn, tid, cid, data)
         return {
             "id": cid,
             "client_code": code,
@@ -5935,6 +5937,21 @@ async def update_client(client_id: int, data: dict, request: Request):
                 source_channel="crm",
             )
             conn.commit()
+        # Sync contact fields to crm.contacts if any voice-relevant field changed
+        _CONTACT_SYNC_FIELDS = {"display_name","first_name","last_name","company_name",
+                                 "phone_primary","email_primary","is_commercial"}
+        if any(k in data for k in _CONTACT_SYNC_FIELDS):
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT * FROM clients WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL",
+                        (tid, client_id)
+                    )
+                    client_row = cur.fetchone()
+                if client_row:
+                    _upsert_contact_for_client(conn, tid, client_id, dict(client_row))
+            except Exception as _e:
+                print(f"[update_client] contact sync error (non-critical): {_e}")
         return {"status":"updated"}
     except HTTPException:
         conn.rollback()
@@ -6894,6 +6911,87 @@ async def delete_shared_contact(contact_id: int, request: Request):
         raise HTTPException(500, str(e))
     finally:
         release_conn(conn)
+
+# ===== CONTACT VOICE ALIAS SYNC =====
+
+def _upsert_contact_for_client(conn, tenant_id: int, client_id: int, client_data: dict):
+    """Upsert crm.contacts entry for a client and regenerate voice aliases.
+    Called after POST/PUT /crm/clients. Never raises — all errors are logged only.
+    Uses SELECT+INSERT/UPDATE pattern to avoid needing a UNIQUE constraint."""
+    import re as _re
+
+    def _norm_phone(v):
+        if not v:
+            return None
+        stripped = _re.sub(r'\D', '', str(v))
+        return stripped or None
+
+    def _norm_email(v):
+        if not v:
+            return None
+        return str(v).strip().lower() or None
+
+    display_name  = client_data.get("display_name") or client_data.get("company_name") or ""
+    first_name    = client_data.get("first_name")
+    last_name     = client_data.get("last_name")
+    company_name  = client_data.get("company_name")
+    phone_primary = client_data.get("phone_primary")
+    email_primary = client_data.get("email_primary")
+    is_company    = bool(client_data.get("is_commercial", False))
+    norm_phone    = _norm_phone(phone_primary)
+    norm_email    = _norm_email(email_primary)
+
+    try:
+        contact_uuid = None
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM crm.contacts WHERE tenant_id=%s AND source_client_id=%s",
+                (tenant_id, client_id)
+            )
+            row = cur.fetchone()
+            if row:
+                contact_uuid = row["id"]
+                cur.execute("""
+                    UPDATE crm.contacts
+                    SET display_name=%s, first_name=%s, last_name=%s,
+                        company_name=%s, phone_primary=%s, email_primary=%s,
+                        is_company=%s, normalized_phone=%s, normalized_email=%s,
+                        updated_at=now()
+                    WHERE id=%s
+                """, (
+                    display_name, first_name, last_name,
+                    company_name, phone_primary, email_primary,
+                    is_company, norm_phone, norm_email,
+                    contact_uuid
+                ))
+            else:
+                cur.execute("""
+                    INSERT INTO crm.contacts
+                        (tenant_id, source_client_id, display_name, first_name, last_name,
+                         company_name, phone_primary, email_primary, is_company,
+                         contact_role, normalized_phone, normalized_email)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'client', %s, %s)
+                    RETURNING id
+                """, (
+                    tenant_id, client_id,
+                    display_name, first_name, last_name,
+                    company_name, phone_primary, email_primary, is_company,
+                    norm_phone, norm_email
+                ))
+                contact_uuid = cur.fetchone()["id"]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT crm.generate_contact_aliases(%s, %s)",
+                (tenant_id, contact_uuid)
+            )
+        conn.commit()
+    except Exception as e:
+        print(f"[_upsert_contact_for_client] error (non-critical): {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
 
 # ===== CONTACTS TABLE MIGRATION =====
 
@@ -9977,6 +10075,8 @@ async def get_tenant_config_endpoint(tenant_id: int):
     conn = get_db_conn()
     try:
         verify_tenant(conn, tenant_id)
+        # Always bypass cache for direct config requests so app sees fresh data
+        _tenant_config_cache.pop(tenant_id, None)
         config = get_tenant_config(conn, tenant_id)
         if not config.get("found"):
             raise HTTPException(404, "Tenant config not found. Run onboarding first.")

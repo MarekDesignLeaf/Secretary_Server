@@ -1115,7 +1115,6 @@ def generate_embeddings_for_control(
                     "(tenant_id, control_code, language_code, source_text, "
                     " embedding_vector, source_type) "
                     "VALUES (%s, %s, %s, %s, %s::vector, 'synonym') "
-                    "ON CONFLICT (tenant_id, control_code, language_code, source_text) "
                     "DO UPDATE SET embedding_vector = EXCLUDED.embedding_vector",
                     (tenant_id, control_code, lang, text, vec_str),
                 )

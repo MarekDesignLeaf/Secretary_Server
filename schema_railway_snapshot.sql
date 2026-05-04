@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS clients (
     company_registration_no TEXT,
     vat_no TEXT,
     preferred_language_code TEXT,
+    preferred_language_name TEXT,
+    language_source TEXT,
+    language_confidence DECIMAL(3,2),
+    language_updated_at TIMESTAMPTZ,
     default_hourly_rate DECIMAL DEFAULT 0
 );
 
