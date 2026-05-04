@@ -10466,8 +10466,9 @@ async def health():
 
 @app.get("/version")
 async def get_version():
-    conn = get_db_conn()
+    conn = None
     try:
+        conn = get_db_conn()
         with conn.cursor() as cur:
             cur.execute("SELECT filename, applied_at FROM migration_log ORDER BY id DESC LIMIT 1")
             m = cur.fetchone()
@@ -10479,13 +10480,15 @@ async def get_version():
     except Exception as e:
         return {"server_version": "1.2a", "error": str(e)}
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 @app.get("/tenant/profile")
 async def get_tenant_profile():
-    conn = get_db_conn()
+    conn = None
     tenant_id = 1
     try:
+        conn = get_db_conn()
         with conn.cursor() as cur:
             result = {"found": False, "tenant_id": tenant_id}
             cur.execute("SELECT name, slug FROM tenants WHERE id=%s", (tenant_id,))
@@ -10530,13 +10533,15 @@ async def get_tenant_profile():
     except Exception as e:
         return {"found": False, "error": str(e)}
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 @app.get("/tenant/languages")
 async def get_tenant_languages():
-    conn = get_db_conn()
+    conn = None
     tenant_id = 1
     try:
+        conn = get_db_conn()
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT language_code, language_scope, is_default FROM tenant_languages WHERE tenant_id=%s AND is_active=true ORDER BY language_scope, sort_order",
@@ -10552,7 +10557,8 @@ async def get_tenant_languages():
     except Exception as e:
         return {"found": False, "languages": [], "error": str(e)}
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 @app.get("/debug/test-ai")
 async def test_ai():
