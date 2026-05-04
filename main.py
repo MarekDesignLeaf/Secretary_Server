@@ -10181,6 +10181,84 @@ async def get_industry_subtypes(group_id: int):
             return [dict(r) for r in cur.fetchall()]
     finally: release_conn(conn)
 
+@app.get("/onboarding/industries/{tenant_id}")
+async def get_tenant_industries(tenant_id: int):
+    """Return all selected industries + subtypes for a tenant (checkbox state)."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT tip.id, tip.industry_group_id, tip.industry_subtype_id, tip.is_primary,
+                                  ig.code as group_code, ig.name as group_name,
+                                  ist.code as subtype_code, ist.name as subtype_name
+                             FROM tenant_industry_profile tip
+                             LEFT JOIN industry_groups ig ON tip.industry_group_id = ig.id
+                             LEFT JOIN industry_subtypes ist ON tip.industry_subtype_id = ist.id
+                            WHERE tip.tenant_id = %s
+                            ORDER BY tip.is_primary DESC, ig.sort_order, ist.sort_order""", (tenant_id,))
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.post("/onboarding/industry/{tenant_id}")
+async def add_tenant_industry(tenant_id: int, data: dict):
+    """Add one industry+subtype combo for a tenant. Checkbox ON.
+    Idempotent — calling twice with same values is a no-op."""
+    gid = data.get("industry_group_id")
+    sid = data.get("industry_subtype_id")  # may be None
+    if not gid:
+        raise HTTPException(422, "industry_group_id required")
+    conn = get_db_conn()
+    try:
+        verify_tenant(conn, tenant_id)
+        with conn.cursor() as cur:
+            # Check for duplicate (handle NULL subtype explicitly — NULL != NULL in SQL)
+            if sid is not None:
+                cur.execute(
+                    "SELECT id FROM tenant_industry_profile WHERE tenant_id=%s AND industry_group_id=%s AND industry_subtype_id=%s",
+                    (tenant_id, gid, sid))
+            else:
+                cur.execute(
+                    "SELECT id FROM tenant_industry_profile WHERE tenant_id=%s AND industry_group_id=%s AND industry_subtype_id IS NULL",
+                    (tenant_id, gid))
+            if cur.fetchone():
+                return {"ok": True, "already_exists": True}
+            # First entry for this tenant becomes primary
+            cur.execute("SELECT COUNT(*) FROM tenant_industry_profile WHERE tenant_id=%s", (tenant_id,))
+            count = cur.fetchone()[0]
+            cur.execute("""INSERT INTO tenant_industry_profile
+                (tenant_id, industry_group_id, industry_subtype_id, is_primary)
+                VALUES (%s,%s,%s,%s)""",
+                (tenant_id, gid, sid, count == 0))
+        conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.delete("/onboarding/industry/{industry_id}")
+async def remove_tenant_industry(industry_id: int, tenant_id: int = Query(...)):
+    """Remove one industry+subtype combo. Checkbox OFF."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tenant_industry_profile WHERE id=%s AND tenant_id=%s RETURNING is_primary",
+                (industry_id, tenant_id))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Industry entry not found")
+            # If primary was removed, promote the next one
+            if row[0]:
+                cur.execute("""UPDATE tenant_industry_profile SET is_primary=true
+                    WHERE tenant_id=%s AND id=(SELECT id FROM tenant_industry_profile
+                        WHERE tenant_id=%s ORDER BY id LIMIT 1)""",
+                    (tenant_id, tenant_id))
+        conn.commit()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
 @app.get("/onboarding/status/{tenant_id}")
 async def get_onboarding_status(tenant_id: int):
     conn = get_db_conn()
@@ -10196,8 +10274,15 @@ async def get_onboarding_status(tenant_id: int):
             profile = cur.fetchone()
             cur.execute("SELECT language_code,language_scope,is_default FROM tenant_languages WHERE tenant_id=%s ORDER BY language_scope,sort_order",(tenant_id,))
             languages = [dict(r) for r in cur.fetchall()]
-            cur.execute("SELECT tip.*, ig.code as group_code, ig.name as group_name, ist.code as subtype_code, ist.name as subtype_name FROM tenant_industry_profile tip LEFT JOIN industry_groups ig ON tip.industry_group_id=ig.id LEFT JOIN industry_subtypes ist ON tip.industry_subtype_id=ist.id WHERE tip.tenant_id=%s",(tenant_id,))
-            industry = cur.fetchone()
+            cur.execute("""SELECT tip.id, tip.industry_group_id, tip.industry_subtype_id, tip.is_primary,
+                                  ig.code as group_code, ig.name as group_name,
+                                  ist.code as subtype_code, ist.name as subtype_name
+                             FROM tenant_industry_profile tip
+                             LEFT JOIN industry_groups ig ON tip.industry_group_id = ig.id
+                             LEFT JOIN industry_subtypes ist ON tip.industry_subtype_id = ist.id
+                            WHERE tip.tenant_id = %s
+                            ORDER BY tip.is_primary DESC, tip.id""", (tenant_id,))
+            industries = [dict(r) for r in cur.fetchall()]
             cur.execute("SELECT * FROM subscription_limits WHERE tenant_id=%s",(tenant_id,))
             limits = cur.fetchone()
             return {
@@ -10205,9 +10290,9 @@ async def get_onboarding_status(tenant_id: int):
                 "settings": dict(settings) if settings else None,
                 "operating_profile": dict(profile) if profile else None,
                 "languages": languages,
-                "industry": dict(industry) if industry else None,
+                "industries": industries,
                 "subscription_limits": dict(limits) if limits else None,
-                "is_complete": all([settings, profile, languages, industry, limits])
+                "is_complete": all([settings, profile, languages, bool(industries), limits])
             }
     finally: release_conn(conn)
 
@@ -10227,8 +10312,12 @@ async def company_setup(data: dict):
     if customer_language_mode not in VALID_LANGUAGE_MODES: errors.append(f"customer_language_mode must be one of {VALID_LANGUAGE_MODES}")
     default_internal_lang = data.get("default_internal_language_code","en")
     default_customer_lang = data.get("default_customer_language_code","en")
-    industry_group_id = data.get("industry_group_id")
-    industry_subtype_id = data.get("industry_subtype_id")
+    # industries: [{industry_group_id, industry_subtype_id}] — first entry is primary
+    # backward compat: accept old single industry_group_id/industry_subtype_id too
+    industries = data.get("industries", [])
+    if not industries and data.get("industry_group_id"):
+        industries = [{"industry_group_id": data["industry_group_id"],
+                       "industry_subtype_id": data.get("industry_subtype_id")}]
     max_active_users = data.get("max_active_users", WORKSPACE_DEFAULTS.get(workspace_mode,{}).get("max_users",1))
     tenant_id = data.get("tenant_id", 1)
     languages = data.get("languages", [])
@@ -10276,28 +10365,25 @@ async def company_setup(data: dict):
                     internal_language_mode=%s, customer_language_mode=%s,
                     default_internal_language_code=%s, default_customer_language_code=%s,
                     voice_input_strategy=%s, voice_output_strategy=%s,
-                    workspace_mode=%s, max_active_users=%s,
-                    industry_group_id=%s, industry_subtype_id=%s, updated_at=now()
+                    workspace_mode=%s, max_active_users=%s, updated_at=now()
                     WHERE tenant_id=%s""",
                     (internal_language_mode, customer_language_mode,
                      default_internal_lang, default_customer_lang,
                      data.get("voice_input_strategy","auto_detect"),
                      data.get("voice_output_strategy","customer_default"),
-                     workspace_mode, max_active_users,
-                     industry_group_id, industry_subtype_id, tenant_id))
+                     workspace_mode, max_active_users, tenant_id))
             else:
                 cur.execute("""INSERT INTO tenant_operating_profile
                     (tenant_id, internal_language_mode, customer_language_mode,
                      default_internal_language_code, default_customer_language_code,
                      voice_input_strategy, voice_output_strategy,
-                     workspace_mode, max_active_users, industry_group_id, industry_subtype_id)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                     workspace_mode, max_active_users)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (tenant_id, internal_language_mode, customer_language_mode,
                      default_internal_lang, default_customer_lang,
                      data.get("voice_input_strategy","auto_detect"),
                      data.get("voice_output_strategy","customer_default"),
-                     workspace_mode, max_active_users,
-                     industry_group_id, industry_subtype_id))
+                     workspace_mode, max_active_users))
 
             # 4. TENANT LANGUAGES (replace — delete old, insert new)
             if languages:
@@ -10310,19 +10396,19 @@ async def company_setup(data: dict):
                         (tenant_id, lang_entry.get("code","en"), lang_entry.get("scope","internal"),
                          lang_entry.get("is_default",False), i+1))
 
-            # 5. TENANT INDUSTRY PROFILE (upsert primary)
-            if industry_group_id:
-                cur.execute("SELECT id FROM tenant_industry_profile WHERE tenant_id=%s AND is_primary=true",(tenant_id,))
-                if cur.fetchone():
-                    cur.execute("""UPDATE tenant_industry_profile SET
-                        industry_group_id=%s, industry_subtype_id=%s, updated_at=now()
-                        WHERE tenant_id=%s AND is_primary=true""",
-                        (industry_group_id, industry_subtype_id, tenant_id))
-                else:
+            # 5. TENANT INDUSTRY PROFILE (replace all — multi-industry, checkbox style)
+            # Each entry = one group+subtype combo; first entry gets is_primary=true.
+            if industries:
+                cur.execute("DELETE FROM tenant_industry_profile WHERE tenant_id=%s", (tenant_id,))
+                for i, ind in enumerate(industries):
+                    gid = ind.get("industry_group_id")
+                    sid = ind.get("industry_subtype_id")  # may be None if no subtype selected
+                    if not gid:
+                        continue
                     cur.execute("""INSERT INTO tenant_industry_profile
                         (tenant_id, industry_group_id, industry_subtype_id, is_primary)
-                        VALUES (%s,%s,%s,true)""",
-                        (tenant_id, industry_group_id, industry_subtype_id))
+                        VALUES (%s,%s,%s,%s)""",
+                        (tenant_id, gid, sid, i == 0))
 
             # 6. SUBSCRIPTION LIMITS (upsert based on workspace_mode)
             ws = WORKSPACE_DEFAULTS.get(workspace_mode, WORKSPACE_DEFAULTS["solo"])
