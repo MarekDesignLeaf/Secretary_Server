@@ -2055,6 +2055,14 @@ def release_conn(conn):
         try: conn.close()
         except: pass
 
+def get_db():
+    """FastAPI Depends()-compatible generator that provides a pooled DB connection."""
+    conn = get_db_conn()
+    try:
+        yield conn
+    finally:
+        release_conn(conn)
+
 def _get_tenant_settings(conn, tenant_id: int) -> dict:
     """Return tenant_settings row as dict. Falls back to empty dict on error."""
     try:
