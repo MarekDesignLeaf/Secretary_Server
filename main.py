@@ -13092,3 +13092,49 @@ async def api_search_contact_aliases(
 @app.get("/")
 async def root():
     return {"service": "Secretary CRM", "status": "running"}
+
+
+# ========== TEMP ADMIN BOOTSTRAP (REMOVE AFTER USE) ==========
+@app.get("/admin/users-list")
+async def admin_list_users(secret: str = ""):
+    if secret != JWT_SECRET:
+        raise HTTPException(403, "Forbidden")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, email, display_name, role, is_active, deleted_at, tenant_id FROM crm.users ORDER BY id")
+            users = [dict(r) for r in cur.fetchall()]
+        return {"users": users, "count": len(users)}
+    finally:
+        release_conn(conn)
+
+@app.post("/admin/create-user")
+async def admin_create_user(data: dict, secret: str = ""):
+    if secret != JWT_SECRET:
+        raise HTTPException(403, "Forbidden")
+    import bcrypt
+    conn = get_db_conn()
+    try:
+        email = data.get("email", "").strip().lower()
+        display_name = data.get("display_name", "")
+        role = data.get("role", "worker")
+        password = data.get("password", "")
+        tenant_id = data.get("tenant_id", 1)
+        if not email or not password:
+            raise HTTPException(400, "email and password required")
+        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO crm.users (email, display_name, role, password_hash, is_active, tenant_id, first_login)
+                VALUES (%s, %s, %s, %s, true, %s, false)
+                ON CONFLICT (email) DO UPDATE SET
+                    deleted_at = NULL, is_active = true,
+                    display_name = EXCLUDED.display_name,
+                    role = EXCLUDED.role
+                RETURNING id, email, display_name, role
+            """, (email, display_name, role, pw_hash, tenant_id))
+            conn.commit()
+            user = dict(cur.fetchone())
+        return {"created": True, "user": user}
+    finally:
+        release_conn(conn)
