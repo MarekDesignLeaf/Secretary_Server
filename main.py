@@ -13254,3 +13254,8 @@ async def admin_create_user(data: dict, secret: str = ""):
         return {"created": True, "user": user}
     finally:
         release_conn(conn)
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
