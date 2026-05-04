@@ -6,3 +6,11 @@ venv/
 secretary_pro.db
 debug_network.py
 deploy.ps1
+# Utility scripts with hardcoded credentials — run locally only, never deploy
+check_and_fix_users.py
+setup_db.py
+# Local debug/snapshot files
+crm_schema_snapshot.txt
+*.bak
+schema_after.json
+commit_msg.txt

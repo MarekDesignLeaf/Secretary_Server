@@ -466,24 +466,24 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE TABLE IF NOT EXISTS client_notes (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    client_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'Marek',
+    client_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'system',
     created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS job_notes (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    job_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'Marek',
+    job_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'system',
     note_type TEXT DEFAULT 'general', tenant_id INT NOT NULL DEFAULT 1,
     updated_at TIMESTAMPTZ DEFAULT now(), created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS task_history (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     task_id TEXT NOT NULL, field_name TEXT NOT NULL, old_value TEXT, new_value TEXT,
-    changed_by TEXT DEFAULT 'Marek', changed_at TIMESTAMPTZ DEFAULT now()
+    changed_by TEXT DEFAULT 'system', changed_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS activity_timeline (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL,
-    description TEXT NOT NULL, user_name TEXT DEFAULT 'Marek',
+    description TEXT NOT NULL, user_name TEXT DEFAULT 'system',
     source_channel TEXT,
     details_json JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ DEFAULT now()
@@ -493,7 +493,7 @@ CREATE TABLE IF NOT EXISTS photos (
     entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
     filename TEXT NOT NULL, description TEXT, photo_type TEXT DEFAULT 'general',
     file_path TEXT, thumbnail_base64 TEXT, tenant_id INT NOT NULL DEFAULT 1,
-    created_by TEXT DEFAULT 'Marek', created_at TIMESTAMPTZ DEFAULT now()
+    created_by TEXT DEFAULT 'system', created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS work_reports (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1986,30 +1986,9 @@ def init_pool():
             db_pool.putconn(conn_perm)
             print("Permissions seeded")
         except Exception as e: print(f"Permission seed: {e}")
-        # Seed default service rates
-        try:
-            conn3 = db_pool.getconn()
-            with conn3.cursor() as cur:
-                cur.execute("SET search_path TO crm, public")
-                for rt, rate, desc in [
-                    ("garden_maintenance", 27, "Garden maintenance: cleaning, weeding, planting, grass strimming"),
-                    ("hedge_trimming", 31, "Hedge trimming & pruning"),
-                    ("arborist_works", 34, "Arboristic works, tree surgeon"),
-                    ("hourly_rate", 27, "Default hourly rate"),
-                    ("hourly_cost", 15, "Internal hourly cost"),
-                    ("garden_waste_bulkbag", 55, "Garden waste bulk bag"),
-                    ("minimum_charge", 150, "Minimum charge per job"),
-                ]:
-                    cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, description, updated_at)
-                        VALUES (1, %s, %s, %s, now())
-                        ON CONFLICT (tenant_id, rate_type) DO UPDATE SET
-                            rate = EXCLUDED.rate,
-                            description = EXCLUDED.description,
-                            updated_at = now()""", (rt, rate, desc))
-                conn3.commit()
-            db_pool.putconn(conn3)
-            print("Service rates seeded")
-        except Exception as e: print(f"Rate seed: {e}")
+        # NOTE: Service rates are NOT seeded on startup.
+        # They must be configured per tenant via the settings UI or onboarding flow.
+        # Hardcoded landscaping rates were removed — do not re-add them here.
         try:
             conn_sections = db_pool.getconn()
             with conn_sections.cursor() as cur:
@@ -4737,7 +4716,7 @@ async def process_message(msg: MessageRequest, request: Request):
                 with conn.cursor() as cur:
                     cur.execute("SELECT display_name,email_primary,phone_primary FROM clients WHERE id=%s", (msg.context_entity_id,))
                     r = cur.fetchone()
-                    if r: entity_ctx = f"Marek se diva na klienta: {r['display_name']}"
+                    if r: entity_ctx = f"Aktualni klient: {r['display_name']}"
             finally: release_conn(conn)
 
         tenant_id = get_request_tenant_id(request)
@@ -6130,7 +6109,7 @@ async def add_client_note(client_id: int, data: dict):
     try:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO client_notes (client_id,note,created_by) VALUES (%s,%s,%s) RETURNING id,note,created_by,created_at::text",
-                (client_id,data.get("note",""),data.get("created_by","Marek")))
+                (client_id,data.get("note",""),data.get("created_by","system")))
             note = dict(cur.fetchone())
             log_activity(conn,"client",client_id,"note",f"Poznamka: {data.get('note','')[:50]}")
             conn.commit()
@@ -8208,7 +8187,7 @@ async def add_photo(data: dict):
             cur.execute("""INSERT INTO photos (entity_type,entity_id,filename,description,file_path,thumbnail_base64,created_by,tenant_id)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,1) RETURNING id,filename,created_at::text""",
                 (data.get("entity_type","job"),data.get("entity_id","0"),data.get("filename","photo.jpg"),
-                 data.get("description"),data.get("file_path"),data.get("thumbnail_base64"),data.get("created_by","Marek")))
+                 data.get("description"),data.get("file_path"),data.get("thumbnail_base64"),data.get("created_by","system")))
             photo = dict(cur.fetchone())
             log_activity(conn,data.get("entity_type","job"),str(data.get("entity_id","0")),"photo",f"Foto: {data.get('filename','')}")
             conn.commit()
