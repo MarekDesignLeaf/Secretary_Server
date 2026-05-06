@@ -336,31 +336,308 @@ ROLE_PERMISSION_DEFAULTS = {
 
 ALL_PERMISSION_CODES = [p["permission_code"] for p in PERMISSION_DEFINITIONS]
 
-CLIENT_SERVICE_RATE_KEYS = [
-    "garden_maintenance",
-    "hedge_trimming",
-    "arborist_works",
-    "hourly_rate",
-    "garden_waste_bulkbag",
-    "minimum_charge",
-]
-
-VISIBLE_CLIENT_SERVICE_RATE_KEYS = [
-    "garden_maintenance",
-    "hedge_trimming",
-    "arborist_works",
-    "garden_waste_bulkbag",
-    "minimum_charge",
-]
-
-SERVICE_RATE_DEFAULTS = {
-    "garden_maintenance": 27.0,
-    "hedge_trimming": 31.0,
-    "arborist_works": 34.0,
-    "hourly_rate": 27.0,
-    "garden_waste_bulkbag": 55.0,
-    "minimum_charge": 150.0,
+# Built-in rate types seeded for new tenants. Keys are permanent codes; values = (display_name, default_rate, sort_order).
+BUILTIN_SERVICE_RATES = {
+    "hourly_rate":          ("Hourly rate",           0.0,  10),
+    "minimum_charge":       ("Minimum charge",        0.0,  20),
 }
+
+# Fallback rates used only when tenant has no rates configured at all (pre-migration safety net).
+SERVICE_RATE_DEFAULTS = {
+    "hourly_rate":    0.0,
+    "minimum_charge": 0.0,
+}
+
+def get_tenant_rate_types(conn, tid) -> list:
+    """Return all rate_type codes defined for this tenant, ordered by sort_order."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT rate_type FROM tenant_default_rates WHERE tenant_id=%s ORDER BY sort_order, id",
+            (tid,)
+        )
+        rows = cur.fetchall()
+    return [r["rate_type"] for r in rows]
+
+def seed_industry_catalog(conn):
+    """Idempotently seed all industry groups and subtypes. Safe to run on every startup."""
+    with conn.cursor() as cur:
+        # Groups — upsert so names/sort can be updated in future deploys
+        cur.execute("""
+            INSERT INTO industry_groups (code, name, sort_order, is_active) VALUES
+            ('trades','Trades and field services',10,true),
+            ('construction','Construction and building',20,true),
+            ('property','Property management',30,true),
+            ('real_estate','Real estate and lettings',40,true),
+            ('cleaning','Cleaning services',50,true),
+            ('automotive','Automotive services',60,true),
+            ('logistics','Logistics and transport',70,true),
+            ('beauty','Beauty and personal care',80,true),
+            ('healthcare','Healthcare and wellbeing',90,true),
+            ('fitness','Fitness and coaching',100,true),
+            ('hospitality','Hospitality and food service',110,true),
+            ('events','Events and entertainment',120,true),
+            ('education','Education and training',130,true),
+            ('it_tech','IT and technology',140,true),
+            ('retail','Retail and e-commerce',150,true),
+            ('security','Security services',160,true),
+            ('agriculture','Agriculture and farming',170,true),
+            ('other','Other / General business',999,true)
+            ON CONFLICT (code) DO UPDATE SET
+                name=EXCLUDED.name, sort_order=EXCLUDED.sort_order, is_active=true
+        """)
+        # Subtypes — DO NOTHING so user edits are preserved
+        subtypes = [
+            # trades
+            ('trades','landscaping','Landscaping and garden services',10),
+            ('trades','grounds_maintenance','Grounds and parks maintenance',20),
+            ('trades','tree_surgery','Tree surgery and arboriculture',30),
+            ('trades','fencing','Fencing and gate installation',40),
+            ('trades','drainage_groundworks','Drainage and groundworks',50),
+            ('trades','paving_patios','Paving, patios and driveways',60),
+            ('trades','building_maintenance','Building maintenance and repairs',70),
+            ('trades','painting_decorating','Painting and decorating',80),
+            ('trades','electrical','Electrical installations and repairs',90),
+            ('trades','plumbing_heating','Plumbing and heating',100),
+            ('trades','gas_boilers','Gas services and boiler installation',110),
+            ('trades','hvac','HVAC (air conditioning and ventilation)',120),
+            ('trades','carpentry_joinery','Carpentry and joinery',130),
+            ('trades','roofing_guttering','Roofing and guttering',140),
+            ('trades','flooring_tiling','Flooring and tiling',150),
+            ('trades','glazing_windows','Glazing and window fitting',160),
+            ('trades','pest_control','Pest control and prevention',170),
+            ('trades','locksmith','Locksmith services',180),
+            ('trades','solar_energy','Solar panels and renewable energy',190),
+            ('trades','scaffolding','Scaffolding erection and hire',200),
+            ('trades','pool_maintenance','Pool and hot tub maintenance',210),
+            ('trades','pressure_washing','Pressure washing and exterior cleaning',220),
+            ('trades','waste_removal','Waste removal and skip hire',230),
+            ('trades','handyman','Handyman and general maintenance',240),
+            ('trades','security_systems','Security alarms and camera installation',250),
+            # construction
+            ('construction','new_build','New build residential',10),
+            ('construction','extensions_conversions','Extensions and conversions',20),
+            ('construction','commercial_fit_out','Commercial fit-out and refurbishment',30),
+            ('construction','structural_works','Structural engineering and steelwork',40),
+            ('construction','groundworks_civil','Groundworks and civil engineering',50),
+            ('construction','demolition','Demolition and site clearance',60),
+            ('construction','dry_lining_plastering','Dry lining and plastering',70),
+            ('construction','bricklaying_masonry','Bricklaying and masonry',80),
+            ('construction','project_management','Construction project management',90),
+            # property
+            ('property','hmo_management','HMO property management',10),
+            ('property','residential_management','Residential property management',20),
+            ('property','commercial_management','Commercial property management',30),
+            ('property','block_management','Block and estate management',40),
+            ('property','facilities_management','Facilities management',50),
+            ('property','short_term_lets','Short-term let management (Airbnb)',60),
+            ('property','void_management','Void property management',70),
+            ('property','property_maintenance','General property maintenance',80),
+            ('property','renovation_project_management','Renovation project management',90),
+            ('property','student_accommodation','Student accommodation management',100),
+            # real_estate
+            ('real_estate','lettings_coordination','Lettings coordination and management',10),
+            ('real_estate','residential_sales','Residential property sales',20),
+            ('real_estate','commercial_lettings','Commercial lettings and sales',30),
+            ('real_estate','land_development','Land and new development sales',40),
+            ('real_estate','property_valuation','Property valuation and surveys',50),
+            ('real_estate','investment_consultancy','Property investment consultancy',60),
+            ('real_estate','mortgage_brokering','Mortgage and financial brokering',70),
+            # cleaning
+            ('cleaning','domestic_cleaning','Domestic regular cleaning',10),
+            ('cleaning','commercial_cleaning','Commercial and office cleaning',20),
+            ('cleaning','end_of_tenancy','End of tenancy cleaning',30),
+            ('cleaning','deep_cleaning','Deep cleaning and sanitisation',40),
+            ('cleaning','window_cleaning','Window cleaning',50),
+            ('cleaning','carpet_upholstery','Carpet and upholstery cleaning',60),
+            ('cleaning','oven_appliance','Oven and appliance cleaning',70),
+            ('cleaning','industrial_cleaning','Industrial and factory cleaning',80),
+            ('cleaning','biohazard_specialist','Specialist and biohazard cleaning',90),
+            ('cleaning','after_builders','After-builders cleaning',100),
+            ('cleaning','pressure_cleaning','Pressure washing and jet washing',110),
+            # automotive
+            ('automotive','vehicle_repairs','Vehicle repairs and servicing',10),
+            ('automotive','mot_testing','MOT testing and inspection',20),
+            ('automotive','body_repairs','Bodywork, paint and panel repairs',30),
+            ('automotive','tyres_wheels','Tyres and wheel alignment',40),
+            ('automotive','vehicle_valeting','Vehicle valeting and detailing',50),
+            ('automotive','mobile_mechanic','Mobile mechanic',60),
+            ('automotive','breakdown_recovery','Breakdown recovery and towing',70),
+            ('automotive','car_sales','Car sales and brokerage',80),
+            ('automotive','fleet_management','Fleet management and maintenance',90),
+            ('automotive','vehicle_diagnostics','Diagnostics and ECU tuning',100),
+            ('automotive','auto_electrics','Auto electrics and audio installation',110),
+            # logistics
+            ('logistics','courier_delivery','Courier and parcel delivery',10),
+            ('logistics','removals_storage','House and office removals',20),
+            ('logistics','man_and_van','Man and van services',30),
+            ('logistics','taxi_private_hire','Taxi and private hire',40),
+            ('logistics','haulage_freight','Haulage and freight transport',50),
+            ('logistics','warehousing','Warehousing and fulfilment',60),
+            ('logistics','same_day_delivery','Same-day and express delivery',70),
+            # beauty
+            ('beauty','hairdressing','Hairdressing and barbering',10),
+            ('beauty','beauty_therapy','Beauty therapy and facials',20),
+            ('beauty','nail_technician','Nail technician',30),
+            ('beauty','massage_therapy','Massage therapy and bodywork',40),
+            ('beauty','lash_brow','Lash and brow technician',50),
+            ('beauty','aesthetics','Aesthetic treatments and injectables',60),
+            ('beauty','permanent_makeup','Permanent makeup and microblading',70),
+            ('beauty','spray_tanning','Spray tanning and bronzing',80),
+            ('beauty','mobile_beauty','Mobile beauty services',90),
+            ('beauty','hair_extensions','Hair extensions',100),
+            ('beauty','makeup_artistry','Makeup artistry and bridal',110),
+            # healthcare
+            ('healthcare','physiotherapy','Physiotherapy and sports rehab',10),
+            ('healthcare','mental_health','Mental health and counselling',20),
+            ('healthcare','private_gp','Private GP and medical consultations',30),
+            ('healthcare','dentistry','Dentistry and oral health',40),
+            ('healthcare','optometry','Optometry and eyecare',50),
+            ('healthcare','nutrition_dietetics','Nutrition and dietetics',60),
+            ('healthcare','osteopathy','Osteopathy and chiropractic',70),
+            ('healthcare','podiatry','Podiatry and chiropody',80),
+            ('healthcare','home_nursing','Home nursing and domiciliary care',90),
+            ('healthcare','occupational_therapy','Occupational therapy',100),
+            ('healthcare','acupuncture','Acupuncture and complementary therapy',110),
+            ('healthcare','veterinary','Veterinary services',120),
+            # fitness
+            ('fitness','personal_training','Personal training',10),
+            ('fitness','group_fitness','Group fitness classes',20),
+            ('fitness','yoga_pilates','Yoga and Pilates instruction',30),
+            ('fitness','sports_coaching','Sports coaching and development',40),
+            ('fitness','online_coaching','Online fitness and wellness coaching',50),
+            ('fitness','nutrition_coaching','Nutritional coaching',60),
+            ('fitness','gym_studio','Gym and studio management',70),
+            ('fitness','swimming_coaching','Swimming instruction and coaching',80),
+            ('fitness','martial_arts','Martial arts and self-defence',90),
+            # hospitality
+            ('hospitality','restaurant_catering','Restaurant and dining',10),
+            ('hospitality','cafe_coffee','Cafe and coffee shop',20),
+            ('hospitality','takeaway_delivery','Takeaway and food delivery',30),
+            ('hospitality','bar_pub','Bar, pub and club management',40),
+            ('hospitality','hotel_bnb','Hotel, B&B and serviced accommodation',50),
+            ('hospitality','event_catering','Event and mobile catering',60),
+            ('hospitality','private_chef','Private chef and personal catering',70),
+            ('hospitality','food_production','Food production and meal prep',80),
+            # events
+            ('events','event_planning','Event planning and coordination',10),
+            ('events','wedding_services','Wedding services',20),
+            ('events','photography_video','Photography and videography',30),
+            ('events','entertainment','Entertainment, DJs and performers',40),
+            ('events','av_technical','AV and technical production',50),
+            ('events','venue_management','Venue hire and management',60),
+            ('events','marquee_equipment','Marquee and equipment hire',70),
+            ('events','floristry','Floristry and event decor',80),
+            ('events','events_catering','Events catering and bar staff',90),
+            ('events','photobooth_hire','Photo booth and prop hire',100),
+            # education
+            ('education','private_tutoring','Private tutoring (school subjects)',10),
+            ('education','music_tuition','Music tuition and instrument lessons',20),
+            ('education','driving_instruction','Driving instruction and theory coaching',30),
+            ('education','language_teaching','Language teaching and translation',40),
+            ('education','corporate_training','Corporate and professional training',50),
+            ('education','vocational_courses','Vocational and trade courses',60),
+            ('education','online_courses','Online courses and digital learning',70),
+            ('education','childcare_education','Childcare and early years education',80),
+            ('education','arts_creative','Arts, crafts and creative workshops',90),
+            ('education','sports_instruction','Sports instruction and coaching',100),
+            # it_tech
+            ('it_tech','it_support','IT support and helpdesk',10),
+            ('it_tech','web_development','Website development and design',20),
+            ('it_tech','software_development','Software and app development',30),
+            ('it_tech','network_infrastructure','Network setup and infrastructure',40),
+            ('it_tech','cybersecurity','Cybersecurity and data protection',50),
+            ('it_tech','cloud_services','Cloud migration and managed services',60),
+            ('it_tech','digital_marketing','Digital marketing and SEO',70),
+            ('it_tech','graphic_design','Graphic design and branding',80),
+            ('it_tech','data_analytics','Data analytics and reporting',90),
+            ('it_tech','ecommerce','E-commerce setup and management',100),
+            # retail
+            ('retail','physical_retail','Physical retail store',10),
+            ('retail','online_retail','Online shop and marketplace',20),
+            ('retail','wholesale','Wholesale and distribution',30),
+            ('retail','market_stall','Market stall and pop-up retail',40),
+            ('retail','specialist_retail','Specialist and trade retail',50),
+            # security
+            ('security','manned_guarding','Manned guarding and security officers',10),
+            ('security','door_supervision','Door supervision and event security',20),
+            ('security','cctv_monitoring','CCTV monitoring and installation',30),
+            ('security','alarm_response','Alarm response and key holding',40),
+            ('security','retail_security','Retail loss prevention',50),
+            ('security','mobile_patrol','Mobile patrols and inspections',60),
+            # agriculture
+            ('agriculture','arable_farming','Arable and crop farming',10),
+            ('agriculture','livestock_farming','Livestock and animal husbandry',20),
+            ('agriculture','horticulture','Horticulture and market gardening',30),
+            ('agriculture','equestrian','Equestrian services and livery',40),
+            ('agriculture','land_management','Land and estate management',50),
+            ('agriculture','agricultural_contracting','Agricultural contracting',60),
+            ('agriculture','forestry','Forestry and woodland management',70),
+        ]
+        for group_code, sub_code, sub_name, sort_order in subtypes:
+            cur.execute("""
+                INSERT INTO industry_subtypes (industry_group_id, code, name, sort_order, is_active)
+                SELECT g.id, %s, %s, %s, true FROM industry_groups g WHERE g.code=%s
+                ON CONFLICT (industry_group_id, code) DO NOTHING
+            """, (sub_code, sub_name, sort_order, group_code))
+        cur.execute("""
+            INSERT INTO migration_log (filename) VALUES ('2026_05_05_industry_catalog_019.sql')
+            ON CONFLICT (filename) DO NOTHING
+        """)
+    conn.commit()
+
+
+def seed_activity_templates(conn):
+    """Create activity_templates and tenant_activity_pricing tables, then run migration 020 SQL if not yet applied."""
+    import os
+    with conn.cursor() as cur:
+        # Check if migration already applied
+        cur.execute("SELECT 1 FROM migration_log WHERE filename='2026_05_06_activity_templates_020.sql'")
+        if cur.fetchone():
+            return
+
+        # Run the migration SQL file
+        migration_path = os.path.join(os.path.dirname(__file__), "migrations", "2026_05_06_activity_templates_020.sql")
+        if not os.path.exists(migration_path):
+            print(f"WARN: migration 020 not found at {migration_path}")
+            return
+
+        with open(migration_path, encoding="utf-8") as f:
+            sql = f.read()
+
+        # psycopg2 can't execute multiple statements with execute() when they include
+        # DDL + DML inside a BEGIN/COMMIT block — split and run statement by statement.
+        # We handle the transaction ourselves.
+        cur.execute("SAVEPOINT before_020")
+        try:
+            # Strip outer BEGIN/COMMIT and run body
+            body = sql
+            body = body.replace("BEGIN;", "").replace("COMMIT;", "")
+            # Split on semicolons, skip empty
+            statements = [s.strip() for s in body.split(";") if s.strip()]
+            for stmt in statements:
+                cur.execute(stmt)
+            conn.commit()
+            print("Migration 020 applied: activity_templates seeded")
+        except Exception as e:
+            cur.execute("ROLLBACK TO SAVEPOINT before_020")
+            conn.commit()
+            print(f"Migration 020 FAILED: {e}")
+
+
+def seed_builtin_rates_if_empty(conn, tid):
+    """Seed built-in rate types for a tenant that has none yet (idempotent)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM tenant_default_rates WHERE tenant_id=%s", (tid,))
+        if cur.fetchone()[0] > 0:
+            return
+        for i, (rtype, (display_name, default_rate, sort_order)) in enumerate(BUILTIN_SERVICE_RATES.items()):
+            cur.execute(
+                """INSERT INTO tenant_default_rates
+                   (tenant_id, rate_type, rate, description, is_builtin, sort_order)
+                   VALUES (%s,%s,%s,%s,true,%s)
+                   ON CONFLICT (tenant_id, rate_type) DO NOTHING""",
+                (tid, rtype, default_rate, display_name, sort_order)
+            )
 
 DEFAULT_CONTACT_SECTIONS = [
     ("client",                  "Klienti",                    10),
@@ -562,10 +839,14 @@ CREATE TABLE IF NOT EXISTS tenant_default_rates (
     rate DECIMAL NOT NULL DEFAULT 0,
     currency TEXT DEFAULT 'GBP',
     description TEXT,
+    is_builtin BOOLEAN NOT NULL DEFAULT false,
+    sort_order INT NOT NULL DEFAULT 100,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     CONSTRAINT uq_tenant_default_rates UNIQUE (tenant_id, rate_type)
 );
+ALTER TABLE crm.tenant_default_rates ADD COLUMN IF NOT EXISTS is_builtin BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE crm.tenant_default_rates ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 100;
 CREATE TABLE IF NOT EXISTS user_contact_sync (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id INT NOT NULL DEFAULT 1,
@@ -2006,6 +2287,22 @@ def init_pool():
             db_pool.putconn(conn_sections)
             print("Contact sections seeded")
         except Exception as e: print(f"Contact section seed: {e}")
+        try:
+            conn_ind = db_pool.getconn()
+            with conn_ind.cursor() as cur:
+                cur.execute("SET search_path TO crm, public")
+            seed_industry_catalog(conn_ind)
+            db_pool.putconn(conn_ind)
+            print("Industry catalog seeded")
+        except Exception as e: print(f"Industry catalog seed: {e}")
+        try:
+            conn_act = db_pool.getconn()
+            with conn_act.cursor() as cur:
+                cur.execute("SET search_path TO crm, public")
+            seed_activity_templates(conn_act)
+            db_pool.putconn(conn_act)
+            print("Activity templates seeded")
+        except Exception as e: print(f"Activity templates seed: {e}")
     except Exception as e: print(f"DB pool FAIL: {e}")
 
 def get_db_conn():
@@ -7798,42 +8095,141 @@ async def get_default_rates(tenant_id: int, request: Request):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT rate_type, rate, currency, description FROM tenant_default_rates WHERE tenant_id=%s ORDER BY id", (tid,))
+            cur.execute(
+                "SELECT rate_type, rate, currency, description, is_builtin, sort_order FROM tenant_default_rates WHERE tenant_id=%s ORDER BY sort_order, id",
+                (tid,)
+            )
             rows = cur.fetchall()
-            return {r["rate_type"]: {"rate": float(r["rate"]), "currency": r["currency"], "description": r["description"]} for r in rows}
+        if not rows:
+            seed_builtin_rates_if_empty(conn, tid)
+            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT rate_type, rate, currency, description, is_builtin, sort_order FROM tenant_default_rates WHERE tenant_id=%s ORDER BY sort_order, id",
+                    (tid,)
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "rate_type": r["rate_type"],
+                "rate": float(r["rate"]),
+                "currency": r["currency"],
+                "description": r["description"],
+                "is_builtin": bool(r["is_builtin"]),
+                "sort_order": r["sort_order"],
+            }
+            for r in rows
+        ]
     finally: release_conn(conn)
 
 @app.put("/tenant/default-rates/{tenant_id}")
 async def update_default_rates(tenant_id: int, data: dict, request: Request):
+    """Update rate values for existing rate types. {rate_type: rate_value | {rate, description}}"""
     tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             for rate_type, value in data.items():
-                rate_val = value if isinstance(value, (int, float)) else value.get("rate", 0)
-                cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, updated_at)
-                    VALUES (%s, %s, %s, now()) ON CONFLICT (tenant_id, rate_type)
-                    DO UPDATE SET rate=%s, updated_at=now()""", (tid, rate_type, rate_val, rate_val))
+                if isinstance(value, dict):
+                    rate_val = float(value.get("rate", 0))
+                    desc = value.get("description")
+                    if desc is not None:
+                        cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, description, updated_at)
+                            VALUES (%s,%s,%s,%s,now()) ON CONFLICT (tenant_id, rate_type)
+                            DO UPDATE SET rate=%s, description=%s, updated_at=now()""",
+                            (tid, rate_type, rate_val, desc, rate_val, desc))
+                    else:
+                        cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, updated_at)
+                            VALUES (%s,%s,%s,now()) ON CONFLICT (tenant_id, rate_type)
+                            DO UPDATE SET rate=%s, updated_at=now()""",
+                            (tid, rate_type, rate_val, rate_val))
+                else:
+                    rate_val = float(value)
+                    cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, updated_at)
+                        VALUES (%s,%s,%s,now()) ON CONFLICT (tenant_id, rate_type)
+                        DO UPDATE SET rate=%s, updated_at=now()""",
+                        (tid, rate_type, rate_val, rate_val))
             log_activity(conn, "tenant", tid, "update_rates", f"Updated {len(data)} default rates")
             conn.commit()
-            cur.execute("SELECT rate_type, rate, currency FROM tenant_default_rates WHERE tenant_id=%s", (tid,))
-            return {r["rate_type"]: float(r["rate"]) for r in cur.fetchall()}
+            cur.execute("SELECT rate_type, rate, currency, description, is_builtin, sort_order FROM tenant_default_rates WHERE tenant_id=%s ORDER BY sort_order, id", (tid,))
+            rows = cur.fetchall()
+        return [{"rate_type": r["rate_type"], "rate": float(r["rate"]), "currency": r["currency"],
+                 "description": r["description"], "is_builtin": bool(r["is_builtin"]), "sort_order": r["sort_order"]} for r in rows]
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.post("/tenant/service-rate-types/{tenant_id}")
+async def add_service_rate_type(tenant_id: int, data: dict, request: Request):
+    """Add a new custom service rate type. {rate_type: str, description: str, rate: float, currency: str}"""
+    tid = get_request_tenant_id(request)
+    rate_type = (data.get("rate_type") or "").strip().lower().replace(" ", "_")
+    description = (data.get("description") or data.get("display_name") or rate_type).strip()
+    rate_val = float(data.get("rate", 0))
+    currency = data.get("currency", "GBP")
+    if not rate_type:
+        raise HTTPException(422, "rate_type required")
+    if not re.match(r'^[a-z][a-z0-9_]{0,49}$', rate_type):
+        raise HTTPException(422, "rate_type must be lowercase letters, digits, underscores (max 50 chars)")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Get next sort_order
+            cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS next_order FROM tenant_default_rates WHERE tenant_id=%s", (tid,))
+            next_order = cur.fetchone()["next_order"]
+            cur.execute("""INSERT INTO tenant_default_rates
+                (tenant_id, rate_type, rate, currency, description, is_builtin, sort_order)
+                VALUES (%s,%s,%s,%s,%s,false,%s)
+                ON CONFLICT (tenant_id, rate_type) DO NOTHING
+                RETURNING id""",
+                (tid, rate_type, rate_val, currency, description, next_order))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(409, f"Rate type '{rate_type}' already exists")
+            log_activity(conn, "tenant", tid, "add_rate_type", f"Added rate type: {rate_type} ({description})")
+            conn.commit()
+        return {"ok": True, "rate_type": rate_type, "description": description, "rate": rate_val}
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.delete("/tenant/service-rate-types/{tenant_id}/{rate_type}")
+async def delete_service_rate_type(tenant_id: int, rate_type: str, request: Request):
+    """Delete a custom rate type. Built-in types cannot be deleted."""
+    tid = get_request_tenant_id(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT is_builtin FROM tenant_default_rates WHERE tenant_id=%s AND rate_type=%s", (tid, rate_type))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, f"Rate type '{rate_type}' not found")
+            if row["is_builtin"]:
+                raise HTTPException(403, f"Built-in rate type '{rate_type}' cannot be deleted")
+            cur.execute("DELETE FROM tenant_default_rates WHERE tenant_id=%s AND rate_type=%s", (tid, rate_type))
+            # Also remove any client overrides for this rate type
+            cur.execute("DELETE FROM pricing_rules WHERE tenant_id=%s AND rule_type='service_rate' AND rule_key=%s", (tid, rate_type))
+            log_activity(conn, "tenant", tid, "delete_rate_type", f"Deleted rate type: {rate_type}")
+            conn.commit()
+        return {"ok": True, "deleted": rate_type}
+    except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
 def get_client_service_rate_overrides(conn, tid, client_id):
+    rate_keys = get_tenant_rate_types(conn, tid) or list(SERVICE_RATE_DEFAULTS.keys())
     with conn.cursor() as cur:
         cur.execute("""SELECT rule_key, rate
             FROM pricing_rules
             WHERE tenant_id=%s AND scope='client' AND scope_id=%s
               AND rule_type='service_rate' AND rule_key = ANY(%s)""",
-            (tid, client_id, CLIENT_SERVICE_RATE_KEYS))
+            (tid, client_id, rate_keys))
         return {row["rule_key"]: float(row["rate"]) for row in cur.fetchall() if row.get("rule_key")}
 
 def get_client_service_rates(conn, tid, client_id):
+    rate_keys = get_tenant_rate_types(conn, tid) or list(SERVICE_RATE_DEFAULTS.keys())
     return {
         key: get_effective_rate(conn, tid, client_id=client_id, rate_type=key)
-        for key in VISIBLE_CLIENT_SERVICE_RATE_KEYS
+        for key in rate_keys
     }
 
 def get_effective_rate(conn, tid, user_id=None, client_id=None, rate_type="hourly_rate"):
@@ -10410,7 +10806,10 @@ async def company_setup(data: dict):
                         VALUES (%s,%s,%s,%s)""",
                         (tenant_id, gid, sid, i == 0))
 
-            # 6. SUBSCRIPTION LIMITS (upsert based on workspace_mode)
+            # 6. SEED BUILT-IN RATE TYPES (only if tenant has none yet)
+            seed_builtin_rates_if_empty(conn, tenant_id)
+
+            # 8. SUBSCRIPTION LIMITS (upsert based on workspace_mode)
             ws = WORKSPACE_DEFAULTS.get(workspace_mode, WORKSPACE_DEFAULTS["solo"])
             cur.execute("SELECT id FROM subscription_limits WHERE tenant_id=%s",(tenant_id,))
             if cur.fetchone():
@@ -10424,7 +10823,7 @@ async def company_setup(data: dict):
                     VALUES (%s,%s,%s,%s,%s)""",
                     (tenant_id, max_active_users, ws["max_clients"], ws["max_jobs"], ws["max_voice"]))
 
-            # 7. AUDIT LOG
+            # 9. AUDIT LOG
             audit_config_change(conn, tenant_id, "onboarding_setup",
                 f"Company: {company_name}, mode: {workspace_mode}, legal: {legal_type}, "
                 f"int_lang: {internal_language_mode}/{default_internal_lang}, "
@@ -13270,6 +13669,187 @@ async def api_search_contact_aliases(
 
 
 # ========== SYSTEM ==========
+# ===== ACTIVITY TEMPLATES =====
+
+@app.get("/activities/templates")
+async def get_activity_templates(
+    subtype_id: int | None = None,
+    group_id: int | None = None,
+    subtype_code: str | None = None,
+    group_code: str | None = None,
+):
+    """Return all activity templates for a given industry subtype or group."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            if subtype_code:
+                cur.execute("""
+                    SELECT at.id, at.code, at.name, at.default_pricing_method,
+                           at.allowed_pricing_methods, at.default_unit, at.sort_order,
+                           at.is_builtin,
+                           ig.code AS group_code, ist.code AS subtype_code
+                    FROM activity_templates at
+                    JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
+                    JOIN industry_groups ig ON ist.industry_group_id = ig.id
+                    WHERE ist.code = %s AND at.is_active = true
+                    ORDER BY at.sort_order, at.name
+                """, (subtype_code,))
+            elif subtype_id:
+                cur.execute("""
+                    SELECT at.id, at.code, at.name, at.default_pricing_method,
+                           at.allowed_pricing_methods, at.default_unit, at.sort_order,
+                           at.is_builtin,
+                           ig.code AS group_code, ist.code AS subtype_code
+                    FROM activity_templates at
+                    JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
+                    JOIN industry_groups ig ON ist.industry_group_id = ig.id
+                    WHERE at.industry_subtype_id = %s AND at.is_active = true
+                    ORDER BY at.sort_order, at.name
+                """, (subtype_id,))
+            elif group_code:
+                cur.execute("""
+                    SELECT at.id, at.code, at.name, at.default_pricing_method,
+                           at.allowed_pricing_methods, at.default_unit, at.sort_order,
+                           at.is_builtin,
+                           ig.code AS group_code,
+                           COALESCE(ist.code, '') AS subtype_code
+                    FROM activity_templates at
+                    LEFT JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
+                    JOIN industry_groups ig ON at.industry_group_id = ig.id
+                    WHERE ig.code = %s AND at.is_active = true
+                    ORDER BY COALESCE(ist.sort_order, 0), at.sort_order, at.name
+                """, (group_code,))
+            elif group_id:
+                cur.execute("""
+                    SELECT at.id, at.code, at.name, at.default_pricing_method,
+                           at.allowed_pricing_methods, at.default_unit, at.sort_order,
+                           at.is_builtin,
+                           ig.code AS group_code,
+                           COALESCE(ist.code, '') AS subtype_code
+                    FROM activity_templates at
+                    LEFT JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
+                    JOIN industry_groups ig ON at.industry_group_id = ig.id
+                    WHERE at.industry_group_id = %s AND at.is_active = true
+                    ORDER BY COALESCE(ist.sort_order, 0), at.sort_order, at.name
+                """, (group_id,))
+            else:
+                raise HTTPException(400, "Provide subtype_id, subtype_code, group_id or group_code")
+            return cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
+@app.get("/activities/tenant/{tenant_id}")
+async def get_tenant_activity_pricing(tenant_id: int, subtype_id: int | None = None, subtype_code: str | None = None):
+    """Return tenant's activity pricing overrides, optionally filtered by subtype."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            if subtype_code or subtype_id:
+                filter_clause = "AND ist.code = %s" if subtype_code else "AND at.industry_subtype_id = %s"
+                filter_val = subtype_code if subtype_code else subtype_id
+                cur.execute(f"""
+                    SELECT tap.id, tap.activity_template_id, tap.is_active,
+                           tap.pricing_method, tap.rate, tap.rate_secondary,
+                           tap.custom_name, tap.supplementary, tap.voice_aliases, tap.notes,
+                           at.code, at.name AS template_name, at.default_pricing_method,
+                           at.allowed_pricing_methods, at.default_unit,
+                           ist.code AS subtype_code
+                    FROM tenant_activity_pricing tap
+                    JOIN activity_templates at ON tap.activity_template_id = at.id
+                    LEFT JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
+                    WHERE tap.tenant_id = %s {filter_clause}
+                    ORDER BY at.sort_order
+                """, (tenant_id, filter_val))
+            else:
+                cur.execute("""
+                    SELECT tap.id, tap.activity_template_id, tap.is_active,
+                           tap.pricing_method, tap.rate, tap.rate_secondary,
+                           tap.custom_name, tap.supplementary, tap.voice_aliases, tap.notes,
+                           at.code, at.name AS template_name, at.default_pricing_method,
+                           at.allowed_pricing_methods, at.default_unit,
+                           COALESCE(ist.code,'') AS subtype_code
+                    FROM tenant_activity_pricing tap
+                    JOIN activity_templates at ON tap.activity_template_id = at.id
+                    LEFT JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
+                    WHERE tap.tenant_id = %s
+                    ORDER BY at.sort_order
+                """, (tenant_id,))
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
+@app.put("/activities/tenant/{tenant_id}/{template_id}")
+async def upsert_tenant_activity_pricing(tenant_id: int, template_id: int, data: dict):
+    """Create or update a tenant's pricing override for one activity template."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            pricing_method = data.get("pricing_method")
+            rate = data.get("rate")
+            rate_secondary = data.get("rate_secondary")
+            is_active = data.get("is_active", True)
+            custom_name = data.get("custom_name")
+            supplementary = data.get("supplementary", {})
+            voice_aliases = data.get("voice_aliases", [])
+            notes = data.get("notes")
+
+            cur.execute("""
+                INSERT INTO tenant_activity_pricing
+                    (tenant_id, activity_template_id, is_active, pricing_method, rate, rate_secondary,
+                     custom_name, supplementary, voice_aliases, notes, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (tenant_id, activity_template_id) DO UPDATE SET
+                    is_active = EXCLUDED.is_active,
+                    pricing_method = EXCLUDED.pricing_method,
+                    rate = EXCLUDED.rate,
+                    rate_secondary = EXCLUDED.rate_secondary,
+                    custom_name = EXCLUDED.custom_name,
+                    supplementary = EXCLUDED.supplementary,
+                    voice_aliases = EXCLUDED.voice_aliases,
+                    notes = EXCLUDED.notes,
+                    updated_at = now()
+                RETURNING id
+            """, (tenant_id, template_id, is_active, pricing_method, rate, rate_secondary,
+                  custom_name, json.dumps(supplementary) if isinstance(supplementary, dict) else supplementary,
+                  voice_aliases, notes))
+            row = cur.fetchone()
+            conn.commit()
+            return {"ok": True, "id": row["id"]}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
+@app.delete("/activities/tenant/{tenant_id}/{template_id}")
+async def reset_tenant_activity_pricing(tenant_id: int, template_id: int):
+    """Delete tenant override — reverts to system default pricing method."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM tenant_activity_pricing WHERE tenant_id=%s AND activity_template_id=%s RETURNING id",
+                (tenant_id, template_id)
+            )
+            deleted = cur.fetchone()
+            conn.commit()
+            return {"ok": True, "deleted": deleted is not None}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        release_conn(conn)
+
+
 @app.get("/")
 async def root():
     return {"service": "Secretary CRM", "status": "running"}
