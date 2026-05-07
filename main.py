@@ -242,7 +242,7 @@ def send_mail_reply(original: Dict[str, Any], body: str) -> Dict[str, Any]:
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
 PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/nature/", "/admin/", "/assistant/", "/process", "/voice/", "/work-reports"]
-PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets", "/admin/reset-pw-temp-x7k2", "/admin/db-diag", "/version"]
+PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets", "/admin/reset-pw-temp-x7k2", "/admin/db-diag", "/admin/force-repair", "/version"]
 
 PERMISSION_DEFINITIONS = [
     {"permission_code": "crm_read", "module_name": "crm", "name": "View CRM", "description": "Read clients, jobs, leads and invoices."},
@@ -11230,6 +11230,78 @@ async def db_diag(key: str = Query(default="")):
     finally:
         if conn:
             release_conn(conn)
+
+@app.post("/admin/force-repair")
+async def force_repair(key: str = Query(default="")):
+    """Force all DB repairs: unique indexes, group names, language codes."""
+    if key != "repair2024": raise HTTPException(403, "forbidden")
+    res = {}
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT code, name FROM industry_groups ORDER BY id")
+            res["before_groups"] = {x["code"]: x["name"] for x in cur.fetchall()}
+            cur.execute("SELECT indexname FROM pg_indexes WHERE tablename='industry_groups' AND schemaname='crm'")
+            res["idx_before"] = [x["indexname"] for x in cur.fetchall()]
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT code, COUNT(*) FROM industry_groups GROUP BY code HAVING COUNT(*)>1")
+                dg = cur.fetchall()
+                if dg: cur.execute("DELETE FROM industry_groups WHERE id NOT IN (SELECT MIN(id) FROM industry_groups GROUP BY code)")
+                cur.execute("SELECT industry_group_id,code,COUNT(*) FROM industry_subtypes GROUP BY industry_group_id,code HAVING COUNT(*)>1")
+                ds = cur.fetchall()
+                if ds: cur.execute("DELETE FROM industry_subtypes WHERE id NOT IN (SELECT MIN(id) FROM industry_subtypes GROUP BY industry_group_id,code)")
+            conn.commit(); res["dedup"] = f"ok grp={len(dg)} sub={len(ds)}"
+        except Exception as e:
+            conn.rollback(); res["dedup"] = f"FAIL:{e}"
+        try:
+            with conn.cursor() as cur:
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_groups_code ON industry_groups (code)")
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_subtypes_group_code ON industry_subtypes (industry_group_id, code)")
+            conn.commit(); res["indexes"] = "ok"
+        except Exception as e:
+            conn.rollback(); res["indexes"] = f"FAIL:{e}"
+        try:
+            n = 0
+            with conn.cursor() as cur:
+                for code, name, so in [
+                    ("trades","Trades and field services",10),("construction","Construction and building",20),
+                    ("property","Property management",30),("real_estate","Real estate and lettings",40),
+                    ("cleaning","Cleaning services",50),("automotive","Automotive services",60),
+                    ("logistics","Logistics and transport",70),("beauty","Beauty and personal care",80),
+                    ("healthcare","Healthcare and wellbeing",90),("fitness","Fitness and coaching",100),
+                    ("hospitality","Hospitality and food service",110),("events","Events and entertainment",120),
+                    ("education","Education and training",130),("it_tech","IT and technology",140),
+                    ("retail","Retail and e-commerce",150),("security","Security services",160),
+                    ("agriculture","Agriculture and farming",170),("other","Other / General business",999),
+                ]:
+                    cur.execute("UPDATE industry_groups SET name=%s, sort_order=%s, is_active=true WHERE code=%s", (name, so, code))
+                    n += cur.rowcount
+                cur.execute("UPDATE industry_groups SET is_active=false WHERE code IN ('landscaping','it_services')")
+            conn.commit(); res["group_names"] = f"ok rows={n}"
+        except Exception as e:
+            conn.rollback(); res["group_names"] = f"FAIL:{e}"
+        try:
+            n = 0
+            with conn.cursor() as cur:
+                for old_c, new_c in [("cs","cs-CZ"),("cs_CZ","cs-CZ"),("en","en-GB"),("en_GB","en-GB"),
+                        ("pl","pl-PL"),("pl_PL","pl-PL"),("de","de-DE"),("sk","sk-SK"),("hu","hu-HU")]:
+                    cur.execute("UPDATE tenant_languages SET language_code=%s WHERE language_code=%s", (new_c, old_c))
+                    n += cur.rowcount
+            conn.commit(); res["languages"] = f"ok rows={n}"
+        except Exception as e:
+            conn.rollback(); res["languages"] = f"FAIL:{e}"
+        with conn.cursor() as cur:
+            cur.execute("SELECT code, name, is_active FROM industry_groups ORDER BY sort_order, id")
+            res["after_groups"] = [dict(x) for x in cur.fetchall()]
+            cur.execute("SELECT indexname FROM pg_indexes WHERE tablename='industry_groups' AND schemaname='crm'")
+            res["idx_after"] = [x["indexname"] for x in cur.fetchall()]
+            cur.execute("SELECT language_code, language_scope FROM tenant_languages WHERE tenant_id=1 ORDER BY language_scope")
+            res["langs_final"] = [dict(x) for x in cur.fetchall()]
+        return res
+    except Exception as e: return {"error": str(e)}
+    finally: release_conn(conn)
+
 
 @app.get("/version")
 async def get_version():
