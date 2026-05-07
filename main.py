@@ -358,6 +358,142 @@ def get_tenant_rate_types(conn, tid) -> list:
         rows = cur.fetchall()
     return [r["rate_type"] for r in rows]
 
+def apply_python_repair_024(conn):
+    """Python-based startup repair: fix missing unique indexes, normalize language codes.
+    Runs BEFORE seed_industry_catalog so ON CONFLICT clauses work correctly.
+    Idempotent — checks migration_log and skips if already applied."""
+    REPAIR_NAME = '2026_05_07_python_repair_024.py'
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM migration_log WHERE filename=%s", (REPAIR_NAME,))
+        if cur.fetchone():
+            return  # already applied
+
+        print("=== Python repair 024: starting ===")
+
+        # Diagnostics
+        cur.execute("SELECT COUNT(*) FROM industry_groups")
+        print(f"repair 024: industry_groups count = {cur.fetchone()[0]}")
+        cur.execute("SELECT COUNT(*) FROM industry_subtypes")
+        print(f"repair 024: industry_subtypes count = {cur.fetchone()[0]}")
+
+        # Check for duplicate codes in industry_groups
+        cur.execute("""
+            SELECT code, COUNT(*) AS cnt FROM industry_groups
+            GROUP BY code HAVING COUNT(*) > 1
+        """)
+        dup_groups = cur.fetchall()
+        if dup_groups:
+            print(f"repair 024: removing duplicates from industry_groups: {dup_groups}")
+            cur.execute("""
+                DELETE FROM industry_groups
+                WHERE id NOT IN (SELECT MIN(id) FROM industry_groups GROUP BY code)
+            """)
+
+        # Check for duplicate (industry_group_id, code) in industry_subtypes
+        cur.execute("""
+            SELECT industry_group_id, code, COUNT(*) AS cnt FROM industry_subtypes
+            GROUP BY industry_group_id, code HAVING COUNT(*) > 1
+        """)
+        dup_subs = cur.fetchall()
+        if dup_subs:
+            print(f"repair 024: removing duplicates from industry_subtypes: {dup_subs}")
+            cur.execute("""
+                DELETE FROM industry_subtypes
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM industry_subtypes GROUP BY industry_group_id, code
+                )
+            """)
+
+        conn.commit()
+
+        # Create unique indexes (safe with IF NOT EXISTS)
+        print("repair 024: creating unique indexes...")
+        with conn.cursor() as cur2:
+            try:
+                cur2.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_groups_code ON industry_groups (code)")
+                print("repair 024: uq_industry_groups_code OK")
+            except Exception as e:
+                conn.rollback()
+                print(f"repair 024: uq_industry_groups_code FAILED: {e}")
+                raise
+            try:
+                cur2.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_subtypes_group_code ON industry_subtypes (industry_group_id, code)")
+                print("repair 024: uq_industry_subtypes_group_code OK")
+            except Exception as e:
+                conn.rollback()
+                print(f"repair 024: uq_industry_subtypes_group_code FAILED: {e}")
+                raise
+            conn.commit()
+
+        # Normalize language codes in tenant_languages
+        print("repair 024: normalizing language codes...")
+        lang_map = [
+            ('cs', 'cs-CZ'), ('cs_CZ', 'cs-CZ'), ('cs_cz', 'cs-CZ'),
+            ('en', 'en-GB'), ('en_GB', 'en-GB'), ('en_gb', 'en-GB'),
+            ('pl', 'pl-PL'), ('pl_PL', 'pl-PL'), ('pl_pl', 'pl-PL'),
+            ('de', 'de-DE'), ('de_DE', 'de-DE'), ('de_de', 'de-DE'),
+            ('sk', 'sk-SK'), ('sk_SK', 'sk-SK'), ('sk_sk', 'sk-SK'),
+            ('hu', 'hu-HU'), ('hu_HU', 'hu-HU'), ('hu_hu', 'hu-HU'),
+            ('ro', 'ro-RO'), ('ro_RO', 'ro-RO'), ('ro_ro', 'ro-RO'),
+            ('uk', 'uk-UA'), ('uk_UA', 'uk-UA'), ('uk_ua', 'uk-UA'),
+            ('ru', 'ru-RU'), ('ru_RU', 'ru-RU'), ('ru_ru', 'ru-RU'),
+        ]
+        with conn.cursor() as cur3:
+            total_lang = 0
+            for old_code, new_code in lang_map:
+                cur3.execute("UPDATE tenant_languages SET language_code=%s WHERE language_code=%s", (new_code, old_code))
+                total_lang += cur3.rowcount
+            # Fix tenant_operating_profile
+            prof_map = [
+                ('cs', 'cs-CZ'), ('en', 'en-GB'), ('pl', 'pl-PL'),
+                ('de', 'de-DE'), ('sk', 'sk-SK'), ('hu', 'hu-HU'),
+            ]
+            for old_code, new_code in prof_map:
+                cur3.execute("UPDATE tenant_operating_profile SET default_internal_language_code=%s WHERE default_internal_language_code=%s", (new_code, old_code))
+                cur3.execute("UPDATE tenant_operating_profile SET default_customer_language_code=%s WHERE default_customer_language_code=%s", (new_code, old_code))
+            print(f"repair 024: updated {total_lang} language rows")
+            conn.commit()
+
+        # Fix industry group names / deactivate old groups
+        print("repair 024: fixing industry groups...")
+        group_fixes = [
+            ('trades',       'Trades and field services',       10,  True),
+            ('construction', 'Construction and building',       20,  True),
+            ('property',     'Property management',             30,  True),
+            ('real_estate',  'Real estate and lettings',        40,  True),
+            ('cleaning',     'Cleaning services',               50,  True),
+            ('automotive',   'Automotive services',             60,  True),
+            ('logistics',    'Logistics and transport',         70,  True),
+            ('beauty',       'Beauty and personal care',        80,  True),
+            ('healthcare',   'Healthcare and wellbeing',        90,  True),
+            ('fitness',      'Fitness and coaching',            100, True),
+            ('hospitality',  'Hospitality and food service',    110, True),
+            ('events',       'Events and entertainment',        120, True),
+            ('education',    'Education and training',          130, True),
+            ('it_tech',      'IT and technology',               140, True),
+            ('retail',       'Retail and e-commerce',           150, True),
+            ('security',     'Security services',               160, True),
+            ('agriculture',  'Agriculture and farming',         170, True),
+            ('other',        'Other / General business',        999, True),
+        ]
+        with conn.cursor() as cur4:
+            for code, name, sort_order, is_active in group_fixes:
+                cur4.execute("""
+                    UPDATE industry_groups SET name=%s, sort_order=%s, is_active=%s
+                    WHERE code=%s
+                """, (name, sort_order, is_active, code))
+            cur4.execute("UPDATE industry_groups SET is_active=false WHERE code IN ('landscaping','it_services')")
+            conn.commit()
+
+        # Mark repair + SQL migration 023 as applied so SQL runner skips them
+        with conn.cursor() as cur5:
+            cur5.execute("INSERT INTO migration_log (filename) VALUES (%s) ON CONFLICT DO NOTHING", (REPAIR_NAME,))
+            cur5.execute("INSERT INTO migration_log (filename) VALUES (%s) ON CONFLICT DO NOTHING",
+                         ('2026_05_07_fix_language_codes_and_reseed_activities_023.sql',))
+            conn.commit()
+        print("=== Python repair 024: COMPLETE ===")
+
+
 def seed_industry_catalog(conn):
     """Idempotently seed all industry groups and subtypes. Safe to run on every startup."""
     with conn.cursor() as cur:
@@ -2312,6 +2448,13 @@ def init_pool():
             print("Contact sections seeded")
         except Exception as e: print(f"Contact section seed: {e}")
         try:
+            conn_repair = db_pool.getconn()
+            with conn_repair.cursor() as cur:
+                cur.execute("SET search_path TO crm, public")
+            apply_python_repair_024(conn_repair)
+            db_pool.putconn(conn_repair)
+        except Exception as e: print(f"Python repair 024 error: {e}")
+        try:
             conn_ind = db_pool.getconn()
             with conn_ind.cursor() as cur:
                 cur.execute("SET search_path TO crm, public")
@@ -2352,7 +2495,23 @@ def init_pool():
                     try:
                         sql = open(fpath, encoding="utf-8").read()
                         body = sql.replace("BEGIN;","").replace("COMMIT;","")
-                        stmts = [s.strip() for s in body.split(";") if s.strip()]
+                        # Smart split: don't split inside dollar-quoted blocks (DO $$ ... $$)
+                        stmts = []
+                        current = []
+                        in_dollar = False
+                        for line in body.splitlines(keepends=True):
+                            current.append(line)
+                            if '$$' in line:
+                                in_dollar = not in_dollar
+                            if not in_dollar and line.rstrip().endswith(';'):
+                                stmt = ''.join(current).strip()
+                                if stmt:
+                                    stmts.append(stmt)
+                                current = []
+                        # Flush any remaining (no trailing semicolon)
+                        remainder = ''.join(current).strip()
+                        if remainder:
+                            stmts.append(remainder)
                         cur.execute("SAVEPOINT mig_auto")
                         for stmt in stmts:
                             cur.execute(stmt)
@@ -11045,12 +11204,12 @@ async def get_version():
             cur.execute("SELECT filename, applied_at FROM migration_log ORDER BY id DESC LIMIT 1")
             m = cur.fetchone()
         return {
-            "server_version": "1.3",
+            "server_version": "1.4",
             "latest_migration": m["filename"] if m else None,
             "applied_at": m["applied_at"].isoformat() if m and m["applied_at"] else None
         }
     except Exception as e:
-        return {"server_version": "1.3", "error": str(e)}
+        return {"server_version": "1.4", "error": str(e)}
     finally:
         if conn:
             release_conn(conn)
