@@ -2367,16 +2367,25 @@ def init_pool():
         except Exception as e: print(f"Auto-migration error: {e}")
 
         # Self-heal: re-seed activity_templates if incomplete (fewer than 100 = partial seed)
+        # Runs AFTER auto-migration so migration 023 has already fixed industry subtypes
         try:
             conn_heal = db_pool.getconn()
+            act_count = 0
             with conn_heal.cursor() as cur:
                 cur.execute("SET search_path TO crm, public")
                 cur.execute("SELECT COUNT(*) FROM activity_templates WHERE is_active=true")
                 act_count = cur.fetchone()[0]
                 if act_count < 100:
-                    print(f"activity_templates incomplete ({act_count} rows) — clearing migration log and re-seeding")
+                    print(f"activity_templates incomplete ({act_count} rows) — rebuilding")
+                    # Clear migration log so seed_activity_templates will re-run
                     cur.execute("DELETE FROM migration_log WHERE filename='2026_05_06_activity_templates_020.sql'")
-                    cur.execute("TRUNCATE activity_templates RESTART IDENTITY CASCADE")
+                    # Use DELETE instead of TRUNCATE to avoid CASCADE lock issues
+                    cur.execute("DELETE FROM tenant_activity_pricing")
+                    cur.execute("DELETE FROM activity_templates")
+                    # Reset sequences (safe, ignore if sequence name differs)
+                    try:
+                        cur.execute("ALTER SEQUENCE activity_templates_id_seq RESTART WITH 1")
+                    except Exception: pass
             conn_heal.commit()
             db_pool.putconn(conn_heal)
             if act_count < 100:
@@ -2385,6 +2394,14 @@ def init_pool():
                     cur.execute("SET search_path TO crm, public")
                 seed_activity_templates(conn_reseed)
                 db_pool.putconn(conn_reseed)
+                # Verify re-seed result
+                conn_verify = db_pool.getconn()
+                with conn_verify.cursor() as cur:
+                    cur.execute("SET search_path TO crm, public")
+                    cur.execute("SELECT COUNT(*) FROM activity_templates WHERE is_active=true")
+                    new_count = cur.fetchone()[0]
+                    print(f"activity_templates after re-seed: {new_count} rows")
+                db_pool.putconn(conn_verify)
         except Exception as e: print(f"Self-heal activity_templates error: {e}")
     except Exception as e: print(f"DB pool FAIL: {e}")
 
