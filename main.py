@@ -2366,19 +2366,20 @@ def init_pool():
             db_pool.putconn(conn_mig)
         except Exception as e: print(f"Auto-migration error: {e}")
 
-        # Self-heal: re-seed activity_templates if empty (migration ran but data lost)
+        # Self-heal: re-seed activity_templates if incomplete (fewer than 100 = partial seed)
         try:
             conn_heal = db_pool.getconn()
             with conn_heal.cursor() as cur:
                 cur.execute("SET search_path TO crm, public")
                 cur.execute("SELECT COUNT(*) FROM activity_templates WHERE is_active=true")
                 act_count = cur.fetchone()[0]
-                if act_count == 0:
-                    print("activity_templates empty — clearing migration log entry and re-seeding")
+                if act_count < 100:
+                    print(f"activity_templates incomplete ({act_count} rows) — clearing migration log and re-seeding")
                     cur.execute("DELETE FROM migration_log WHERE filename='2026_05_06_activity_templates_020.sql'")
+                    cur.execute("TRUNCATE activity_templates RESTART IDENTITY CASCADE")
             conn_heal.commit()
             db_pool.putconn(conn_heal)
-            if act_count == 0:
+            if act_count < 100:
                 conn_reseed = db_pool.getconn()
                 with conn_reseed.cursor() as cur:
                     cur.execute("SET search_path TO crm, public")
@@ -11015,7 +11016,7 @@ async def translate_message(request: Request):
 async def health():
     try:
         conn = get_db_conn(); release_conn(conn)
-        return {"status":"ok","version":"1.2a","ai":bool(OPENAI_API_KEY)}
+        return {"status":"ok","version":"1.3","ai":bool(OPENAI_API_KEY)}
     except: return {"status":"error"}
 
 @app.get("/version")
@@ -11027,12 +11028,12 @@ async def get_version():
             cur.execute("SELECT filename, applied_at FROM migration_log ORDER BY id DESC LIMIT 1")
             m = cur.fetchone()
         return {
-            "server_version": "1.2a",
+            "server_version": "1.3",
             "latest_migration": m["filename"] if m else None,
             "applied_at": m["applied_at"].isoformat() if m and m["applied_at"] else None
         }
     except Exception as e:
-        return {"server_version": "1.2a", "error": str(e)}
+        return {"server_version": "1.3", "error": str(e)}
     finally:
         if conn:
             release_conn(conn)
