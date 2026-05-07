@@ -11197,8 +11197,10 @@ async def health():
     except: return {"status":"error"}
 
 @app.get("/admin/db-diag")
-async def db_diag():
+async def db_diag(key: str = Query(default="")):
     """Diagnostic: returns DB state for debugging repair issues."""
+    if key != "diag2024":
+        raise HTTPException(403, "forbidden")
     conn = None
     try:
         conn = get_db_conn()
