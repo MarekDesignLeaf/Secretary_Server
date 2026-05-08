@@ -1,4 +1,4 @@
-﻿import os, json, uuid, csv, io, hashlib
+import os, json, uuid, csv, io, hashlib, hmac, re
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
@@ -28,8 +28,8 @@ JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
-PROTECTED_PREFIXES = ["/crm/", "/process", "/voice/", "/work-reports"]
-PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
+PROTECTED_PREFIXES = ["/crm/", "/process", "/voice/", "/work-reports", "/debug/"]
+PUBLIC_PATHS = ["/health", "/bootstrap/status", "/bootstrap/first-admin", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -56,6 +56,15 @@ async def auth_middleware(request: Request, call_next):
     except pyjwt.InvalidTokenError:
         return JSONResponse(status_code=401, content={"detail": "Invalid token"})
     return await call_next(request)
+
+
+def require_debug_admin(request: Request):
+    if os.getenv("ENABLE_DEBUG_ENDPOINTS", "").lower() != "true":
+        raise HTTPException(404, "Not found")
+    user = getattr(request.state, "user", {})
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin role required")
+
 
 def get_request_tenant_id(request: Request) -> int:
     """Extract tenant_id from authenticated request. Falls back to 1."""
@@ -178,6 +187,72 @@ CREATE TABLE IF NOT EXISTS pricing_rules (
     rule_key TEXT, rate DECIMAL NOT NULL,
     currency TEXT DEFAULT 'GBP', created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS industry_groups (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    sort_order INT DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS industry_subtypes (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    industry_group_id BIGINT NOT NULL,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    sort_order INT DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pricing_methods (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT,
+    unit_label TEXT,
+    sort_order INT DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS additional_charges (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT,
+    sort_order INT DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS system_activity_templates (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    industry_group_id BIGINT NOT NULL,
+    industry_subtype_id BIGINT NOT NULL,
+    activity_code TEXT NOT NULL UNIQUE,
+    activity_name TEXT NOT NULL,
+    description TEXT,
+    default_pricing_method TEXT NOT NULL,
+    available_pricing_methods JSONB NOT NULL DEFAULT '[]',
+    available_additional_charges JSONB NOT NULL DEFAULT '[]',
+    voice_aliases JSONB NOT NULL DEFAULT '[]',
+    sort_order INT DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS tenant_activity_pricing (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id INT NOT NULL,
+    system_activity_template_id BIGINT NOT NULL,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    selected_pricing_method TEXT,
+    price_amount DECIMAL,
+    currency TEXT DEFAULT 'GBP',
+    additional_charge_settings JSONB NOT NULL DEFAULT '{}',
+    custom_display_name TEXT,
+    notes TEXT,
+    voice_aliases JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (tenant_id, system_activity_template_id)
+);
 DO $$ BEGIN
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name TEXT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email TEXT;
@@ -281,6 +356,9 @@ def init_pool():
             db_pool.putconn(conn3)
             print("Service rates seeded")
         except Exception as e: print(f"Rate seed: {e}")
+        try:
+            seed_activity_catalogue()
+        except Exception as e: print(f"Activity catalogue seed: {e}")
     except Exception as e: print(f"DB pool FAIL: {e}")
 
 def get_db_conn():
@@ -329,6 +407,132 @@ def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1,
              str(user_id) if user_id else "system",
              tenant_id,
              str(user_id) if user_id else None))
+
+PRICING_METHODS = [
+    ("hourly_rate","Hourly rate","Price per hour","hour",10),("day_rate","Day rate","Price per day","day",20),("per_visit","Per visit","Price per visit","visit",30),
+    ("per_item","Per item","Price per item","item",40),("per_square_metre","Per square metre","Price per square metre","m²",50),("per_metre","Per metre","Price per linear metre","m",60),
+    ("per_cubic_metre","Per cubic metre","Price per cubic metre","m³",70),("per_kg","Per kg","Price per kilogram","kg",80),("per_tonne","Per tonne","Price per tonne","tonne",90),
+    ("per_bulk_bag","Per bulk bag","Price per bulk bag","bulk bag",100),("per_skip","Per skip","Price per skip","skip",110),("fixed_price","Fixed price","Fixed job price","job",120),
+    ("package_price","Package price","Bundled package price","package",130),("callout_fee","Callout fee","Callout charge","callout",140),("travel_charge","Travel charge","Travel charge","trip",150),
+    ("material_item","Material item","Material item price","item",160),("percentage_fee","Percentage fee","Percentage fee","percent",170),("milestone_payment","Milestone payment","Stage or milestone payment","stage",180),
+    ("subscription_retainer","Subscription or retainer","Recurring subscription or retainer","period",190),
+]
+
+ADDITIONAL_CHARGES = [
+    ("materials","Materials","Materials supplied",10),("waste_removal","Waste removal","Waste removal charge",20),("travel_charge","Travel charge","Travel and mileage",30),
+    ("minimum_charge","Minimum charge","Minimum invoice charge",40),("callout_fee","Callout fee","Callout attendance fee",50),("machine_hire","Machine hire","Plant or machine hire",60),
+    ("subcontractor_cost","Subcontractor cost","Specialist subcontractor cost",70),("permit_fee","Permit or compliance fee","Permit or compliance fee",80),
+    ("delivery_charge","Delivery charge","Delivery charge",90),("parking_charge","Parking charge","Parking charge",100),("disposal_charge","Disposal charge","Disposal or tipping charge",110),
+    ("emergency_surcharge","Emergency surcharge","Emergency or out-of-hours surcharge",120),
+]
+
+TRADES_ACTIVITY_CATALOGUE = {
+    "landscaping": ["garden_design","turf_laying","planting_scheme","soil_preparation","raised_beds"],
+    "grounds_maintenance": ["grass_cutting","weed_control","seasonal_clearance","border_maintenance","leaf_clearance"],
+    "tree_surgery": ["tree_pruning","tree_felling","stump_grinding","crown_reduction","hedge_trimming"],
+    "fencing": ["fence_installation","fence_repair","gate_installation","post_replacement","panel_replacement"],
+    "drainage_groundworks": ["french_drain","soakaway_installation","trenching","foundation_excavation","land_drainage"],
+    "paving_patios": ["patio_installation","block_paving","driveway_repair","path_installation","slab_relaying"],
+    "building_maintenance": ["general_repairs","brickwork_repair","plaster_patch","door_repair","property_inspection"],
+    "painting_decorating": ["interior_painting","exterior_painting","wallpapering","woodwork_painting","surface_preparation"],
+    "electrical": ["socket_installation","lighting_installation","fault_finding","consumer_unit_work","ev_charger_installation"],
+    "plumbing_heating": ["leak_repair","tap_replacement","radiator_installation","pipework_repair","bathroom_plumbing"],
+    "gas_boilers": ["boiler_service","boiler_repair","gas_safety_check","boiler_installation","smart_thermostat"],
+    "hvac": ["air_conditioning_service","ventilation_installation","filter_replacement","heat_pump_service","ductwork_repair"],
+    "carpentry_joinery": ["door_hanging","skirting_installation","custom_shelving","decking_installation","cabinet_repair"],
+    "roofing_guttering": ["roof_repair","gutter_cleaning","gutter_replacement","fascia_soffit_repair","flat_roof_repair"],
+    "flooring_tiling": ["floor_laying","tile_installation","grout_repair","laminate_flooring","floor_levelling"],
+    "glazing_windows": ["window_repair","double_glazing_replacement","glass_replacement","seal_repair","window_installation"],
+    "pest_control": ["rodent_treatment","wasp_nest_removal","insect_treatment","bird_proofing","pest_inspection"],
+    "locksmith": ["lock_replacement","emergency_entry","key_cutting","door_mechanism_repair","security_upgrade"],
+    "solar_energy": ["solar_panel_installation","solar_panel_cleaning","inverter_replacement","battery_installation","solar_inspection"],
+    "scaffolding": ["scaffold_erection","scaffold_dismantle","tower_hire","edge_protection","permit_arrangement"],
+    "pool_maintenance": ["pool_cleaning","chemical_balance","pump_service","liner_repair","winter_closing"],
+    "pressure_washing": ["driveway_cleaning","patio_cleaning","decking_cleaning","render_cleaning","graffiti_removal"],
+    "waste_removal": ["green_waste_removal","skip_loading","rubbish_clearance","soil_disposal","bulk_bag_collection"],
+    "handyman": ["flat_pack_assembly","picture_hanging","minor_repairs","fixture_installation","silicone_sealing"],
+    "security_alarms_cameras": ["alarm_installation","cctv_installation","camera_service","sensor_replacement","access_control"],
+}
+
+SUBTYPE_NAMES = {
+    "landscaping":"Landscaping","grounds_maintenance":"Grounds maintenance","tree_surgery":"Tree surgery","fencing":"Fencing","drainage_groundworks":"Drainage and groundworks",
+    "paving_patios":"Paving and patios","building_maintenance":"Building maintenance","painting_decorating":"Painting and decorating","electrical":"Electrical","plumbing_heating":"Plumbing and heating",
+    "gas_boilers":"Gas and boilers","hvac":"HVAC","carpentry_joinery":"Carpentry and joinery","roofing_guttering":"Roofing and guttering","flooring_tiling":"Flooring and tiling",
+    "glazing_windows":"Glazing and windows","pest_control":"Pest control","locksmith":"Locksmith","solar_energy":"Solar energy","scaffolding":"Scaffolding","pool_maintenance":"Pool maintenance",
+    "pressure_washing":"Pressure washing","waste_removal":"Waste removal","handyman":"Handyman","security_alarms_cameras":"Security alarms and cameras",
+}
+
+def _label_from_code(code: str) -> str:
+    return code.replace("_", " ").title()
+
+def _activity_defaults(code: str):
+    if any(x in code for x in ("waste", "soil_disposal", "bulk_bag")):
+        return "per_bulk_bag", ["per_bulk_bag","per_skip","per_tonne","fixed_price","hourly_rate"], ["waste_removal","disposal_charge","travel_charge","minimum_charge","emergency_surcharge"]
+    if any(x in code for x in ("paving", "patio", "floor", "tile", "turf", "render")):
+        return "per_square_metre", ["per_square_metre","fixed_price","hourly_rate","day_rate","material_item"], ["materials","delivery_charge","machine_hire","waste_removal","minimum_charge"]
+    if any(x in code for x in ("fence", "gate", "gutter", "skirting", "pipework", "trenching")):
+        return "per_metre", ["per_metre","fixed_price","hourly_rate","material_item"], ["materials","delivery_charge","waste_removal","minimum_charge"]
+    if any(x in code for x in ("service", "inspection", "check", "cleaning", "balance")):
+        return "per_visit", ["per_visit","hourly_rate","fixed_price","subscription_retainer"], ["callout_fee","travel_charge","materials","emergency_surcharge"]
+    if any(x in code for x in ("installation", "replacement", "repair", "removal", "assembly")):
+        return "fixed_price", ["fixed_price","hourly_rate","day_rate","per_item","material_item"], ["materials","callout_fee","travel_charge","delivery_charge","minimum_charge"]
+    return "hourly_rate", ["hourly_rate","day_rate","fixed_price","package_price"], ["materials","travel_charge","minimum_charge","callout_fee"]
+
+def seed_activity_catalogue():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            for code, name, desc, unit, sort_order in PRICING_METHODS:
+                cur.execute("""INSERT INTO pricing_methods (code,name,description,unit_label,sort_order,is_active)
+                    VALUES (%s,%s,%s,%s,%s,true)
+                    ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description,
+                    unit_label=EXCLUDED.unit_label, sort_order=EXCLUDED.sort_order, is_active=true, updated_at=now()""",
+                    (code,name,desc,unit,sort_order))
+            for code, name, desc, sort_order in ADDITIONAL_CHARGES:
+                cur.execute("""INSERT INTO additional_charges (code,name,description,sort_order,is_active)
+                    VALUES (%s,%s,%s,%s,true)
+                    ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description,
+                    sort_order=EXCLUDED.sort_order, is_active=true, updated_at=now()""", (code,name,desc,sort_order))
+            cur.execute("SELECT id FROM industry_groups WHERE code=%s LIMIT 1", ("trades_field_services",))
+            row = cur.fetchone()
+            if row: group_id = row["id"]
+            else:
+                cur.execute("INSERT INTO industry_groups (code,name,sort_order) VALUES (%s,%s,%s) RETURNING id", ("trades_field_services","Trades and field services",10))
+                group_id = cur.fetchone()["id"]
+            subtype_ids = {}
+            for index, (code, name) in enumerate(SUBTYPE_NAMES.items(), start=1):
+                cur.execute("SELECT id FROM industry_subtypes WHERE code=%s LIMIT 1", (code,))
+                row = cur.fetchone()
+                if row: subtype_ids[code] = row["id"]
+                else:
+                    cur.execute("INSERT INTO industry_subtypes (industry_group_id,code,name,sort_order) VALUES (%s,%s,%s,%s) RETURNING id", (group_id,code,name,index*10))
+                    subtype_ids[code] = cur.fetchone()["id"]
+            seeded = 0
+            for subtype_code, activities in TRADES_ACTIVITY_CATALOGUE.items():
+                subtype_id = subtype_ids[subtype_code]
+                for index, activity_code in enumerate(activities, start=1):
+                    default_method, methods, charges = _activity_defaults(activity_code)
+                    full_code = f"{subtype_code}.{activity_code}"
+                    name = _label_from_code(activity_code)
+                    aliases = [name.lower(), activity_code.replace("_", " ")]
+                    cur.execute("""INSERT INTO system_activity_templates
+                        (industry_group_id,industry_subtype_id,activity_code,activity_name,description,default_pricing_method,
+                         available_pricing_methods,available_additional_charges,voice_aliases,sort_order,is_active)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,true)
+                        ON CONFLICT (activity_code) DO UPDATE SET activity_name=EXCLUDED.activity_name,
+                         description=EXCLUDED.description, default_pricing_method=EXCLUDED.default_pricing_method,
+                         available_pricing_methods=EXCLUDED.available_pricing_methods,
+                         available_additional_charges=EXCLUDED.available_additional_charges,
+                         voice_aliases=EXCLUDED.voice_aliases, sort_order=EXCLUDED.sort_order, is_active=true, updated_at=now()""",
+                        (group_id, subtype_id, full_code, name, f"System template for {name} in {SUBTYPE_NAMES[subtype_code]}",
+                         default_method, json.dumps(methods), json.dumps(charges), json.dumps(aliases), index*10))
+                    seeded += 1
+            conn.commit()
+            print(f"Activity catalogue seeded: {seeded} activities")
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        release_conn(conn)
 
 # ========== TENANT CONFIG LOADER ==========
 _tenant_config_cache = {}
@@ -1692,7 +1896,8 @@ async def get_settings():
 
 
 @app.get("/debug/db-schema")
-async def db_schema():
+async def db_schema(request: Request):
+    require_debug_admin(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -1702,7 +1907,10 @@ async def db_schema():
 
 
 @app.post("/debug/repair-schema")
-async def repair_schema():
+async def repair_schema(request: Request):
+    require_debug_admin(request)
+    if os.getenv("ENABLE_SCHEMA_REPAIR_ENDPOINT", "").lower() != "true":
+        raise HTTPException(404, "Not found")
     conn = get_db_conn()
     results = []
     try:
@@ -1748,7 +1956,8 @@ async def repair_schema():
 # /debug/seed-admin REMOVED — security risk (was public, no auth)
 
 @app.get("/debug/test-voice")
-async def test_voice():
+async def test_voice(request: Request):
+    require_debug_admin(request)
     """Test voice session input to see actual error"""
     conn = get_db_conn()
     try:
@@ -2126,11 +2335,32 @@ async def get_work_report(report_id: int):
 
 # ========== AUTH: JWT ==========
 
+PBKDF2_PASSWORD_ITERATIONS = 200000
+
+
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    salt = os.urandom(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_PASSWORD_ITERATIONS}${salt.hex()}${derived.hex()}"
+
 
 def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
+    if not hashed:
+        return False
+    if hashed.startswith("pbkdf2_sha256$"):
+        try:
+            _, iterations_raw, salt_hex, hash_hex = hashed.split("$", 3)
+            iterations = int(iterations_raw)
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(hash_hex)
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+    if len(hashed) == 64 and all(c in "0123456789abcdefABCDEF" for c in hashed):
+        legacy = hashlib.sha256(password.encode()).hexdigest()
+        return hmac.compare_digest(legacy, hashed.lower())
+    return False
 
 def create_token(user_id: int, tenant_id: int, role: str, token_type: str = "access") -> str:
     if token_type == "access":
@@ -2514,6 +2744,121 @@ async def get_industry_subtypes(group_id: int):
             return [dict(r) for r in cur.fetchall()]
     finally: release_conn(conn)
 
+@app.get("/activity/pricing-methods")
+async def list_pricing_methods():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT code,name,description,unit_label,sort_order,is_active FROM pricing_methods WHERE is_active=true ORDER BY sort_order,code")
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.get("/activity/additional-charges")
+async def list_additional_charges():
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT code,name,description,sort_order,is_active FROM additional_charges WHERE is_active=true ORDER BY sort_order,code")
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.get("/activity/system")
+async def list_system_activities(industry_subtype_id: Optional[int]=None, industry_group_id: Optional[int]=None):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = """SELECT sat.*, ig.code AS industry_group_code, ig.name AS industry_group_name,
+                    ist.code AS industry_subtype_code, ist.name AS industry_subtype_name
+                FROM system_activity_templates sat
+                JOIN industry_groups ig ON sat.industry_group_id=ig.id
+                JOIN industry_subtypes ist ON sat.industry_subtype_id=ist.id
+                WHERE sat.is_active=true"""
+            params = []
+            if industry_subtype_id is not None:
+                sql += " AND sat.industry_subtype_id=%s"; params.append(industry_subtype_id)
+            if industry_group_id is not None:
+                sql += " AND sat.industry_group_id=%s"; params.append(industry_group_id)
+            sql += " ORDER BY ig.sort_order, ist.sort_order, sat.sort_order, sat.activity_name"
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.get("/onboarding/industry-subtypes/{subtype_id}/activities")
+async def get_industry_subtype_activities(subtype_id: int):
+    return await list_system_activities(industry_subtype_id=subtype_id)
+
+@app.get("/tenant/activity-pricing/{tenant_id}")
+async def list_tenant_activity_pricing(tenant_id: int, industry_subtype_id: Optional[int]=None):
+    conn = get_db_conn()
+    try:
+        verify_tenant(conn, tenant_id)
+        with conn.cursor() as cur:
+            sql = """SELECT sat.id AS system_activity_template_id, sat.activity_code, sat.activity_name,
+                    sat.description, sat.default_pricing_method, sat.available_pricing_methods,
+                    sat.available_additional_charges, sat.voice_aliases AS system_voice_aliases,
+                    sat.industry_group_id, sat.industry_subtype_id,
+                    tap.id AS override_id, COALESCE(tap.is_enabled, true) AS is_enabled,
+                    COALESCE(tap.selected_pricing_method, sat.default_pricing_method) AS selected_pricing_method,
+                    tap.price_amount, COALESCE(tap.currency, 'GBP') AS currency,
+                    COALESCE(tap.additional_charge_settings, '{}'::jsonb) AS additional_charge_settings,
+                    tap.custom_display_name, tap.notes, COALESCE(tap.voice_aliases, '[]'::jsonb) AS tenant_voice_aliases
+                FROM system_activity_templates sat
+                LEFT JOIN tenant_activity_pricing tap
+                  ON tap.system_activity_template_id=sat.id AND tap.tenant_id=%s
+                WHERE sat.is_active=true"""
+            params = [tenant_id]
+            if industry_subtype_id is not None:
+                sql += " AND sat.industry_subtype_id=%s"; params.append(industry_subtype_id)
+            sql += " ORDER BY sat.industry_group_id, sat.industry_subtype_id, sat.sort_order, sat.activity_name"
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+    finally: release_conn(conn)
+
+@app.put("/tenant/activity-pricing/{tenant_id}/{activity_id}")
+async def update_tenant_activity_pricing(tenant_id: int, activity_id: int, data: dict):
+    conn = get_db_conn()
+    try:
+        verify_tenant(conn, tenant_id)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,default_pricing_method,available_pricing_methods FROM system_activity_templates WHERE id=%s AND is_active=true", (activity_id,))
+            template = cur.fetchone()
+            if not template: raise HTTPException(404, "System activity template not found")
+            selected = data.get("selected_pricing_method") or template["default_pricing_method"]
+            methods = template.get("available_pricing_methods") or []
+            if isinstance(methods, str): methods = json.loads(methods)
+            if selected not in methods: raise HTTPException(422, "selected_pricing_method is not available for this activity")
+            cur.execute("""INSERT INTO tenant_activity_pricing
+                (tenant_id,system_activity_template_id,is_enabled,selected_pricing_method,price_amount,currency,
+                 additional_charge_settings,custom_display_name,notes,voice_aliases,updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,now())
+                ON CONFLICT (tenant_id,system_activity_template_id) DO UPDATE SET
+                 is_enabled=EXCLUDED.is_enabled, selected_pricing_method=EXCLUDED.selected_pricing_method,
+                 price_amount=EXCLUDED.price_amount, currency=EXCLUDED.currency,
+                 additional_charge_settings=EXCLUDED.additional_charge_settings,
+                 custom_display_name=EXCLUDED.custom_display_name, notes=EXCLUDED.notes,
+                 voice_aliases=EXCLUDED.voice_aliases, updated_at=now()
+                RETURNING id""",
+                (tenant_id, activity_id, data.get("is_enabled", True), selected, data.get("price_amount"), data.get("currency", "GBP"),
+                 json.dumps(data.get("additional_charge_settings", {})), data.get("custom_display_name"), data.get("notes"), json.dumps(data.get("voice_aliases", []))))
+            override_id = cur.fetchone()["id"]
+            conn.commit()
+            return {"status":"ok","override_id":override_id,"tenant_id":tenant_id,"system_activity_template_id":activity_id}
+    except HTTPException: raise
+    except Exception as e:
+        conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
+
+@app.delete("/tenant/activity-pricing/{tenant_id}/{activity_id}")
+async def reset_tenant_activity_pricing(tenant_id: int, activity_id: int):
+    conn = get_db_conn()
+    try:
+        verify_tenant(conn, tenant_id)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tenant_activity_pricing WHERE tenant_id=%s AND system_activity_template_id=%s", (tenant_id, activity_id))
+            conn.commit()
+            return {"status":"reset","tenant_id":tenant_id,"system_activity_template_id":activity_id}
+    finally: release_conn(conn)
+
 @app.get("/onboarding/status/{tenant_id}")
 async def get_onboarding_status(tenant_id: int):
     conn = get_db_conn()
@@ -2692,8 +3037,334 @@ async def health():
         return {"status":"ok","version":"1.2a","ai":bool(OPENAI_API_KEY)}
     except: return {"status":"error"}
 
+class BootstrapFirstAdminRequest(BaseModel):
+    company_name: str
+    admin_email: str
+    admin_password: str
+    admin_display_name: str
+    admin_first_name: Optional[str] = None
+    admin_last_name: Optional[str] = None
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    legal_type: Optional[str] = None
+    country: Optional[str] = None
+    timezone: Optional[str] = None
+    currency: Optional[str] = None
+    industry_group_id: Optional[int] = None
+    industry_subtype_id: Optional[int] = None
+    default_internal_language_code: Optional[str] = None
+    default_customer_language_code: Optional[str] = None
+    workspace_mode: Optional[str] = None
+
+
+def _safe_slug(value: str) -> str:
+    chars = []
+    previous_dash = False
+    for ch in (value or "").lower():
+        if ch.isalnum():
+            chars.append(ch)
+            previous_dash = False
+        elif not previous_dash:
+            chars.append("-")
+            previous_dash = True
+    slug = "".join(chars).strip("-")
+    return slug[:60] or f"tenant-{uuid.uuid4().hex[:8]}"
+
+
+def _table_exists(cur, table_name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s) AS table_name", (f"crm.{table_name}",))
+    row = cur.fetchone()
+    if row and row.get("table_name"):
+        return True
+    cur.execute("SELECT to_regclass(%s) AS table_name", (table_name,))
+    row = cur.fetchone()
+    return bool(row and row.get("table_name"))
+
+
+def _table_columns(cur, table_name: str) -> dict:
+    cur.execute("""SELECT column_name, column_default
+        FROM information_schema.columns
+        WHERE table_schema IN ('crm','public') AND table_name=%s
+        ORDER BY CASE WHEN table_schema='crm' THEN 0 ELSE 1 END, ordinal_position""", (table_name,))
+    return {row["column_name"]: row.get("column_default") for row in cur.fetchall()}
+
+
+def _next_id_value(cur, table_name: str) -> int:
+    cur.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table_name}")
+    return int(cur.fetchone()["next_id"])
+
+
+def _insert_dynamic(cur, table_name: str, values: dict, columns: dict, returning: str = "id"):
+    insert_values = {k: v for k, v in values.items() if k in columns}
+    if "id" in columns and not columns.get("id") and "id" not in insert_values:
+        insert_values["id"] = _next_id_value(cur, table_name)
+    names = list(insert_values.keys())
+    placeholders = ["%s"] * len(names)
+    sql = f"INSERT INTO {table_name} ({','.join(names)}) VALUES ({','.join(placeholders)})"
+    if returning in columns:
+        sql += f" RETURNING {returning}"
+    cur.execute(sql, [insert_values[name] for name in names])
+    if returning in columns:
+        return cur.fetchone()[returning]
+    return None
+
+
+def _upsert_dynamic_by_tenant(cur, table_name: str, values: dict):
+    if not _table_exists(cur, table_name):
+        return
+    columns = _table_columns(cur, table_name)
+    if "tenant_id" not in columns:
+        return
+    safe_values = {k: v for k, v in values.items() if k in columns}
+    if not safe_values:
+        return
+    cur.execute(f"SELECT id FROM {table_name} WHERE tenant_id=%s LIMIT 1", (values["tenant_id"],))
+    existing = cur.fetchone()
+    if existing:
+        updates = [k for k in safe_values.keys() if k != "tenant_id"]
+        if updates:
+            if "updated_at" in columns and "updated_at" not in updates:
+                set_sql = ",".join([f"{k}=%s" for k in updates] + ["updated_at=now()"])
+                params = [safe_values[k] for k in updates]
+            else:
+                set_sql = ",".join([f"{k}=%s" for k in updates])
+                params = [safe_values[k] for k in updates]
+            params.append(values["tenant_id"])
+            cur.execute(f"UPDATE {table_name} SET {set_sql} WHERE tenant_id=%s", params)
+    else:
+        _insert_dynamic(cur, table_name, safe_values, columns, returning="id")
+
+
+@app.get("/bootstrap/status")
+async def bootstrap_status():
+    conn = None
+    details = {"migration_log_readable": False}
+    admin_exists = False
+    tenant_exists = False
+    latest_migration = None
+    try:
+        conn = get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM users u
+                LEFT JOIN roles r ON u.role_id = r.id
+                WHERE u.deleted_at IS NULL
+                  AND COALESCE(u.status, 'active') = 'active'
+                  AND r.role_name = 'admin'
+            ) AS exists""")
+            admin_exists = bool(cur.fetchone()["exists"])
+
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM tenants
+                WHERE COALESCE(status, 'active') = 'active'
+            ) AS exists""")
+            tenant_exists = bool(cur.fetchone()["exists"])
+
+            try:
+                cur.execute("SELECT to_regclass('crm.migration_log') AS table_name")
+                migration_table = cur.fetchone()["table_name"]
+                if migration_table:
+                    cur.execute("SELECT filename FROM migration_log ORDER BY applied_at DESC NULLS LAST, id DESC LIMIT 1")
+                    row = cur.fetchone()
+                    latest_migration = row["filename"] if row else None
+                    details["migration_log_readable"] = True
+                else:
+                    details["migration_log_message"] = "migration_log table not found"
+            except Exception:
+                details["migration_log_message"] = "migration_log could not be read"
+
+        system_configured = admin_exists and tenant_exists
+        details["admin_check"] = "ok"
+        details["tenant_check"] = "ok"
+        return {
+            "system_configured": system_configured,
+            "admin_exists": admin_exists,
+            "tenant_exists": tenant_exists,
+            "onboarding_required": not system_configured,
+            "server_version": "1.2a",
+            "database_available": True,
+            "latest_migration": latest_migration,
+            "details": details,
+        }
+    except Exception as e:
+        details["database_message"] = "database unavailable or bootstrap status checks failed"
+        details["error_type"] = type(e).__name__
+        return {
+            "system_configured": False,
+            "admin_exists": False,
+            "tenant_exists": False,
+            "onboarding_required": True,
+            "server_version": "1.2a",
+            "database_available": False,
+            "latest_migration": None,
+            "details": details,
+        }
+    finally:
+        if conn:
+            release_conn(conn)
+
+
+@app.post("/bootstrap/first-admin")
+async def bootstrap_first_admin(data: BootstrapFirstAdminRequest):
+    company_name = data.company_name.strip()
+    admin_email = data.admin_email.strip().lower()
+    admin_password = data.admin_password
+    admin_display_name = data.admin_display_name.strip()
+    if not company_name:
+        raise HTTPException(422, "company_name is required")
+    if "@" not in admin_email:
+        raise HTTPException(422, "admin_email must be valid")
+    if len(admin_password) < 8:
+        raise HTTPException(422, "admin_password must be at least 8 characters")
+    if not admin_display_name:
+        raise HTTPException(422, "admin_display_name is required")
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(912202601)")
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM users u
+                JOIN roles r ON u.role_id = r.id
+                WHERE u.deleted_at IS NULL
+                  AND COALESCE(u.status, 'active') IN ('active', 'setup')
+                  AND r.role_name = 'admin'
+            ) AS exists""")
+            if bool(cur.fetchone()["exists"]):
+                conn.rollback()
+                raise HTTPException(409, "First admin already exists")
+
+            cur.execute("SELECT id FROM users WHERE LOWER(email)=%s AND deleted_at IS NULL LIMIT 1", (admin_email,))
+            if cur.fetchone():
+                conn.rollback()
+                raise HTTPException(409, "Email already registered")
+
+            tenant_columns = _table_columns(cur, "tenants")
+            cur.execute("""SELECT id FROM tenants
+                WHERE COALESCE(status, 'active') = 'active'
+                ORDER BY id LIMIT 1""")
+            tenant = cur.fetchone()
+            if tenant:
+                tenant_id = tenant["id"]
+            else:
+                slug = _safe_slug(company_name)
+                cur.execute("SELECT id FROM tenants WHERE slug=%s LIMIT 1", (slug,))
+                if cur.fetchone():
+                    slug = f"{slug[:52]}-{uuid.uuid4().hex[:6]}"
+                tenant_values = {
+                    "name": company_name,
+                    "slug": slug,
+                    "status": "active",
+                    "legal_type": data.legal_type,
+                    "phone": data.phone,
+                    "email": admin_email,
+                    "website": data.website,
+                    "country_code": data.country or "GB",
+                    "timezone": data.timezone or "Europe/London",
+                    "currency": data.currency or "GBP",
+                }
+                tenant_id = _insert_dynamic(cur, "tenants", tenant_values, tenant_columns, returning="id")
+
+            cur.execute("SELECT id FROM roles WHERE role_name='admin' LIMIT 1")
+            role = cur.fetchone()
+            if role:
+                role_id = role["id"]
+            else:
+                role_columns = _table_columns(cur, "roles")
+                _insert_dynamic(cur, "roles", {"role_name": "admin", "description": "Full access"}, role_columns, returning="id")
+                cur.execute("SELECT id FROM roles WHERE role_name='admin' LIMIT 1")
+                role = cur.fetchone()
+                if not role:
+                    raise HTTPException(500, "Admin role could not be created")
+                role_id = role["id"]
+
+            first_name = (data.admin_first_name or admin_display_name.split(" ", 1)[0]).strip()
+            last_name = (data.admin_last_name or (admin_display_name.split(" ", 1)[1] if " " in admin_display_name else "")).strip()
+            user_columns = _table_columns(cur, "users")
+            user_values = {
+                "tenant_id": tenant_id,
+                "role_id": role_id,
+                "first_name": first_name,
+                "last_name": last_name,
+                "display_name": admin_display_name,
+                "email": admin_email,
+                "phone": data.phone,
+                "password_hash": hash_password(admin_password),
+                "status": "active",
+                "is_owner": True,
+                "preferred_language_code": data.default_internal_language_code or "en",
+            }
+            admin_user_id = _insert_dynamic(cur, "users", user_values, user_columns, returning="id")
+
+            settings_values = {
+                "tenant_id": tenant_id,
+                "company_name": company_name,
+                "phone": data.phone,
+                "website": data.website,
+                "legal_type": data.legal_type,
+                "default_location": data.country,
+                "country": data.country,
+                "country_code": data.country,
+                "currency": data.currency or "GBP",
+            }
+            _upsert_dynamic_by_tenant(cur, "tenant_settings", settings_values)
+
+            workspace_mode = data.workspace_mode or "solo"
+            internal_lang = data.default_internal_language_code or "en"
+            customer_lang = data.default_customer_language_code or "en"
+            profile_values = {
+                "tenant_id": tenant_id,
+                "workspace_mode": workspace_mode,
+                "default_internal_language_code": internal_lang,
+                "default_customer_language_code": customer_lang,
+                "internal_language_mode": "single",
+                "customer_language_mode": "single",
+                "industry_group_id": data.industry_group_id,
+                "industry_subtype_id": data.industry_subtype_id,
+            }
+            _upsert_dynamic_by_tenant(cur, "tenant_operating_profile", profile_values)
+
+            if _table_exists(cur, "tenant_languages"):
+                language_columns = _table_columns(cur, "tenant_languages")
+                for index, (language_code, scope) in enumerate(((internal_lang, "internal"), (customer_lang, "customer")), start=1):
+                    cur.execute("""SELECT id FROM tenant_languages
+                        WHERE tenant_id=%s AND language_code=%s AND language_scope=%s LIMIT 1""",
+                        (tenant_id, language_code, scope))
+                    if not cur.fetchone():
+                        _insert_dynamic(cur, "tenant_languages", {
+                            "tenant_id": tenant_id,
+                            "language_code": language_code,
+                            "language_scope": scope,
+                            "is_default": True,
+                            "is_active": True,
+                            "sort_order": index,
+                        }, language_columns, returning="id")
+
+            conn.commit()
+        return {
+            "success": True,
+            "system_configured": True,
+            "tenant_id": tenant_id,
+            "admin_user_id": admin_user_id,
+            "admin_email": admin_email,
+            "onboarding_required": False,
+        }
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise HTTPException(500, "First admin bootstrap failed")
+    finally:
+        if conn:
+            release_conn(conn)
+
 @app.get("/debug/test-ai")
-async def test_ai():
+async def test_ai(request: Request):
+    require_debug_admin(request)
     if not ai_client: return {"status":"error","message":"OPENAI_API_KEY not set"}
     try:
         r = ai_client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":"Rekni ahoj"}],max_tokens=20)
@@ -2701,7 +3372,8 @@ async def test_ai():
     except Exception as e: return {"status":"error","message":str(e)}
 
 @app.get("/debug/schema-audit")
-async def schema_audit():
+async def schema_audit(request: Request):
+    require_debug_admin(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
