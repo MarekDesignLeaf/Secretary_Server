@@ -1,4 +1,4 @@
-﻿import os, json, uuid, csv, io, hashlib
+﻿import os, json, uuid, csv, io, hashlib, hmac
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
@@ -28,8 +28,8 @@ JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
-PROTECTED_PREFIXES = ["/crm/", "/process", "/voice/", "/work-reports"]
-PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
+PROTECTED_PREFIXES = ["/crm/", "/process", "/voice/", "/work-reports", "/debug/"]
+PUBLIC_PATHS = ["/health", "/bootstrap/status", "/bootstrap/first-admin", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -56,6 +56,15 @@ async def auth_middleware(request: Request, call_next):
     except pyjwt.InvalidTokenError:
         return JSONResponse(status_code=401, content={"detail": "Invalid token"})
     return await call_next(request)
+
+
+def require_debug_admin(request: Request):
+    if os.getenv("ENABLE_DEBUG_ENDPOINTS", "").lower() != "true":
+        raise HTTPException(404, "Not found")
+    user = getattr(request.state, "user", {})
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin role required")
+
 
 def get_request_tenant_id(request: Request) -> int:
     """Extract tenant_id from authenticated request. Falls back to 1."""
@@ -1692,7 +1701,8 @@ async def get_settings():
 
 
 @app.get("/debug/db-schema")
-async def db_schema():
+async def db_schema(request: Request):
+    require_debug_admin(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -1702,7 +1712,10 @@ async def db_schema():
 
 
 @app.post("/debug/repair-schema")
-async def repair_schema():
+async def repair_schema(request: Request):
+    require_debug_admin(request)
+    if os.getenv("ENABLE_SCHEMA_REPAIR_ENDPOINT", "").lower() != "true":
+        raise HTTPException(404, "Not found")
     conn = get_db_conn()
     results = []
     try:
@@ -1748,7 +1761,8 @@ async def repair_schema():
 # /debug/seed-admin REMOVED — security risk (was public, no auth)
 
 @app.get("/debug/test-voice")
-async def test_voice():
+async def test_voice(request: Request):
+    require_debug_admin(request)
     """Test voice session input to see actual error"""
     conn = get_db_conn()
     try:
@@ -2126,11 +2140,32 @@ async def get_work_report(report_id: int):
 
 # ========== AUTH: JWT ==========
 
+PBKDF2_PASSWORD_ITERATIONS = 200000
+
+
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    salt = os.urandom(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_PASSWORD_ITERATIONS}${salt.hex()}${derived.hex()}"
+
 
 def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
+    if not hashed:
+        return False
+    if hashed.startswith("pbkdf2_sha256$"):
+        try:
+            _, iterations_raw, salt_hex, hash_hex = hashed.split("$", 3)
+            iterations = int(iterations_raw)
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(hash_hex)
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+    if len(hashed) == 64 and all(c in "0123456789abcdefABCDEF" for c in hashed):
+        legacy = hashlib.sha256(password.encode()).hexdigest()
+        return hmac.compare_digest(legacy, hashed.lower())
+    return False
 
 def create_token(user_id: int, tenant_id: int, role: str, token_type: str = "access") -> str:
     if token_type == "access":
@@ -2692,8 +2727,334 @@ async def health():
         return {"status":"ok","version":"1.2a","ai":bool(OPENAI_API_KEY)}
     except: return {"status":"error"}
 
+class BootstrapFirstAdminRequest(BaseModel):
+    company_name: str
+    admin_email: str
+    admin_password: str
+    admin_display_name: str
+    admin_first_name: Optional[str] = None
+    admin_last_name: Optional[str] = None
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    legal_type: Optional[str] = None
+    country: Optional[str] = None
+    timezone: Optional[str] = None
+    currency: Optional[str] = None
+    industry_group_id: Optional[int] = None
+    industry_subtype_id: Optional[int] = None
+    default_internal_language_code: Optional[str] = None
+    default_customer_language_code: Optional[str] = None
+    workspace_mode: Optional[str] = None
+
+
+def _safe_slug(value: str) -> str:
+    chars = []
+    previous_dash = False
+    for ch in (value or "").lower():
+        if ch.isalnum():
+            chars.append(ch)
+            previous_dash = False
+        elif not previous_dash:
+            chars.append("-")
+            previous_dash = True
+    slug = "".join(chars).strip("-")
+    return slug[:60] or f"tenant-{uuid.uuid4().hex[:8]}"
+
+
+def _table_exists(cur, table_name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s) AS table_name", (f"crm.{table_name}",))
+    row = cur.fetchone()
+    if row and row.get("table_name"):
+        return True
+    cur.execute("SELECT to_regclass(%s) AS table_name", (table_name,))
+    row = cur.fetchone()
+    return bool(row and row.get("table_name"))
+
+
+def _table_columns(cur, table_name: str) -> dict:
+    cur.execute("""SELECT column_name, column_default
+        FROM information_schema.columns
+        WHERE table_schema IN ('crm','public') AND table_name=%s
+        ORDER BY CASE WHEN table_schema='crm' THEN 0 ELSE 1 END, ordinal_position""", (table_name,))
+    return {row["column_name"]: row.get("column_default") for row in cur.fetchall()}
+
+
+def _next_id_value(cur, table_name: str) -> int:
+    cur.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table_name}")
+    return int(cur.fetchone()["next_id"])
+
+
+def _insert_dynamic(cur, table_name: str, values: dict, columns: dict, returning: str = "id"):
+    insert_values = {k: v for k, v in values.items() if k in columns}
+    if "id" in columns and not columns.get("id") and "id" not in insert_values:
+        insert_values["id"] = _next_id_value(cur, table_name)
+    names = list(insert_values.keys())
+    placeholders = ["%s"] * len(names)
+    sql = f"INSERT INTO {table_name} ({','.join(names)}) VALUES ({','.join(placeholders)})"
+    if returning in columns:
+        sql += f" RETURNING {returning}"
+    cur.execute(sql, [insert_values[name] for name in names])
+    if returning in columns:
+        return cur.fetchone()[returning]
+    return None
+
+
+def _upsert_dynamic_by_tenant(cur, table_name: str, values: dict):
+    if not _table_exists(cur, table_name):
+        return
+    columns = _table_columns(cur, table_name)
+    if "tenant_id" not in columns:
+        return
+    safe_values = {k: v for k, v in values.items() if k in columns}
+    if not safe_values:
+        return
+    cur.execute(f"SELECT id FROM {table_name} WHERE tenant_id=%s LIMIT 1", (values["tenant_id"],))
+    existing = cur.fetchone()
+    if existing:
+        updates = [k for k in safe_values.keys() if k != "tenant_id"]
+        if updates:
+            if "updated_at" in columns and "updated_at" not in updates:
+                set_sql = ",".join([f"{k}=%s" for k in updates] + ["updated_at=now()"])
+                params = [safe_values[k] for k in updates]
+            else:
+                set_sql = ",".join([f"{k}=%s" for k in updates])
+                params = [safe_values[k] for k in updates]
+            params.append(values["tenant_id"])
+            cur.execute(f"UPDATE {table_name} SET {set_sql} WHERE tenant_id=%s", params)
+    else:
+        _insert_dynamic(cur, table_name, safe_values, columns, returning="id")
+
+
+@app.get("/bootstrap/status")
+async def bootstrap_status():
+    conn = None
+    details = {"migration_log_readable": False}
+    admin_exists = False
+    tenant_exists = False
+    latest_migration = None
+    try:
+        conn = get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM users u
+                LEFT JOIN roles r ON u.role_id = r.id
+                WHERE u.deleted_at IS NULL
+                  AND COALESCE(u.status, 'active') = 'active'
+                  AND r.role_name = 'admin'
+            ) AS exists""")
+            admin_exists = bool(cur.fetchone()["exists"])
+
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM tenants
+                WHERE COALESCE(status, 'active') = 'active'
+            ) AS exists""")
+            tenant_exists = bool(cur.fetchone()["exists"])
+
+            try:
+                cur.execute("SELECT to_regclass('crm.migration_log') AS table_name")
+                migration_table = cur.fetchone()["table_name"]
+                if migration_table:
+                    cur.execute("SELECT filename FROM migration_log ORDER BY applied_at DESC NULLS LAST, id DESC LIMIT 1")
+                    row = cur.fetchone()
+                    latest_migration = row["filename"] if row else None
+                    details["migration_log_readable"] = True
+                else:
+                    details["migration_log_message"] = "migration_log table not found"
+            except Exception:
+                details["migration_log_message"] = "migration_log could not be read"
+
+        system_configured = admin_exists and tenant_exists
+        details["admin_check"] = "ok"
+        details["tenant_check"] = "ok"
+        return {
+            "system_configured": system_configured,
+            "admin_exists": admin_exists,
+            "tenant_exists": tenant_exists,
+            "onboarding_required": not system_configured,
+            "server_version": "1.2a",
+            "database_available": True,
+            "latest_migration": latest_migration,
+            "details": details,
+        }
+    except Exception as e:
+        details["database_message"] = "database unavailable or bootstrap status checks failed"
+        details["error_type"] = type(e).__name__
+        return {
+            "system_configured": False,
+            "admin_exists": False,
+            "tenant_exists": False,
+            "onboarding_required": True,
+            "server_version": "1.2a",
+            "database_available": False,
+            "latest_migration": None,
+            "details": details,
+        }
+    finally:
+        if conn:
+            release_conn(conn)
+
+
+@app.post("/bootstrap/first-admin")
+async def bootstrap_first_admin(data: BootstrapFirstAdminRequest):
+    company_name = data.company_name.strip()
+    admin_email = data.admin_email.strip().lower()
+    admin_password = data.admin_password
+    admin_display_name = data.admin_display_name.strip()
+    if not company_name:
+        raise HTTPException(422, "company_name is required")
+    if "@" not in admin_email:
+        raise HTTPException(422, "admin_email must be valid")
+    if len(admin_password) < 8:
+        raise HTTPException(422, "admin_password must be at least 8 characters")
+    if not admin_display_name:
+        raise HTTPException(422, "admin_display_name is required")
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(912202601)")
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM users u
+                JOIN roles r ON u.role_id = r.id
+                WHERE u.deleted_at IS NULL
+                  AND COALESCE(u.status, 'active') IN ('active', 'setup')
+                  AND r.role_name = 'admin'
+            ) AS exists""")
+            if bool(cur.fetchone()["exists"]):
+                conn.rollback()
+                raise HTTPException(409, "First admin already exists")
+
+            cur.execute("SELECT id FROM users WHERE LOWER(email)=%s AND deleted_at IS NULL LIMIT 1", (admin_email,))
+            if cur.fetchone():
+                conn.rollback()
+                raise HTTPException(409, "Email already registered")
+
+            tenant_columns = _table_columns(cur, "tenants")
+            cur.execute("""SELECT id FROM tenants
+                WHERE COALESCE(status, 'active') = 'active'
+                ORDER BY id LIMIT 1""")
+            tenant = cur.fetchone()
+            if tenant:
+                tenant_id = tenant["id"]
+            else:
+                slug = _safe_slug(company_name)
+                cur.execute("SELECT id FROM tenants WHERE slug=%s LIMIT 1", (slug,))
+                if cur.fetchone():
+                    slug = f"{slug[:52]}-{uuid.uuid4().hex[:6]}"
+                tenant_values = {
+                    "name": company_name,
+                    "slug": slug,
+                    "status": "active",
+                    "legal_type": data.legal_type,
+                    "phone": data.phone,
+                    "email": admin_email,
+                    "website": data.website,
+                    "country_code": data.country or "GB",
+                    "timezone": data.timezone or "Europe/London",
+                    "currency": data.currency or "GBP",
+                }
+                tenant_id = _insert_dynamic(cur, "tenants", tenant_values, tenant_columns, returning="id")
+
+            cur.execute("SELECT id FROM roles WHERE role_name='admin' LIMIT 1")
+            role = cur.fetchone()
+            if role:
+                role_id = role["id"]
+            else:
+                role_columns = _table_columns(cur, "roles")
+                _insert_dynamic(cur, "roles", {"role_name": "admin", "description": "Full access"}, role_columns, returning="id")
+                cur.execute("SELECT id FROM roles WHERE role_name='admin' LIMIT 1")
+                role = cur.fetchone()
+                if not role:
+                    raise HTTPException(500, "Admin role could not be created")
+                role_id = role["id"]
+
+            first_name = (data.admin_first_name or admin_display_name.split(" ", 1)[0]).strip()
+            last_name = (data.admin_last_name or (admin_display_name.split(" ", 1)[1] if " " in admin_display_name else "")).strip()
+            user_columns = _table_columns(cur, "users")
+            user_values = {
+                "tenant_id": tenant_id,
+                "role_id": role_id,
+                "first_name": first_name,
+                "last_name": last_name,
+                "display_name": admin_display_name,
+                "email": admin_email,
+                "phone": data.phone,
+                "password_hash": hash_password(admin_password),
+                "status": "active",
+                "is_owner": True,
+                "preferred_language_code": data.default_internal_language_code or "en",
+            }
+            admin_user_id = _insert_dynamic(cur, "users", user_values, user_columns, returning="id")
+
+            settings_values = {
+                "tenant_id": tenant_id,
+                "company_name": company_name,
+                "phone": data.phone,
+                "website": data.website,
+                "legal_type": data.legal_type,
+                "default_location": data.country,
+                "country": data.country,
+                "country_code": data.country,
+                "currency": data.currency or "GBP",
+            }
+            _upsert_dynamic_by_tenant(cur, "tenant_settings", settings_values)
+
+            workspace_mode = data.workspace_mode or "solo"
+            internal_lang = data.default_internal_language_code or "en"
+            customer_lang = data.default_customer_language_code or "en"
+            profile_values = {
+                "tenant_id": tenant_id,
+                "workspace_mode": workspace_mode,
+                "default_internal_language_code": internal_lang,
+                "default_customer_language_code": customer_lang,
+                "internal_language_mode": "single",
+                "customer_language_mode": "single",
+                "industry_group_id": data.industry_group_id,
+                "industry_subtype_id": data.industry_subtype_id,
+            }
+            _upsert_dynamic_by_tenant(cur, "tenant_operating_profile", profile_values)
+
+            if _table_exists(cur, "tenant_languages"):
+                language_columns = _table_columns(cur, "tenant_languages")
+                for index, (language_code, scope) in enumerate(((internal_lang, "internal"), (customer_lang, "customer")), start=1):
+                    cur.execute("""SELECT id FROM tenant_languages
+                        WHERE tenant_id=%s AND language_code=%s AND language_scope=%s LIMIT 1""",
+                        (tenant_id, language_code, scope))
+                    if not cur.fetchone():
+                        _insert_dynamic(cur, "tenant_languages", {
+                            "tenant_id": tenant_id,
+                            "language_code": language_code,
+                            "language_scope": scope,
+                            "is_default": True,
+                            "is_active": True,
+                            "sort_order": index,
+                        }, language_columns, returning="id")
+
+            conn.commit()
+        return {
+            "success": True,
+            "system_configured": True,
+            "tenant_id": tenant_id,
+            "admin_user_id": admin_user_id,
+            "admin_email": admin_email,
+            "onboarding_required": False,
+        }
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise HTTPException(500, "First admin bootstrap failed")
+    finally:
+        if conn:
+            release_conn(conn)
+
 @app.get("/debug/test-ai")
-async def test_ai():
+async def test_ai(request: Request):
+    require_debug_admin(request)
     if not ai_client: return {"status":"error","message":"OPENAI_API_KEY not set"}
     try:
         r = ai_client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":"Rekni ahoj"}],max_tokens=20)
@@ -2701,7 +3062,8 @@ async def test_ai():
     except Exception as e: return {"status":"error","message":str(e)}
 
 @app.get("/debug/schema-audit")
-async def schema_audit():
+async def schema_audit(request: Request):
+    require_debug_admin(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
