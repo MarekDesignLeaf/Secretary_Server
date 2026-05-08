@@ -1,45 +1,20 @@
-import os, json, uuid, csv, io, hashlib
-import re
+import os, json, uuid, csv, io, hashlib, hmac, re
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
-from urllib.parse import urlparse, urlencode
-from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, UploadFile, File, Form, Body
+from urllib.parse import urlparse
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 import uvicorn
 from openai import OpenAI
-import httpx
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import base64
-import imaplib
 import jwt as pyjwt
 import json
-import smtplib
 import urllib.request
-import unicodedata
-from email import policy
-from email.header import decode_header, make_header
-from email.message import EmailMessage
-from email.parser import BytesParser
-from email.utils import parsedate_to_datetime
-from contextlib import contextmanager, asynccontextmanager
-from action_executor import (
-    execute_action, register_handler, ActionResult,
-    get_registered_actions, _t as _at,
-)
-from ai_control_bridge import (
-    resolve_voice_command, update_voice_context,
-    get_screen_controls, generate_synonyms_for_control,
-    approve_synonym, reject_synonym,
-    generate_embeddings_for_control,
-    learn_contact_alias,
-    _find_contacts_by_alias,
-)
 
-app = FastAPI(title="Secretary CRM")
+app = FastAPI(title="Secretary CRM - DesignLeaf v1.2a")
 
 # === JWT CONFIG ===
 JWT_SECRET = os.getenv("JWT_SECRET")
@@ -51,764 +26,10 @@ print("JWT auth initialized — using environment secret")
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_EXPIRE_MINUTES = 60 * 24  # 24 hours
 JWT_REFRESH_EXPIRE_DAYS = 30
-DEFAULT_TEMP_PASSWORD = "12345"
-WEATHER_CACHE_TTL_SECONDS = 600
-WEATHER_CACHE: Dict[str, Dict[str, Any]] = {}
-
-MAIL_SEARCH_FETCH_LIMIT = 200
-
-def _env_bool(name: str, default: bool = True) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off"}
-
-def get_mail_config() -> Dict[str, Any]:
-    username = os.getenv("MAIL_IMAP_USERNAME") or os.getenv("MAIL_USERNAME") or os.getenv("SMTP_USERNAME")
-    password = os.getenv("MAIL_IMAP_PASSWORD") or os.getenv("MAIL_PASSWORD") or os.getenv("SMTP_PASSWORD")
-    return {
-        "imap_host": os.getenv("MAIL_IMAP_HOST") or os.getenv("IMAP_HOST"),
-        "imap_port": int(os.getenv("MAIL_IMAP_PORT") or os.getenv("IMAP_PORT") or "993"),
-        "imap_ssl": _env_bool("MAIL_IMAP_SSL", True),
-        "imap_folder": os.getenv("MAIL_IMAP_FOLDER") or "INBOX",
-        "username": username,
-        "password": password,
-        "smtp_host": os.getenv("MAIL_SMTP_HOST") or os.getenv("SMTP_HOST"),
-        "smtp_port": int(os.getenv("MAIL_SMTP_PORT") or os.getenv("SMTP_PORT") or "465"),
-        "smtp_ssl": _env_bool("MAIL_SMTP_SSL", True),
-        "smtp_starttls": _env_bool("MAIL_SMTP_STARTTLS", False),
-        "smtp_username": os.getenv("MAIL_SMTP_USERNAME") or os.getenv("SMTP_USERNAME") or username,
-        "smtp_password": os.getenv("MAIL_SMTP_PASSWORD") or os.getenv("SMTP_PASSWORD") or password,
-        "from_email": os.getenv("MAIL_FROM") or username,
-    }
-
-def ensure_mail_reader_config(cfg: Dict[str, Any]):
-    missing = [name for name in ("imap_host", "username", "password") if not cfg.get(name)]
-    if missing:
-        raise RuntimeError("Mailbox is not configured. Set MAIL_IMAP_HOST, MAIL_IMAP_USERNAME and MAIL_IMAP_PASSWORD on the server.")
-
-def ensure_mail_sender_config(cfg: Dict[str, Any]):
-    missing = [name for name in ("smtp_host", "smtp_username", "smtp_password", "from_email") if not cfg.get(name)]
-    if missing:
-        raise RuntimeError("SMTP is not configured. Set MAIL_SMTP_HOST, MAIL_SMTP_USERNAME, MAIL_SMTP_PASSWORD and MAIL_FROM on the server.")
-
-def decode_mail_header(value: Optional[str]) -> str:
-    if not value:
-        return ""
-    try:
-        return str(make_header(decode_header(value))).strip()
-    except Exception:
-        return str(value).strip()
-
-def extract_mail_text(message) -> str:
-    if message.is_multipart():
-        html_fallback = ""
-        for part in message.walk():
-            if part.get_content_disposition() == "attachment":
-                continue
-            content_type = part.get_content_type()
-            try:
-                content = part.get_content()
-            except Exception:
-                continue
-            if not isinstance(content, str):
-                continue
-            if content_type == "text/plain" and content.strip():
-                return content.strip()
-            if content_type == "text/html" and content.strip() and not html_fallback:
-                html_fallback = re.sub(r"<[^>]+>", " ", content)
-        return re.sub(r"\s+", " ", html_fallback).strip()
-    try:
-        content = message.get_content()
-        return content.strip() if isinstance(content, str) else ""
-    except Exception:
-        return ""
-
-def parse_mail_message(uid: str, raw: bytes, include_body: bool = True) -> Dict[str, Any]:
-    message = BytesParser(policy=policy.default).parsebytes(raw)
-    sent_at = ""
-    try:
-        sent = parsedate_to_datetime(message.get("Date"))
-        sent_at = sent.isoformat()
-    except Exception:
-        sent_at = message.get("Date") or ""
-    body = extract_mail_text(message) if include_body else ""
-    return {
-        "uid": uid,
-        "message_id": message.get("Message-ID") or "",
-        "subject": decode_mail_header(message.get("Subject")),
-        "from": decode_mail_header(message.get("From")),
-        "to": decode_mail_header(message.get("To")),
-        "reply_to": decode_mail_header(message.get("Reply-To")),
-        "date": sent_at,
-        "body": body,
-        "summary": re.sub(r"\s+", " ", body).strip()[:350],
-    }
-
-def connect_imap_mailbox(cfg: Dict[str, Any]):
-    ensure_mail_reader_config(cfg)
-    if cfg["imap_ssl"]:
-        mailbox = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"])
-    else:
-        mailbox = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"])
-    mailbox.login(cfg["username"], cfg["password"])
-    mailbox.select(cfg["imap_folder"], readonly=True)
-    return mailbox
-
-def fetch_mail_by_uid(uid: str) -> Optional[Dict[str, Any]]:
-    cfg = get_mail_config()
-    mailbox = connect_imap_mailbox(cfg)
-    try:
-        status, data = mailbox.uid("fetch", uid, "(RFC822)")
-        if status != "OK" or not data:
-            return None
-        for item in data:
-            if isinstance(item, tuple):
-                return parse_mail_message(uid, item[1], include_body=True)
-        return None
-    finally:
-        try: mailbox.close()
-        except Exception: pass
-        try: mailbox.logout()
-        except Exception: pass
-
-def search_mail_messages(query: str = "", sender: str = "", unread_only: bool = False, limit: int = 5) -> List[Dict[str, Any]]:
-    cfg = get_mail_config()
-    mailbox = connect_imap_mailbox(cfg)
-    try:
-        criteria = "UNSEEN" if unread_only else "ALL"
-        status, data = mailbox.uid("search", None, criteria)
-        if status != "OK" or not data:
-            return []
-        uids = data[0].split()[-MAIL_SEARCH_FETCH_LIMIT:]
-        needles = [n.lower() for n in [query.strip(), sender.strip()] if n.strip()]
-        matches: List[Dict[str, Any]] = []
-        for raw_uid in reversed(uids):
-            uid = raw_uid.decode("ascii", errors="ignore")
-            status, msg_data = mailbox.uid("fetch", uid, "(RFC822)")
-            if status != "OK":
-                continue
-            for item in msg_data:
-                if not isinstance(item, tuple):
-                    continue
-                parsed = parse_mail_message(uid, item[1], include_body=True)
-                haystack = " ".join([
-                    parsed.get("subject", ""),
-                    parsed.get("from", ""),
-                    parsed.get("to", ""),
-                    parsed.get("body", ""),
-                ]).lower()
-                if needles and not all(n in haystack for n in needles):
-                    continue
-                matches.append(parsed)
-                break
-            if len(matches) >= max(1, min(limit, 20)):
-                break
-        return matches
-    finally:
-        try: mailbox.close()
-        except Exception: pass
-        try: mailbox.logout()
-        except Exception: pass
-
-def send_mail_reply(original: Dict[str, Any], body: str) -> Dict[str, Any]:
-    cfg = get_mail_config()
-    ensure_mail_sender_config(cfg)
-    to_addr = original.get("reply_to") or original.get("from")
-    if not to_addr:
-        raise RuntimeError("Original email has no sender address to reply to.")
-    subject = original.get("subject") or ""
-    if not subject.lower().startswith("re:"):
-        subject = f"Re: {subject}".strip()
-    message = EmailMessage()
-    message["From"] = cfg["from_email"]
-    message["To"] = to_addr
-    message["Subject"] = subject
-    if original.get("message_id"):
-        message["In-Reply-To"] = original["message_id"]
-        message["References"] = original["message_id"]
-    message.set_content(body.strip())
-    if cfg["smtp_ssl"]:
-        with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"]) as smtp:
-            smtp.login(cfg["smtp_username"], cfg["smtp_password"])
-            smtp.send_message(message)
-    else:
-        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"]) as smtp:
-            if cfg["smtp_starttls"]:
-                smtp.starttls()
-            smtp.login(cfg["smtp_username"], cfg["smtp_password"])
-            smtp.send_message(message)
-    return {"to": to_addr, "subject": subject}
 
 # === AUTH MIDDLEWARE: Protect /crm/*, /process, /voice/*, /work-reports* ===
-PROTECTED_PREFIXES = ["/crm/", "/plants/", "/mushrooms/", "/nature/", "/admin/", "/assistant/", "/process", "/voice/", "/work-reports"]
-PUBLIC_PATHS = ["/health", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets", "/admin/reset-pw-temp-x7k2", "/admin/db-diag", "/admin/force-repair", "/version"]
-
-PERMISSION_DEFINITIONS = [
-    {"permission_code": "crm_read", "module_name": "crm", "name": "View CRM", "description": "Read clients, jobs, leads and invoices."},
-    {"permission_code": "crm_write", "module_name": "crm", "name": "Edit CRM", "description": "Create and update CRM records."},
-    {"permission_code": "crm_delete", "module_name": "crm", "name": "Delete CRM", "description": "Delete CRM records."},
-    {"permission_code": "calendar_read", "module_name": "calendar", "name": "View calendar", "description": "Read calendar data and availability."},
-    {"permission_code": "calendar_write", "module_name": "calendar", "name": "Edit calendar", "description": "Create and update calendar entries."},
-    {"permission_code": "contacts_read", "module_name": "contacts", "name": "View contacts", "description": "Read synced contacts and client contact details."},
-    {"permission_code": "contacts_write", "module_name": "contacts", "name": "Edit contacts", "description": "Create and update contact records."},
-    {"permission_code": "contacts_manage", "module_name": "contacts", "name": "Manage contact sorting", "description": "Sort and categorize contacts (admin only)."},
-    {"permission_code": "voice_commands", "module_name": "assistant", "name": "Voice commands", "description": "Use voice commands and guided voice workflows."},
-    {"permission_code": "settings_access", "module_name": "settings", "name": "Settings access", "description": "Open and change application settings."},
-    {"permission_code": "import_data", "module_name": "data", "name": "Import data", "description": "Run imports and ingest external data."},
-    {"permission_code": "export_data", "module_name": "data", "name": "Export data", "description": "Export CRM and operational data."},
-    {"permission_code": "manage_users", "module_name": "users", "name": "Manage users", "description": "Create users, edit rights and remove users."},
-]
-
-ROLE_PERMISSION_DEFAULTS = {
-    "admin": {
-        "crm_read": True,
-        "crm_write": True,
-        "crm_delete": True,
-        "calendar_read": True,
-        "calendar_write": True,
-        "contacts_read": True,
-        "contacts_write": True,
-        "contacts_manage": True,
-        "voice_commands": True,
-        "settings_access": True,
-        "import_data": True,
-        "export_data": True,
-        "manage_users": True,
-    },
-    "manager": {
-        "crm_read": True,
-        "crm_write": True,
-        "crm_delete": False,
-        "calendar_read": True,
-        "calendar_write": True,
-        "contacts_read": True,
-        "contacts_write": True,
-        "voice_commands": True,
-        "settings_access": True,
-        "import_data": True,
-        "export_data": True,
-        "manage_users": False,
-    },
-    "worker": {
-        "crm_read": True,
-        "crm_write": False,
-        "crm_delete": False,
-        "calendar_read": True,
-        "calendar_write": True,
-        "contacts_read": True,
-        "contacts_write": False,
-        "voice_commands": True,
-        "settings_access": False,
-        "import_data": False,
-        "export_data": False,
-        "manage_users": False,
-    },
-    "assistant": {
-        "crm_read": True,
-        "crm_write": True,
-        "crm_delete": False,
-        "calendar_read": True,
-        "calendar_write": True,
-        "contacts_read": True,
-        "contacts_write": True,
-        "voice_commands": True,
-        "settings_access": True,
-        "import_data": False,
-        "export_data": False,
-        "manage_users": False,
-    },
-    "viewer": {
-        "crm_read": True,
-        "crm_write": False,
-        "crm_delete": False,
-        "calendar_read": True,
-        "calendar_write": False,
-        "contacts_read": True,
-        "contacts_write": False,
-        "voice_commands": False,
-        "settings_access": False,
-        "import_data": False,
-        "export_data": False,
-        "manage_users": False,
-    },
-}
-
-ALL_PERMISSION_CODES = [p["permission_code"] for p in PERMISSION_DEFINITIONS]
-
-# Built-in rate types seeded for new tenants. Keys are permanent codes; values = (display_name, default_rate, sort_order).
-BUILTIN_SERVICE_RATES = {
-    "hourly_rate":          ("Hourly rate",           0.0,  10),
-    "minimum_charge":       ("Minimum charge",        0.0,  20),
-}
-
-# Fallback rates used only when tenant has no rates configured at all (pre-migration safety net).
-SERVICE_RATE_DEFAULTS = {
-    "hourly_rate":    0.0,
-    "minimum_charge": 0.0,
-}
-
-def get_tenant_rate_types(conn, tid) -> list:
-    """Return all rate_type codes defined for this tenant, ordered by sort_order."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT rate_type FROM tenant_default_rates WHERE tenant_id=%s ORDER BY sort_order, id",
-            (tid,)
-        )
-        rows = cur.fetchall()
-    return [r["rate_type"] for r in rows]
-
-def apply_python_repair_024(conn):
-    """Python-based startup repair: fix missing unique indexes, normalize language codes.
-    Runs BEFORE seed_industry_catalog so ON CONFLICT clauses work correctly.
-    Idempotent — checks migration_log and skips if already applied."""
-    REPAIR_NAME = '2026_05_07_python_repair_024.py'
-    print(f"repair 024: checking if already applied...")
-    try:
-        with conn.cursor() as chk:
-            chk.execute("SELECT 1 FROM migration_log WHERE filename=%s", (REPAIR_NAME,))
-            if chk.fetchone():
-                print("repair 024: already applied, skipping")
-                return
-    except Exception as e:
-        print(f"repair 024: migration_log check failed: {e}")
-        return
-
-    print("=== Python repair 024: starting ===")
-
-    # Step 1: diagnostics + dedup — own cursor, own commit
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM industry_groups")
-            print(f"repair 024: industry_groups = {cur.fetchone()[0]}")
-            cur.execute("SELECT COUNT(*) FROM industry_subtypes")
-            print(f"repair 024: industry_subtypes = {cur.fetchone()[0]}")
-            # Existing indexes
-            cur.execute("SELECT indexname FROM pg_indexes WHERE tablename='industry_groups' AND schemaname='crm'")
-            print(f"repair 024: industry_groups indexes = {[r[0] for r in cur.fetchall()]}")
-            cur.execute("SELECT indexname FROM pg_indexes WHERE tablename='industry_subtypes' AND schemaname='crm'")
-            print(f"repair 024: industry_subtypes indexes = {[r[0] for r in cur.fetchall()]}")
-            # Dedup industry_groups
-            cur.execute("SELECT code, COUNT(*) AS cnt FROM industry_groups GROUP BY code HAVING COUNT(*) > 1")
-            dups = cur.fetchall()
-            if dups:
-                print(f"repair 024: removing dup industry_groups: {dups}")
-                cur.execute("DELETE FROM industry_groups WHERE id NOT IN (SELECT MIN(id) FROM industry_groups GROUP BY code)")
-            # Dedup industry_subtypes
-            cur.execute("SELECT industry_group_id, code, COUNT(*) AS cnt FROM industry_subtypes GROUP BY industry_group_id, code HAVING COUNT(*) > 1")
-            dups2 = cur.fetchall()
-            if dups2:
-                print(f"repair 024: removing dup industry_subtypes: {dups2}")
-                cur.execute("DELETE FROM industry_subtypes WHERE id NOT IN (SELECT MIN(id) FROM industry_subtypes GROUP BY industry_group_id, code)")
-        conn.commit()
-        print("repair 024: step 1 (dedup) done")
-    except Exception as e:
-        conn.rollback()
-        print(f"repair 024: step 1 FAILED: {e}")
-
-    # Step 2: create unique indexes — separate cursor, separate commit
-    idx_ok = False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_groups_code ON industry_groups (code)")
-            print("repair 024: uq_industry_groups_code created")
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_subtypes_group_code ON industry_subtypes (industry_group_id, code)")
-            print("repair 024: uq_industry_subtypes_group_code created")
-        conn.commit()
-        idx_ok = True
-        print("repair 024: step 2 (unique indexes) done")
-    except Exception as e:
-        conn.rollback()
-        print(f"repair 024: step 2 (unique indexes) FAILED: {e}")
-
-    # Step 3: normalize language codes
-    try:
-        with conn.cursor() as cur:
-            lang_map = [
-                ('cs','cs-CZ'),('cs_CZ','cs-CZ'),('cs_cz','cs-CZ'),
-                ('en','en-GB'),('en_GB','en-GB'),('en_gb','en-GB'),
-                ('pl','pl-PL'),('pl_PL','pl-PL'),('pl_pl','pl-PL'),
-                ('de','de-DE'),('de_DE','de-DE'),('de_de','de-DE'),
-                ('sk','sk-SK'),('sk_SK','sk-SK'),('sk_sk','sk-SK'),
-                ('hu','hu-HU'),('hu_HU','hu-HU'),('hu_hu','hu-HU'),
-                ('ro','ro-RO'),('ro_RO','ro-RO'),('ro_ro','ro-RO'),
-                ('uk','uk-UA'),('uk_UA','uk-UA'),('uk_ua','uk-UA'),
-                ('ru','ru-RU'),('ru_RU','ru-RU'),('ru_ru','ru-RU'),
-            ]
-            n = 0
-            for old, new in lang_map:
-                cur.execute("UPDATE tenant_languages SET language_code=%s WHERE language_code=%s", (new, old))
-                n += cur.rowcount
-            for old, new in [('cs','cs-CZ'),('en','en-GB'),('pl','pl-PL'),('de','de-DE'),('sk','sk-SK'),('hu','hu-HU')]:
-                cur.execute("UPDATE tenant_operating_profile SET default_internal_language_code=%s WHERE default_internal_language_code=%s", (new, old))
-                cur.execute("UPDATE tenant_operating_profile SET default_customer_language_code=%s WHERE default_customer_language_code=%s", (new, old))
-            print(f"repair 024: step 3 (languages) updated {n} rows")
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"repair 024: step 3 (languages) FAILED: {e}")
-
-    # Step 4: fix industry group names + deactivate old groups
-    try:
-        with conn.cursor() as cur:
-            group_fixes = [
-                ('trades','Trades and field services',10,True),
-                ('construction','Construction and building',20,True),
-                ('property','Property management',30,True),
-                ('real_estate','Real estate and lettings',40,True),
-                ('cleaning','Cleaning services',50,True),
-                ('automotive','Automotive services',60,True),
-                ('logistics','Logistics and transport',70,True),
-                ('beauty','Beauty and personal care',80,True),
-                ('healthcare','Healthcare and wellbeing',90,True),
-                ('fitness','Fitness and coaching',100,True),
-                ('hospitality','Hospitality and food service',110,True),
-                ('events','Events and entertainment',120,True),
-                ('education','Education and training',130,True),
-                ('it_tech','IT and technology',140,True),
-                ('retail','Retail and e-commerce',150,True),
-                ('security','Security services',160,True),
-                ('agriculture','Agriculture and farming',170,True),
-                ('other','Other / General business',999,True),
-            ]
-            n = 0
-            for code, name, sort_order, active in group_fixes:
-                cur.execute("UPDATE industry_groups SET name=%s, sort_order=%s, is_active=%s WHERE code=%s", (name, sort_order, active, code))
-                n += cur.rowcount
-            cur.execute("UPDATE industry_groups SET is_active=false WHERE code IN ('landscaping','it_services')")
-            print(f"repair 024: step 4 (group names) updated {n} active groups")
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"repair 024: step 4 (group names) FAILED: {e}")
-
-    # Step 5: mark as applied
-    try:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO migration_log (filename) VALUES (%s) ON CONFLICT DO NOTHING", (REPAIR_NAME,))
-            cur.execute("INSERT INTO migration_log (filename) VALUES (%s) ON CONFLICT DO NOTHING",
-                        ('2026_05_07_fix_language_codes_and_reseed_activities_023.sql',))
-        conn.commit()
-        print(f"=== Python repair 024: COMPLETE (idx_ok={idx_ok}) ===")
-    except Exception as e:
-        conn.rollback()
-        print(f"repair 024: step 5 (mark applied) FAILED: {e}")
-
-
-def seed_industry_catalog(conn):
-    """Idempotently seed all industry groups and subtypes. Safe to run on every startup."""
-    with conn.cursor() as cur:
-        # Groups — upsert so names/sort can be updated in future deploys
-        cur.execute("""
-            INSERT INTO industry_groups (code, name, sort_order, is_active) VALUES
-            ('trades','Trades and field services',10,true),
-            ('construction','Construction and building',20,true),
-            ('property','Property management',30,true),
-            ('real_estate','Real estate and lettings',40,true),
-            ('cleaning','Cleaning services',50,true),
-            ('automotive','Automotive services',60,true),
-            ('logistics','Logistics and transport',70,true),
-            ('beauty','Beauty and personal care',80,true),
-            ('healthcare','Healthcare and wellbeing',90,true),
-            ('fitness','Fitness and coaching',100,true),
-            ('hospitality','Hospitality and food service',110,true),
-            ('events','Events and entertainment',120,true),
-            ('education','Education and training',130,true),
-            ('it_tech','IT and technology',140,true),
-            ('retail','Retail and e-commerce',150,true),
-            ('security','Security services',160,true),
-            ('agriculture','Agriculture and farming',170,true),
-            ('other','Other / General business',999,true)
-            ON CONFLICT (code) DO UPDATE SET
-                name=EXCLUDED.name, sort_order=EXCLUDED.sort_order, is_active=true
-        """)
-        # Subtypes — DO NOTHING so user edits are preserved
-        subtypes = [
-            # trades
-            ('trades','landscaping','Landscaping and garden services',10),
-            ('trades','grounds_maintenance','Grounds and parks maintenance',20),
-            ('trades','tree_surgery','Tree surgery and arboriculture',30),
-            ('trades','fencing','Fencing and gate installation',40),
-            ('trades','drainage_groundworks','Drainage and groundworks',50),
-            ('trades','paving_patios','Paving, patios and driveways',60),
-            ('trades','building_maintenance','Building maintenance and repairs',70),
-            ('trades','painting_decorating','Painting and decorating',80),
-            ('trades','electrical','Electrical installations and repairs',90),
-            ('trades','plumbing_heating','Plumbing and heating',100),
-            ('trades','gas_boilers','Gas services and boiler installation',110),
-            ('trades','hvac','HVAC (air conditioning and ventilation)',120),
-            ('trades','carpentry_joinery','Carpentry and joinery',130),
-            ('trades','roofing_guttering','Roofing and guttering',140),
-            ('trades','flooring_tiling','Flooring and tiling',150),
-            ('trades','glazing_windows','Glazing and window fitting',160),
-            ('trades','pest_control','Pest control and prevention',170),
-            ('trades','locksmith','Locksmith services',180),
-            ('trades','solar_energy','Solar panels and renewable energy',190),
-            ('trades','scaffolding','Scaffolding erection and hire',200),
-            ('trades','pool_maintenance','Pool and hot tub maintenance',210),
-            ('trades','pressure_washing','Pressure washing and exterior cleaning',220),
-            ('trades','waste_removal','Waste removal and skip hire',230),
-            ('trades','handyman','Handyman and general maintenance',240),
-            ('trades','security_systems','Security alarms and camera installation',250),
-            # construction
-            ('construction','new_build','New build residential',10),
-            ('construction','extensions_conversions','Extensions and conversions',20),
-            ('construction','commercial_fit_out','Commercial fit-out and refurbishment',30),
-            ('construction','structural_works','Structural engineering and steelwork',40),
-            ('construction','groundworks_civil','Groundworks and civil engineering',50),
-            ('construction','demolition','Demolition and site clearance',60),
-            ('construction','dry_lining_plastering','Dry lining and plastering',70),
-            ('construction','bricklaying_masonry','Bricklaying and masonry',80),
-            ('construction','project_management','Construction project management',90),
-            # property
-            ('property','hmo_management','HMO property management',10),
-            ('property','residential_management','Residential property management',20),
-            ('property','commercial_management','Commercial property management',30),
-            ('property','block_management','Block and estate management',40),
-            ('property','facilities_management','Facilities management',50),
-            ('property','short_term_lets','Short-term let management (Airbnb)',60),
-            ('property','void_management','Void property management',70),
-            ('property','property_maintenance','General property maintenance',80),
-            ('property','renovation_project_management','Renovation project management',90),
-            ('property','student_accommodation','Student accommodation management',100),
-            # real_estate
-            ('real_estate','lettings_coordination','Lettings coordination and management',10),
-            ('real_estate','residential_sales','Residential property sales',20),
-            ('real_estate','commercial_lettings','Commercial lettings and sales',30),
-            ('real_estate','land_development','Land and new development sales',40),
-            ('real_estate','property_valuation','Property valuation and surveys',50),
-            ('real_estate','investment_consultancy','Property investment consultancy',60),
-            ('real_estate','mortgage_brokering','Mortgage and financial brokering',70),
-            # cleaning
-            ('cleaning','domestic_cleaning','Domestic regular cleaning',10),
-            ('cleaning','commercial_cleaning','Commercial and office cleaning',20),
-            ('cleaning','end_of_tenancy','End of tenancy cleaning',30),
-            ('cleaning','deep_cleaning','Deep cleaning and sanitisation',40),
-            ('cleaning','window_cleaning','Window cleaning',50),
-            ('cleaning','carpet_upholstery','Carpet and upholstery cleaning',60),
-            ('cleaning','oven_appliance','Oven and appliance cleaning',70),
-            ('cleaning','industrial_cleaning','Industrial and factory cleaning',80),
-            ('cleaning','biohazard_specialist','Specialist and biohazard cleaning',90),
-            ('cleaning','after_builders','After-builders cleaning',100),
-            ('cleaning','pressure_cleaning','Pressure washing and jet washing',110),
-            # automotive
-            ('automotive','vehicle_repairs','Vehicle repairs and servicing',10),
-            ('automotive','mot_testing','MOT testing and inspection',20),
-            ('automotive','body_repairs','Bodywork, paint and panel repairs',30),
-            ('automotive','tyres_wheels','Tyres and wheel alignment',40),
-            ('automotive','vehicle_valeting','Vehicle valeting and detailing',50),
-            ('automotive','mobile_mechanic','Mobile mechanic',60),
-            ('automotive','breakdown_recovery','Breakdown recovery and towing',70),
-            ('automotive','car_sales','Car sales and brokerage',80),
-            ('automotive','fleet_management','Fleet management and maintenance',90),
-            ('automotive','vehicle_diagnostics','Diagnostics and ECU tuning',100),
-            ('automotive','auto_electrics','Auto electrics and audio installation',110),
-            # logistics
-            ('logistics','courier_delivery','Courier and parcel delivery',10),
-            ('logistics','removals_storage','House and office removals',20),
-            ('logistics','man_and_van','Man and van services',30),
-            ('logistics','taxi_private_hire','Taxi and private hire',40),
-            ('logistics','haulage_freight','Haulage and freight transport',50),
-            ('logistics','warehousing','Warehousing and fulfilment',60),
-            ('logistics','same_day_delivery','Same-day and express delivery',70),
-            # beauty
-            ('beauty','hairdressing','Hairdressing and barbering',10),
-            ('beauty','beauty_therapy','Beauty therapy and facials',20),
-            ('beauty','nail_technician','Nail technician',30),
-            ('beauty','massage_therapy','Massage therapy and bodywork',40),
-            ('beauty','lash_brow','Lash and brow technician',50),
-            ('beauty','aesthetics','Aesthetic treatments and injectables',60),
-            ('beauty','permanent_makeup','Permanent makeup and microblading',70),
-            ('beauty','spray_tanning','Spray tanning and bronzing',80),
-            ('beauty','mobile_beauty','Mobile beauty services',90),
-            ('beauty','hair_extensions','Hair extensions',100),
-            ('beauty','makeup_artistry','Makeup artistry and bridal',110),
-            # healthcare
-            ('healthcare','physiotherapy','Physiotherapy and sports rehab',10),
-            ('healthcare','mental_health','Mental health and counselling',20),
-            ('healthcare','private_gp','Private GP and medical consultations',30),
-            ('healthcare','dentistry','Dentistry and oral health',40),
-            ('healthcare','optometry','Optometry and eyecare',50),
-            ('healthcare','nutrition_dietetics','Nutrition and dietetics',60),
-            ('healthcare','osteopathy','Osteopathy and chiropractic',70),
-            ('healthcare','podiatry','Podiatry and chiropody',80),
-            ('healthcare','home_nursing','Home nursing and domiciliary care',90),
-            ('healthcare','occupational_therapy','Occupational therapy',100),
-            ('healthcare','acupuncture','Acupuncture and complementary therapy',110),
-            ('healthcare','veterinary','Veterinary services',120),
-            # fitness
-            ('fitness','personal_training','Personal training',10),
-            ('fitness','group_fitness','Group fitness classes',20),
-            ('fitness','yoga_pilates','Yoga and Pilates instruction',30),
-            ('fitness','sports_coaching','Sports coaching and development',40),
-            ('fitness','online_coaching','Online fitness and wellness coaching',50),
-            ('fitness','nutrition_coaching','Nutritional coaching',60),
-            ('fitness','gym_studio','Gym and studio management',70),
-            ('fitness','swimming_coaching','Swimming instruction and coaching',80),
-            ('fitness','martial_arts','Martial arts and self-defence',90),
-            # hospitality
-            ('hospitality','restaurant_catering','Restaurant and dining',10),
-            ('hospitality','cafe_coffee','Cafe and coffee shop',20),
-            ('hospitality','takeaway_delivery','Takeaway and food delivery',30),
-            ('hospitality','bar_pub','Bar, pub and club management',40),
-            ('hospitality','hotel_bnb','Hotel, B&B and serviced accommodation',50),
-            ('hospitality','event_catering','Event and mobile catering',60),
-            ('hospitality','private_chef','Private chef and personal catering',70),
-            ('hospitality','food_production','Food production and meal prep',80),
-            # events
-            ('events','event_planning','Event planning and coordination',10),
-            ('events','wedding_services','Wedding services',20),
-            ('events','photography_video','Photography and videography',30),
-            ('events','entertainment','Entertainment, DJs and performers',40),
-            ('events','av_technical','AV and technical production',50),
-            ('events','venue_management','Venue hire and management',60),
-            ('events','marquee_equipment','Marquee and equipment hire',70),
-            ('events','floristry','Floristry and event decor',80),
-            ('events','events_catering','Events catering and bar staff',90),
-            ('events','photobooth_hire','Photo booth and prop hire',100),
-            # education
-            ('education','private_tutoring','Private tutoring (school subjects)',10),
-            ('education','music_tuition','Music tuition and instrument lessons',20),
-            ('education','driving_instruction','Driving instruction and theory coaching',30),
-            ('education','language_teaching','Language teaching and translation',40),
-            ('education','corporate_training','Corporate and professional training',50),
-            ('education','vocational_courses','Vocational and trade courses',60),
-            ('education','online_courses','Online courses and digital learning',70),
-            ('education','childcare_education','Childcare and early years education',80),
-            ('education','arts_creative','Arts, crafts and creative workshops',90),
-            ('education','sports_instruction','Sports instruction and coaching',100),
-            # it_tech
-            ('it_tech','it_support','IT support and helpdesk',10),
-            ('it_tech','web_development','Website development and design',20),
-            ('it_tech','software_development','Software and app development',30),
-            ('it_tech','network_infrastructure','Network setup and infrastructure',40),
-            ('it_tech','cybersecurity','Cybersecurity and data protection',50),
-            ('it_tech','cloud_services','Cloud migration and managed services',60),
-            ('it_tech','digital_marketing','Digital marketing and SEO',70),
-            ('it_tech','graphic_design','Graphic design and branding',80),
-            ('it_tech','data_analytics','Data analytics and reporting',90),
-            ('it_tech','ecommerce','E-commerce setup and management',100),
-            # retail
-            ('retail','physical_retail','Physical retail store',10),
-            ('retail','online_retail','Online shop and marketplace',20),
-            ('retail','wholesale','Wholesale and distribution',30),
-            ('retail','market_stall','Market stall and pop-up retail',40),
-            ('retail','specialist_retail','Specialist and trade retail',50),
-            # security
-            ('security','manned_guarding','Manned guarding and security officers',10),
-            ('security','door_supervision','Door supervision and event security',20),
-            ('security','cctv_monitoring','CCTV monitoring and installation',30),
-            ('security','alarm_response','Alarm response and key holding',40),
-            ('security','retail_security','Retail loss prevention',50),
-            ('security','mobile_patrol','Mobile patrols and inspections',60),
-            # agriculture
-            ('agriculture','arable_farming','Arable and crop farming',10),
-            ('agriculture','livestock_farming','Livestock and animal husbandry',20),
-            ('agriculture','horticulture','Horticulture and market gardening',30),
-            ('agriculture','equestrian','Equestrian services and livery',40),
-            ('agriculture','land_management','Land and estate management',50),
-            ('agriculture','agricultural_contracting','Agricultural contracting',60),
-            ('agriculture','forestry','Forestry and woodland management',70),
-        ]
-        for group_code, sub_code, sub_name, sort_order in subtypes:
-            cur.execute("""
-                INSERT INTO industry_subtypes (industry_group_id, code, name, sort_order, is_active)
-                SELECT g.id, %s, %s, %s, true FROM industry_groups g WHERE g.code=%s
-                ON CONFLICT (industry_group_id, code) DO NOTHING
-            """, (sub_code, sub_name, sort_order, group_code))
-        cur.execute("""
-            INSERT INTO migration_log (filename) VALUES ('2026_05_05_industry_catalog_019.sql')
-            ON CONFLICT (filename) DO NOTHING
-        """)
-    conn.commit()
-
-
-def seed_activity_templates(conn):
-    """Create activity_templates and tenant_activity_pricing tables, then run migration 020 SQL if not yet applied."""
-    import os
-    with conn.cursor() as cur:
-        # Check if migration already applied
-        cur.execute("SELECT 1 FROM migration_log WHERE filename='2026_05_06_activity_templates_020.sql'")
-        if cur.fetchone():
-            return
-
-        # Run the migration SQL file
-        migration_path = os.path.join(os.path.dirname(__file__), "migrations", "2026_05_06_activity_templates_020.sql")
-        if not os.path.exists(migration_path):
-            print(f"WARN: migration 020 not found at {migration_path}")
-            return
-
-        with open(migration_path, encoding="utf-8") as f:
-            sql = f.read()
-
-        # psycopg2 can't execute multiple statements with execute() when they include
-        # DDL + DML inside a BEGIN/COMMIT block — split and run statement by statement.
-        # We handle the transaction ourselves.
-        cur.execute("SAVEPOINT before_020")
-        try:
-            # Strip outer BEGIN/COMMIT and run body
-            body = sql
-            body = body.replace("BEGIN;", "").replace("COMMIT;", "")
-            # Split on semicolons, skip empty
-            statements = [s.strip() for s in body.split(";") if s.strip()]
-            for stmt in statements:
-                cur.execute(stmt)
-            conn.commit()
-            print("Migration 020 applied: activity_templates seeded")
-        except Exception as e:
-            cur.execute("ROLLBACK TO SAVEPOINT before_020")
-            conn.commit()
-            print(f"Migration 020 FAILED: {e}")
-
-
-def seed_activity_pricing_ui_controls(conn):
-    """Run migration 021: insert ui_control_registry entries for ActivityPricing screen."""
-    import os
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM migration_log WHERE filename='2026_05_06_activity_pricing_ui_controls_021.sql'")
-        if cur.fetchone():
-            return  # already applied
-        migration_path = os.path.join(os.path.dirname(__file__), "migrations", "2026_05_06_activity_pricing_ui_controls_021.sql")
-        if not os.path.exists(migration_path):
-            print("Migration 021 SQL not found, skipping")
-            return
-        try:
-            cur.execute("SAVEPOINT before_021")
-            with open(migration_path, "r", encoding="utf-8") as f:
-                cur.execute(f.read())
-            cur.execute("INSERT INTO migration_log (filename) VALUES (%s)", ("2026_05_06_activity_pricing_ui_controls_021.sql",))
-            conn.commit()
-            print("Migration 021 applied: ActivityPricing ui_control_registry entries seeded")
-        except Exception as e:
-            cur.execute("ROLLBACK TO SAVEPOINT before_021")
-            conn.commit()
-            print(f"Migration 021 FAILED: {e}")
-
-
-def seed_builtin_rates_if_empty(conn, tid):
-    """Seed built-in rate types for a tenant that has none yet (idempotent)."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM tenant_default_rates WHERE tenant_id=%s", (tid,))
-        if cur.fetchone()[0] > 0:
-            return
-        for i, (rtype, (display_name, default_rate, sort_order)) in enumerate(BUILTIN_SERVICE_RATES.items()):
-            cur.execute(
-                """INSERT INTO tenant_default_rates
-                   (tenant_id, rate_type, rate, description, is_builtin, sort_order)
-                   VALUES (%s,%s,%s,%s,true,%s)
-                   ON CONFLICT (tenant_id, rate_type) DO NOTHING""",
-                (tid, rtype, default_rate, display_name, sort_order)
-            )
-
-DEFAULT_CONTACT_SECTIONS = [
-    ("client",                  "Klienti",                    10),
-    ("employee",                "Zaměstnanci",                20),
-    ("subcontractor",           "Subdodavatelé",              30),
-    ("equipment_vehicle_rental","Půjčovny",                   40),
-    ("material_supplier",       "Dodavatelé materiálu",       50),
-    ("private",                 "Soukromé kontakty",          60),
-    ("other",                   "Ostatní",                   100),
-]
+PROTECTED_PREFIXES = ["/crm/", "/process", "/voice/", "/work-reports", "/debug/"]
+PUBLIC_PATHS = ["/health", "/bootstrap/status", "/bootstrap/first-admin", "/auth/login", "/auth/refresh", "/docs", "/openapi.json", "/", "/onboarding/industry-groups", "/onboarding/industry-subtypes", "/onboarding/presets"]
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -836,27 +57,19 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Invalid token"})
     return await call_next(request)
 
+
+def require_debug_admin(request: Request):
+    if os.getenv("ENABLE_DEBUG_ENDPOINTS", "").lower() != "true":
+        raise HTTPException(404, "Not found")
+    user = getattr(request.state, "user", {})
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin role required")
+
+
 def get_request_tenant_id(request: Request) -> int:
     """Extract tenant_id from authenticated request. Falls back to 1."""
     try: return request.state.user.get("tenant_id", 1)
     except: return 1
-
-def get_request_user_payload(request: Request) -> dict:
-    try:
-        return request.state.user
-    except Exception:
-        raise HTTPException(401, "Authentication required")
-
-def ensure_request_permissions(request: Request, *permission_codes) -> dict:
-    user = get_request_user_payload(request)
-    conn = get_db_conn()
-    try:
-        permissions = get_effective_permissions(conn, user["tenant_id"], user["user_id"], user.get("role"))
-        if not all(permissions.get(code, False) for code in permission_codes):
-            raise HTTPException(403, "Permission denied")
-        return user
-    finally:
-        release_conn(conn)
 
 def check_subscription_limit(conn, tenant_id, resource_type):
     """Check if tenant has reached subscription limit. Returns (ok, message)."""
@@ -890,48 +103,42 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_type TEXT DEFAULT 'interni_poznamka', status TEXT DEFAULT 'novy',
     priority TEXT DEFAULT 'bezna', created_at TIMESTAMPTZ DEFAULT now(),
     deadline TEXT, planned_date TEXT, time_window_start TEXT, time_window_end TEXT,
-    planned_start_at TIMESTAMPTZ, planned_end_at TIMESTAMPTZ,
     estimated_minutes INT, actual_minutes INT, created_by TEXT, assigned_to TEXT,
-    assigned_user_id BIGINT, planning_note TEXT, reminder_for_assignee_only BOOLEAN DEFAULT TRUE,
     delegated_by TEXT, client_id BIGINT, client_name TEXT, job_id BIGINT,
     property_id BIGINT, property_address TEXT, is_recurring BOOLEAN DEFAULT FALSE,
     recurrence_rule TEXT, result TEXT, notes JSONB DEFAULT '[]',
     communication_method TEXT, source TEXT DEFAULT 'manualne',
     is_billable BOOLEAN DEFAULT FALSE, has_cost BOOLEAN DEFAULT FALSE,
     waiting_for_payment BOOLEAN DEFAULT FALSE, checklist JSONB DEFAULT '[]',
-    is_completed BOOLEAN DEFAULT FALSE, calendar_sync_enabled BOOLEAN DEFAULT TRUE,
-    tenant_id INT NOT NULL DEFAULT 1, updated_at TIMESTAMPTZ DEFAULT now()
+    is_completed BOOLEAN DEFAULT FALSE, updated_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS client_notes (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    client_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'system',
+    client_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'Marek',
     created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS job_notes (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    job_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'system',
-    note_type TEXT DEFAULT 'general', tenant_id INT NOT NULL DEFAULT 1,
-    updated_at TIMESTAMPTZ DEFAULT now(), created_at TIMESTAMPTZ DEFAULT now()
+    job_id BIGINT NOT NULL, note TEXT NOT NULL, created_by TEXT DEFAULT 'Marek',
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS task_history (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     task_id TEXT NOT NULL, field_name TEXT NOT NULL, old_value TEXT, new_value TEXT,
-    changed_by TEXT DEFAULT 'system', changed_at TIMESTAMPTZ DEFAULT now()
+    changed_by TEXT DEFAULT 'Marek', changed_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS activity_timeline (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL,
-    description TEXT NOT NULL, user_name TEXT DEFAULT 'system',
-    source_channel TEXT,
-    details_json JSONB DEFAULT '{}'::jsonb,
+    description TEXT NOT NULL, user_name TEXT DEFAULT 'Marek',
     created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS photos (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
-    filename TEXT NOT NULL, description TEXT, photo_type TEXT DEFAULT 'general',
-    file_path TEXT, thumbnail_base64 TEXT, tenant_id INT NOT NULL DEFAULT 1,
-    created_by TEXT DEFAULT 'system', created_at TIMESTAMPTZ DEFAULT now()
+    filename TEXT NOT NULL, description TEXT,
+    file_path TEXT, thumbnail_base64 TEXT,
+    created_by TEXT DEFAULT 'Marek', created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS work_reports (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -973,19 +180,6 @@ CREATE TABLE IF NOT EXISTS voice_sessions (
     context JSONB DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(), expires_at TIMESTAMPTZ DEFAULT now() + interval '1 hour'
 );
-CREATE TABLE IF NOT EXISTS assistant_memory (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id INT NOT NULL DEFAULT 1,
-    user_id BIGINT,
-    memory_type TEXT NOT NULL DEFAULT 'long',
-    content TEXT NOT NULL,
-    normalized_content TEXT,
-    source TEXT DEFAULT 'voice',
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    forgotten_at TIMESTAMPTZ
-);
 CREATE TABLE IF NOT EXISTS pricing_rules (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id INT DEFAULT 1, scope TEXT DEFAULT 'system',
@@ -993,112 +187,6 @@ CREATE TABLE IF NOT EXISTS pricing_rules (
     rule_key TEXT, rate DECIMAL NOT NULL,
     currency TEXT DEFAULT 'GBP', created_at TIMESTAMPTZ DEFAULT now()
 );
-CREATE TABLE IF NOT EXISTS tenant_default_rates (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id INT NOT NULL DEFAULT 1,
-    rate_type TEXT NOT NULL,
-    rate DECIMAL NOT NULL DEFAULT 0,
-    currency TEXT DEFAULT 'GBP',
-    description TEXT,
-    is_builtin BOOLEAN NOT NULL DEFAULT false,
-    sort_order INT NOT NULL DEFAULT 100,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    CONSTRAINT uq_tenant_default_rates UNIQUE (tenant_id, rate_type)
-);
-ALTER TABLE crm.tenant_default_rates ADD COLUMN IF NOT EXISTS is_builtin BOOLEAN NOT NULL DEFAULT false;
-ALTER TABLE crm.tenant_default_rates ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 100;
-CREATE TABLE IF NOT EXISTS user_contact_sync (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id INT NOT NULL DEFAULT 1,
-    user_id BIGINT NOT NULL,
-    contact_key TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    phone_primary TEXT,
-    email_primary TEXT,
-    address TEXT,
-    address_line1 TEXT,
-    city TEXT,
-    postcode TEXT,
-    country TEXT,
-    normalized_phone TEXT,
-    normalized_email TEXT,
-    is_client BOOLEAN NOT NULL DEFAULT FALSE,
-    linked_client_id BIGINT,
-    last_seen_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    CONSTRAINT uq_user_contact_sync UNIQUE (tenant_id, user_id, contact_key)
-);
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE TABLE IF NOT EXISTS contact_sections (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id INT NOT NULL DEFAULT 1,
-    section_code TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    is_default BOOLEAN NOT NULL DEFAULT FALSE,
-    sort_order INT NOT NULL DEFAULT 100,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    CONSTRAINT uq_contact_sections UNIQUE (tenant_id, section_code)
-);
-CREATE TABLE IF NOT EXISTS shared_contacts (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id INT NOT NULL DEFAULT 1,
-    section_code TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    company_name TEXT,
-    phone_primary TEXT,
-    email_primary TEXT,
-    address TEXT,
-    address_line1 TEXT,
-    city TEXT,
-    postcode TEXT,
-    country TEXT,
-    notes TEXT,
-    source TEXT DEFAULT 'manual',
-    normalized_phone TEXT,
-    normalized_email TEXT,
-    created_by BIGINT,
-    updated_by BIGINT,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-CREATE TABLE IF NOT EXISTS nature_recognition_history (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id INT NOT NULL DEFAULT 1,
-    user_id BIGINT,
-    recognition_type TEXT NOT NULL,
-    language TEXT DEFAULT 'en',
-    display_name TEXT,
-    scientific_name TEXT,
-    confidence NUMERIC(8,6),
-    guidance TEXT,
-    database_name TEXT,
-    result_json JSONB DEFAULT '{}'::jsonb,
-    photos_json JSONB DEFAULT '[]'::jsonb,
-    captured_at TIMESTAMPTZ,
-    latitude DOUBLE PRECISION,
-    longitude DOUBLE PRECISION,
-    accuracy_meters DOUBLE PRECISION,
-    location_source TEXT,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS nature_recognition_photos (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    history_id BIGINT NOT NULL REFERENCES nature_recognition_history(id) ON DELETE CASCADE,
-    tenant_id INT NOT NULL DEFAULT 1,
-    sort_order INT NOT NULL DEFAULT 0,
-    filename TEXT,
-    photo_type TEXT DEFAULT 'capture',
-    content_type TEXT,
-    size_bytes INT,
-    photo_data_url TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_nature_recognition_photos_history_id
-    ON nature_recognition_photos(history_id, sort_order);
 DO $$ BEGIN
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name TEXT;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email TEXT;
@@ -1111,43 +199,13 @@ DO $$ BEGIN
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS comm_type TEXT DEFAULT 'telefon';
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS job_id BIGINT;
     ALTER TABLE communications ADD COLUMN IF NOT EXISTS notes TEXT;
-    ALTER TABLE communications ADD COLUMN IF NOT EXISTS source TEXT;
-    ALTER TABLE communications ADD COLUMN IF NOT EXISTS external_message_id TEXT;
-    ALTER TABLE communications ADD COLUMN IF NOT EXISTS source_phone TEXT;
-    ALTER TABLE communications ADD COLUMN IF NOT EXISTS target_phone TEXT;
-    ALTER TABLE communications ADD COLUMN IF NOT EXISTS conversation_key TEXT;
-    ALTER TABLE communications ADD COLUMN IF NOT EXISTS imported_at TIMESTAMPTZ DEFAULT now();
     ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;
     ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS user_id_ref TEXT;
-    ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS source_channel TEXT;
-    ALTER TABLE activity_timeline ADD COLUMN IF NOT EXISTS details_json JSONB DEFAULT '{}'::jsonb;
-    ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS note_type TEXT DEFAULT 'general';
-    ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS tenant_id INT NOT NULL DEFAULT 1;
-    ALTER TABLE job_notes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
-    ALTER TABLE photos ADD COLUMN IF NOT EXISTS photo_type TEXT DEFAULT 'general';
-    ALTER TABLE photos ADD COLUMN IF NOT EXISTS tenant_id INT NOT NULL DEFAULT 1;
-    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_user_id BIGINT;
-    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_to TEXT;
-    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS planned_start_at TIMESTAMPTZ;
-    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS planned_end_at TIMESTAMPTZ;
-    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS handover_note TEXT;
-    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS handed_over_by TEXT;
-    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS handed_over_at TIMESTAMPTZ;
-    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS calendar_sync_enabled BOOLEAN DEFAULT TRUE;
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id INT NOT NULL DEFAULT 1;
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assigned_user_id BIGINT;
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS planning_note TEXT;
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS planned_start_at TIMESTAMPTZ;
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS planned_end_at TIMESTAMPTZ;
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_for_assignee_only BOOLEAN DEFAULT TRUE;
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS calendar_sync_enabled BOOLEAN DEFAULT TRUE;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quote_title TEXT;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS valid_until DATE;
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS notes TEXT;
@@ -1159,45 +217,8 @@ DO $$ BEGIN
     ALTER TABLE quotes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
     ALTER TABLE quote_items ADD COLUMN IF NOT EXISTS total DECIMAL DEFAULT 0;
     ALTER TABLE quote_items ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0;
-    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS address TEXT;
-    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS address_line1 TEXT;
-    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS city TEXT;
-    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS postcode TEXT;
-    ALTER TABLE user_contact_sync ADD COLUMN IF NOT EXISTS country TEXT;
-    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS address TEXT;
-    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS owner_user_id BIGINT DEFAULT NULL;
-    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS address_line1 TEXT;
-    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS city TEXT;
-    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS postcode TEXT;
-    ALTER TABLE shared_contacts ADD COLUMN IF NOT EXISTS country TEXT;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
-CREATE INDEX IF NOT EXISTS idx_communications_tenant_client_time
-    ON communications(tenant_id, client_id, sent_at DESC, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_communications_source_external
-    ON communications(tenant_id, source, external_message_id);
-CREATE INDEX IF NOT EXISTS idx_assistant_memory_tenant_active
-    ON assistant_memory(tenant_id, user_id, is_active, updated_at DESC);
-UPDATE users
-SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), email, display_name),
-    updated_at = now()
-WHERE display_name LIKE '%*%';
-UPDATE clients
-SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), display_name),
-    updated_at = now()
-WHERE display_name LIKE '%*%';
-UPDATE shared_contacts
-SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), display_name),
-    updated_at = now()
-WHERE display_name LIKE '%*%';
-UPDATE user_contact_sync
-SET display_name = COALESCE(NULLIF(btrim(regexp_replace(display_name, '\\*+', ' ', 'g')), ''), display_name),
-    updated_at = now()
-WHERE display_name LIKE '%*%';
-UPDATE leads
-SET contact_name = COALESCE(NULLIF(btrim(regexp_replace(contact_name, '\\*+', ' ', 'g')), ''), contact_name),
-    updated_at = now()
-WHERE contact_name LIKE '%*%';
 """
 
 # === CONFIG ===
@@ -1210,1182 +231,11 @@ else:
 ai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # === WHATSAPP CONFIG ===
-def env_first(*names: str, default: str = "") -> str:
-    for name in names:
-        value = os.getenv(name)
-        if value is not None:
-            trimmed = value.strip()
-            if trimmed:
-                return trimmed
-    return default
-
-WA_PHONE_ID = env_first("WHATSAPP_PHONE_NUMBER_ID", "WA_PHONE_ID", "META_WHATSAPP_PHONE_NUMBER_ID")
-WA_ACCOUNT_ID = env_first("WHATSAPP_BUSINESS_ACCOUNT_ID", "WA_ACCOUNT_ID", "META_WHATSAPP_BUSINESS_ACCOUNT_ID")
-WA_TOKEN = env_first("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN", "META_ACCESS_TOKEN")
-WA_VERIFY_TOKEN = env_first("WHATSAPP_VERIFY_TOKEN", default="secretary_webhook_2026")
-TWILIO_ACCOUNT_SID = env_first("TWILIO_ACCOUNT_SID", "TWILIO_SID")
-TWILIO_AUTH_TOKEN = env_first("TWILIO_AUTH_TOKEN", "TWILIO_TOKEN")
-TWILIO_WHATSAPP_FROM = env_first("TWILIO_WHATSAPP_FROM", "TWILIO_WHATSAPP_NUMBER", "TWILIO_WHATSAPP_SENDER")
-PLANTNET_API_KEY = env_first(
-    "PLANTNET_API_KEY",
-    "PLANTNET_KEY",
-    "PLANT_RECOGNITION_API_KEY",
-    "PLANT_ID_API_KEY",
-    "PLANTNET_PRIVATE_API_KEY",
-)
-PLANTNET_PROJECT = env_first("PLANTNET_PROJECT", default="all")
-PLANT_HEALTH_API_KEY = env_first(
-    "PLANT_HEALTH_API_KEY",
-    "KINDWISE_PLANT_HEALTH_API_KEY",
-    "PLANT_DISEASE_API_KEY",
-    "PLANT_ID_API_KEY",
-)
-PLANT_HEALTH_API_URL = env_first(
-    "PLANT_HEALTH_API_URL",
-    default="https://api.plant.id/v3/health_assessment",
-)
-MUSHROOM_ID_API_KEY = env_first(
-    "MUSHROOM_ID_API_KEY",
-    "MUSHROOM_API_KEY",
-    "MUSHROOMID_API_KEY",
-    "MUSHROOM_RECOGNITION_API_KEY",
-    "KINDWISE_MUSHROOM_API_KEY",
-    "KINDWISE_API_KEY",
-)
-MUSHROOM_ID_API_URL = env_first(
-    "MUSHROOM_ID_API_URL",
-    "MUSHROOM_API_URL",
-    "KINDWISE_MUSHROOM_API_URL",
-    default="https://mushroom.kindwise.com/api/v1/identification",
-)
-
-def normalize_kindwise_endpoint(configured_url: str, suffix: str) -> str:
-    base = (configured_url or "").strip().rstrip("/")
-    if not base:
-        return suffix
-    if base.lower().endswith(suffix.lower()):
-        return base
-    if base.lower().endswith("/api/v1") or base.lower().endswith("/v3"):
-        return f"{base}{suffix}"
-    return base
-
-PLANT_HEALTH_API_URL = normalize_kindwise_endpoint(PLANT_HEALTH_API_URL, "/health_assessment")
-MUSHROOM_ID_API_URL = normalize_kindwise_endpoint(MUSHROOM_ID_API_URL, "/identification")
-
-def get_wa_api_url() -> str:
-    return f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
-
-def get_twilio_messages_api_url() -> str:
-    return f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
-
-def get_whatsapp_provider() -> str:
-    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM:
-        return "twilio"
-    if WA_TOKEN and WA_PHONE_ID:
-        return "meta"
-    return "none"
-
-def get_nature_service_status() -> dict:
-    return {
-        "plant_recognition_configured": bool(PLANTNET_API_KEY),
-        "plant_health_configured": bool(PLANT_HEALTH_API_KEY),
-        "mushroom_recognition_configured": bool(MUSHROOM_ID_API_KEY),
-        "plant_health_api_url": PLANT_HEALTH_API_URL,
-        "mushroom_api_url": MUSHROOM_ID_API_URL,
-    }
-
-DEFAULT_CUSTOMER_LANG = "en-GB"
-DEFAULT_ASSISTANT_LANG = "en-GB"
-DEFAULT_ASSISTANT_TONE = "professional"
-DEFAULT_ASSISTANT_STYLE = "concise"
-
-
-def normalize_language_code(language: Optional[str], default: str = "en-GB") -> str:
-    raw = (language or "").strip().lower()
-    if not raw:
-        return default
-    aliases = {
-        "en": "en-GB",
-        "en-gb": "en-GB",
-        "en-uk": "en-GB",
-        "en-us": "en-GB",
-        "english": "en-GB",
-        "anglictina": "en-GB",
-        "angličtina": "en-GB",
-        "cs": "cs-CZ",
-        "cs-cz": "cs-CZ",
-        "czech": "cs-CZ",
-        "cestina": "cs-CZ",
-        "čeština": "cs-CZ",
-        "pl": "pl-PL",
-        "pl-pl": "pl-PL",
-        "polish": "pl-PL",
-        "polski": "pl-PL",
-        "de": "de-DE",
-        "de-de": "de-DE",
-        "german": "de-DE",
-        "deutsch": "de-DE",
-        "fr": "fr-FR",
-        "fr-fr": "fr-FR",
-        "french": "fr-FR",
-        "francais": "fr-FR",
-        "français": "fr-FR",
-        "es": "es-ES",
-        "es-es": "es-ES",
-        "spanish": "es-ES",
-        "espanol": "es-ES",
-        "español": "es-ES",
-        "sk": "sk-SK",
-        "sk-sk": "sk-SK",
-        "slovak": "sk-SK",
-        "slovencina": "sk-SK",
-        "slovenčina": "sk-SK",
-        "ro": "ro-RO",
-        "ro-ro": "ro-RO",
-        "romanian": "ro-RO",
-    }
-    if raw in aliases:
-        return aliases[raw]
-    raw_prefix = raw.split("-")[0]
-    if raw_prefix in aliases:
-        return aliases[raw_prefix]
-    return default
-
-
-def normalize_language_short(language: Optional[str], default: str = "en") -> str:
-    return normalize_language_code(language, default).split("-")[0]
-
-
-def get_customer_output_language(customer_id: Optional[int], tenant_id: int) -> str:
-    if not customer_id:
-        return DEFAULT_CUSTOMER_LANG
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT preferred_language_code
-                FROM clients
-                WHERE id=%s
-                """,
-                (customer_id,),
-            )
-            row = cur.fetchone()
-            if row and row.get("preferred_language_code"):
-                return normalize_language_code(row["preferred_language_code"], DEFAULT_CUSTOMER_LANG)
-    except Exception as e:
-        print(f"get_customer_output_language error: {e}")
-    finally:
-        release_conn(conn)
-    return DEFAULT_CUSTOMER_LANG
-
-
-def set_customer_preferred_language(customer_id: int, language_code: str, source: str = "default", confidence: float = 1.0):
-    lang = normalize_language_code(language_code, DEFAULT_CUSTOMER_LANG)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE clients
-                SET preferred_language_code = %s,
-                    preferred_language_name = %s,
-                    language_source = %s,
-                    language_confidence = %s,
-                    language_updated_at = now()
-                WHERE id = %s
-                """,
-                (lang, lang, source, confidence, customer_id),
-            )
-            conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"set_customer_preferred_language error: {e}")
-    finally:
-        release_conn(conn)
-
-
-def get_assistant_internal_language(user_id: Optional[int], tenant_id: int) -> Dict[str, str]:
-    lang = DEFAULT_ASSISTANT_LANG
-    tone = DEFAULT_ASSISTANT_TONE
-    style = DEFAULT_ASSISTANT_STYLE
-    locked = True
-    if not user_id:
-        return {"lang": lang, "tone": tone, "style": style, "locked": locked}
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT assistant_output_language_code, assistant_output_language_name,
-                       assistant_language_locked, assistant_tone, assistant_style
-                FROM users
-                WHERE id=%s
-                """,
-                (user_id,),
-            )
-            row = cur.fetchone()
-            if row:
-                lang = normalize_language_code(row.get("assistant_output_language_code") or lang, lang)
-                tone = (row.get("assistant_tone") or tone).strip().lower()
-                style = (row.get("assistant_style") or style).strip().lower()
-                locked = bool(row.get("assistant_language_locked") if row.get("assistant_language_locked") is not None else locked)
-    except Exception as e:
-        print(f"get_assistant_internal_language error: {e}")
-    finally:
-        release_conn(conn)
-    return {"lang": lang, "tone": tone, "style": style, "locked": locked}
-
-def tr_lang(lang: str, en: str, cs: str, pl: str) -> str:
-    code = normalize_language_code(lang, default="en")
-    return cs if code == "cs" else pl if code == "pl" else en
-
-
-# ========== OUTPUT LANGUAGE VALIDATION ==========
-
-# Unique character signatures per language
-_LANG_CHAR_SCORES: list = [
-    # (lang_short, [(char, weight), ...])
-    ("cs", [("ě", 6), ("ř", 6), ("ů", 6), ("š", 3), ("č", 3), ("ž", 3), ("ý", 2), ("í", 1), ("á", 1), ("é", 1)]),
-    ("pl", [("ą", 6), ("ę", 6), ("ł", 6), ("ń", 5), ("ź", 5), ("ż", 5), ("ś", 4), ("ć", 4), ("ó", 2)]),
-    ("de", [("ß", 8), ("ä", 4), ("ö", 4), ("ü", 4)]),
-    ("fr", [("ç", 6), ("œ", 6), ("æ", 5), ("à", 3), ("â", 3), ("ê", 3), ("î", 3), ("ô", 3), ("û", 3), ("è", 2)]),
-    ("es", [("ñ", 8), ("¿", 6), ("¡", 6)]),
-    ("sk", [("ľ", 8), ("ĺ", 8), ("ŕ", 8), ("ď", 4), ("ť", 4)]),
-]
-
-# Common stopwords as tiebreakers for short Latin-only text
-_LANG_STOPWORDS: dict = {
-    "en": {"the", "and", "for", "are", "this", "that", "with", "have", "will", "been", "not", "your", "you", "our"},
-    "cs": {"pro", "není", "nebo", "jako", "jsou", "máte", "byl", "ale", "při", "tak", "jak", "kdy"},
-    "pl": {"jest", "nie", "jak", "ale", "który", "przez", "przy", "oraz", "jego", "tak"},
-    "de": {"ist", "die", "der", "das", "und", "ein", "eine", "nicht", "sind", "mit", "von", "für"},
-    "fr": {"est", "les", "des", "pour", "que", "dans", "une", "avec", "pas", "sur", "qui", "mais"},
-    "es": {"los", "las", "del", "para", "que", "con", "una", "por", "pero", "como", "más", "este"},
-}
-
-
-def detect_reply_language_short(text: str, default: str = "en") -> str:
-    """Lightweight heuristic language detection for en/cs/pl/de/fr/es/sk.
-
-    Uses langdetect if the library is installed; otherwise falls back to
-    Unicode character frequency scoring + stopword counting.
-    Returns an ISO 639-1 short code ('en', 'cs', 'pl', …).
-    """
-    if not text or len(text.strip()) < 8:
-        return default
-
-    # --- optional fast path: langdetect library ---
-    try:
-        from langdetect import detect as _ld_detect  # type: ignore
-        raw = _ld_detect(text)
-        canonical = {"en": "en", "cs": "cs", "pl": "pl", "de": "de", "fr": "fr", "es": "es", "sk": "sk", "ro": "ro"}
-        return canonical.get(raw, raw[:2] if raw else default)
-    except Exception:
-        pass
-
-    # --- heuristic fallback ---
-    t = text.lower()
-    scores: dict[str, float] = {}
-
-    # 1. Unique character scoring
-    for lang, chars in _LANG_CHAR_SCORES:
-        score = sum(t.count(ch) * w for ch, w in chars)
-        if score > 0:
-            scores[lang] = scores.get(lang, 0.0) + score
-
-    # 2. If a clear winner already emerged from character scoring, return it
-    if scores:
-        best = max(scores, key=scores.__getitem__)
-        if scores[best] >= 3:
-            return best
-
-    # 3. Stopword tiebreaker (for Latin-only text like English)
-    words = set(re.findall(r"[a-záéíóúàâäèêëîïôùûüýÿœæçñ]+", t))
-    sw_hits: dict[str, int] = {
-        lang: len(words & stops)
-        for lang, stops in _LANG_STOPWORDS.items()
-    }
-    best_sw = max(sw_hits, key=sw_hits.__getitem__)
-    if sw_hits[best_sw] > 0:
-        return best_sw
-
-    return default
-
-
-def log_language_mismatch(
-    tenant_id: int,
-    user_id: Optional[int],
-    customer_id: Optional[int],
-    expected_lang_short: str,
-    detected_lang_short: str,
-    reply_excerpt: str,
-    source: str = "process",
-) -> None:
-    """Persist a language mismatch event to activity_timeline. Non-blocking — errors are swallowed."""
-    try:
-        conn = get_db_conn()
-        try:
-            log_activity(
-                conn,
-                entity_type="language_validation",
-                entity_id=customer_id or 0,
-                action="language_mismatch",
-                description=(
-                    f"Reply language '{detected_lang_short}' does not match "
-                    f"expected '{expected_lang_short}' (source={source})"
-                ),
-                tenant_id=tenant_id,
-                user_id=user_id,
-                source_channel=source,
-                details={
-                    "expected_language": expected_lang_short,
-                    "detected_language": detected_lang_short,
-                    "customer_id": customer_id,
-                    "reply_excerpt": (reply_excerpt or "")[:150],
-                },
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        finally:
-            release_conn(conn)
-    except Exception as e:
-        print(f"log_language_mismatch failed: {e}")
-
-
-def plant_guidance_labels(language: str) -> dict:
-    code = normalize_language_code(language, default="en")
-    if code == "cs":
-        return {
-            "language_name": "Czech",
-            "subject_fallback": "rostlina",
-            "unknown": "neuvedeno",
-            "description": "Popis",
-            "needs": "Nároky",
-            "best_place": "Vhodné místo",
-            "note": "Poznámka",
-            "instruction": "Piš česky. Buď stručný a praktický.",
-        }
-    if code == "pl":
-        return {
-            "language_name": "Polish",
-            "subject_fallback": "roślina",
-            "unknown": "nie podano",
-            "description": "Opis",
-            "needs": "Wymagania",
-            "best_place": "Najlepsze miejsce",
-            "note": "Uwaga",
-            "instruction": "Pisz po polsku. Bądź zwięzły i praktyczny dla ogrodnika.",
-        }
-    return {
-        "language_name": "English",
-        "subject_fallback": "the plant",
-        "unknown": "unknown",
-        "description": "Description",
-        "needs": "Needs",
-        "best_place": "Best place",
-        "note": "Note",
-        "instruction": "Write in English. Keep it concise and practical for a gardener.",
-    }
-
-def plant_health_labels(language: str) -> dict:
-    code = normalize_language_code(language, default="en")
-    if code == "cs":
-        return {
-            "finding": "Nález",
-            "cause": "Příčina",
-            "treatment": "Léčba",
-            "prevention": "Prevence",
-            "healthy": "Rostlina podle fotek působí spíš zdravě.",
-            "instruction": "Piš česky. Buď stručný a praktický. Zaměř se na diagnózu, léčbu a prevenci.",
-        }
-    if code == "pl":
-        return {
-            "finding": "Wniosek",
-            "cause": "Przyczyna",
-            "treatment": "Leczenie",
-            "prevention": "Zapobieganie",
-            "healthy": "Roślina na zdjęciach wygląda raczej zdrowo.",
-            "instruction": "Pisz po polsku. Bądź zwięzły i praktyczny dla ogrodnika. Skup się na diagnozie, leczeniu i zapobieganiu.",
-        }
-    return {
-        "finding": "Finding",
-        "cause": "Cause",
-        "treatment": "Treatment",
-        "prevention": "Prevention",
-        "healthy": "The plant looks rather healthy based on the photos.",
-        "instruction": "Write in English. Keep it concise and practical for a gardener. Focus on diagnosis, treatment, and prevention.",
-    }
-
-def mushroom_guidance_labels(language: str) -> dict:
-    code = normalize_language_code(language, default="en")
-    if code == "cs":
-        return {
-            "subject_fallback": "houba",
-            "unknown": "neuvedeno",
-            "description": "Popis",
-            "edibility": "Jedlost",
-            "habitat": "Stanoviště",
-            "warning": "Varování",
-            "instruction": "Piš česky. Buď stručný a praktický. Vždy zdůrazni, že jedlost se nesmí potvrzovat jen podle fotografie.",
-        }
-    if code == "pl":
-        return {
-            "subject_fallback": "grzyb",
-            "unknown": "nie podano",
-            "description": "Opis",
-            "edibility": "Jadalność",
-            "habitat": "Siedlisko",
-            "warning": "Ostrzeżenie",
-            "instruction": "Pisz po polsku. Bądź zwięzły i praktyczny. Zawsze podkreślaj, że nie wolno potwierdzać jadalności wyłącznie na podstawie zdjęcia.",
-        }
-    return {
-        "subject_fallback": "the mushroom",
-        "unknown": "unknown",
-        "description": "Description",
-        "edibility": "Edibility",
-        "habitat": "Habitat",
-        "warning": "Warning",
-        "instruction": "Write in English. Keep it concise and practical. Always stress that edibility must not be confirmed from a photo alone.",
-    }
-
-def flatten_mushroom_list(value) -> List[str]:
-    items: List[str] = []
-
-    def append(candidate) -> None:
-        if candidate is None:
-            return
-        if isinstance(candidate, str):
-            text = candidate.strip()
-            if text:
-                items.append(text)
-            return
-        if isinstance(candidate, (int, float)):
-            items.append(str(candidate))
-            return
-        if isinstance(candidate, dict):
-            primary = (
-                candidate.get("name")
-                or candidate.get("label")
-                or candidate.get("title")
-                or candidate.get("value")
-                or candidate.get("common_name")
-                or candidate.get("scientific_name")
-                or candidate.get("text")
-            )
-            if isinstance(primary, (str, int, float)):
-                append(primary)
-                return
-            for nested in candidate.values():
-                append(nested)
-            return
-        if isinstance(candidate, list):
-            for nested in candidate:
-                append(nested)
-
-    append(value)
-    return list(dict.fromkeys(items))
-
-def flatten_mushroom_text(value) -> Optional[str]:
-    items = flatten_mushroom_list(value)
-    if not items:
-        return None
-    return ", ".join(items)
-
-def flatten_mushroom_bool(value) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "yes", "y", "1", "psychoactive"}:
-            return True
-        if normalized in {"false", "no", "n", "0", "non-psychoactive", "not psychoactive"}:
-            return False
-        return None
-    if isinstance(value, dict):
-        for key in ("binary", "value", "is_psychoactive", "psychoactive"):
-            parsed = flatten_mushroom_bool(value.get(key))
-            if parsed is not None:
-                return parsed
-        for nested in value.values():
-            parsed = flatten_mushroom_bool(nested)
-            if parsed is not None:
-                return parsed
-    if isinstance(value, list):
-        for nested in value:
-            parsed = flatten_mushroom_bool(nested)
-            if parsed is not None:
-                return parsed
-    return None
-
-def extract_mushroom_suggestions(raw) -> List[dict]:
-    candidates = []
-    if isinstance(raw, dict):
-        result = raw.get("result")
-        if isinstance(result, dict):
-            classification = result.get("classification")
-            if isinstance(classification, dict):
-                suggestions = classification.get("suggestions")
-                if isinstance(suggestions, list):
-                    candidates.extend([item for item in suggestions if isinstance(item, dict)])
-            suggestions = result.get("suggestions")
-            if isinstance(suggestions, list):
-                candidates.extend([item for item in suggestions if isinstance(item, dict)])
-        classification = raw.get("classification")
-        if isinstance(classification, dict):
-            suggestions = classification.get("suggestions")
-            if isinstance(suggestions, list):
-                candidates.extend([item for item in suggestions if isinstance(item, dict)])
-        suggestions = raw.get("suggestions")
-        if isinstance(suggestions, list):
-            candidates.extend([item for item in suggestions if isinstance(item, dict)])
-    if isinstance(raw, list):
-        candidates.extend([item for item in raw if isinstance(item, dict)])
-    return candidates
-
-def flatten_plant_list(value) -> List[str]:
-    items: List[str] = []
-
-    def append(candidate) -> None:
-        if candidate is None:
-            return
-        if isinstance(candidate, str):
-            text = candidate.strip()
-            if text:
-                items.append(text)
-            return
-        if isinstance(candidate, (int, float)):
-            items.append(str(candidate))
-            return
-        if isinstance(candidate, dict):
-            primary = (
-                candidate.get("scientificNameWithoutAuthor")
-                or candidate.get("scientificName")
-                or candidate.get("commonName")
-                or candidate.get("common_name")
-                or candidate.get("name")
-                or candidate.get("label")
-                or candidate.get("title")
-                or candidate.get("value")
-                or candidate.get("text")
-            )
-            if isinstance(primary, (str, int, float)):
-                append(primary)
-                return
-            for nested in candidate.values():
-                append(nested)
-            return
-        if isinstance(candidate, list):
-            for nested in candidate:
-                append(nested)
-
-    append(value)
-    return list(dict.fromkeys(items))
-
-def flatten_plant_text(value) -> str:
-    items = flatten_plant_list(value)
-    return items[0] if items else ""
-
-def normalize_plant_score(value) -> float:
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value.strip())
-        except Exception:
-            return 0.0
-    if isinstance(value, dict):
-        for key in ("score", "probability", "value"):
-            parsed = normalize_plant_score(value.get(key))
-            if parsed > 0:
-                return parsed
-        for nested in value.values():
-            parsed = normalize_plant_score(nested)
-            if parsed > 0:
-                return parsed
-    if isinstance(value, list):
-        for nested in value:
-            parsed = normalize_plant_score(nested)
-            if parsed > 0:
-                return parsed
-    return 0.0
-
-def extract_plant_taxon_name(value) -> str:
-    if isinstance(value, dict):
-        return flatten_plant_text(
-            value.get("scientificNameWithoutAuthor")
-            or value.get("scientificName")
-            or value.get("name")
-            or value.get("label")
-            or value.get("value")
-            or value
-        )
-    return flatten_plant_text(value)
-
-def flatten_treatment_items(treatment: dict) -> dict:
-    treatment = treatment or {}
-    return {
-        "chemical": [str(item).strip() for item in (treatment.get("chemical") or []) if str(item).strip()],
-        "biological": [str(item).strip() for item in (treatment.get("biological") or []) if str(item).strip()],
-        "prevention": [str(item).strip() for item in (treatment.get("prevention") or []) if str(item).strip()],
-    }
-
-async def plantnet_identify(files: List[UploadFile], organs: List[str], language: str) -> dict:
-    if not PLANTNET_API_KEY:
-        raise HTTPException(503, tr_lang(
-            language,
-            "Plant recognition service is not configured.",
-            "Služba pro rozpoznávání rostlin není nastavená.",
-            "Usługa rozpoznawania roślin nie jest skonfigurowana."
-        ))
-    payload_files = []
-    for index, upload in enumerate(files):
-        content = await upload.read()
-        if not content:
-            raise HTTPException(400, tr_lang(
-                language,
-                f"Image {index + 1} is empty.",
-                f"Obrázek {index + 1} je prázdný.",
-                f"Obraz {index + 1} jest pusty."
-            ))
-        payload_files.append((
-            "images",
-            (
-                upload.filename or f"plant_{index + 1}.jpg",
-                content,
-                upload.content_type or "image/jpeg",
-            ),
-        ))
-        await upload.seek(0)
-    lang_code = normalize_language_code(language, default="en")
-    params = {"api-key": PLANTNET_API_KEY, "lang": lang_code, "include-related-images": "false", "nb-results": "5"}
-    multipart_parts = list(payload_files)
-    for organ in organs:
-        multipart_parts.append(("organs", (None, organ or "auto")))
-    url = f"https://my-api.plantnet.org/v2/identify/{PLANTNET_PROJECT}"
-    try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            response = await client.post(url, params=params, files=multipart_parts)
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:500]
-        if exc.response.status_code in (401, 403):
-            raise HTTPException(502, tr_lang(
-                language,
-                "Plant identification service rejected the API key.",
-                "Služba pro rozpoznání rostlin odmítla API klíč.",
-                "Usługa rozpoznawania roślin odrzuciła klucz API."
-            ))
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Plant identification failed: {detail}",
-            f"Rozpoznání rostliny selhalo: {detail}",
-            f"Rozpoznanie rośliny nie powiodło się: {detail}"
-        ))
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Plant identification network error: {exc}",
-            f"Síťová chyba při rozpoznání rostliny: {exc}",
-            f"Błąd sieci podczas rozpoznawania rośliny: {exc}"
-        ))
-    except Exception as exc:
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Plant identification request error: {exc}",
-            f"Chyba požadavku při rozpoznání rostliny: {exc}",
-            f"Błąd żądania podczas rozpoznawania rośliny: {exc}"
-        ))
-
-async def plant_health_assessment(files: List[UploadFile], language: str) -> dict:
-    if not PLANT_HEALTH_API_KEY:
-        raise HTTPException(503, tr_lang(
-            language,
-            "Plant disease service is not configured.",
-            "Služba pro choroby rostlin není nastavená.",
-            "Usługa chorób roślin nie jest skonfigurowana."
-        ))
-    encoded_images = []
-    for index, upload in enumerate(files):
-        content = await upload.read()
-        if not content:
-            raise HTTPException(400, tr_lang(
-                language,
-                f"Image {index + 1} is empty.",
-                f"Obrázek {index + 1} je prázdný.",
-                f"Obraz {index + 1} jest pusty."
-            ))
-        encoded_images.append(base64.b64encode(content).decode("ascii"))
-        await upload.seek(0)
-    lang_code = normalize_language_code(language, default="en")
-    params = {
-        "details": "description,treatment,common_names",
-        "language": lang_code,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            response = await client.post(
-                PLANT_HEALTH_API_URL,
-                params=params,
-                headers={"Api-Key": PLANT_HEALTH_API_KEY},
-                json={"images": encoded_images},
-            )
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:500]
-        if exc.response.status_code in (401, 403):
-            raise HTTPException(502, tr_lang(
-                language,
-                "Plant disease service rejected the API key.",
-                "Služba pro choroby rostlin odmítla API klíč.",
-                "Usługa chorób roślin odrzuciła klucz API."
-            ))
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Plant disease assessment failed: {detail}",
-            f"Posouzení choroby rostliny selhalo: {detail}",
-            f"Ocena choroby rośliny nie powiodła się: {detail}"
-        ))
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Plant disease network error: {exc}",
-            f"Síťová chyba při zjišťování choroby rostliny: {exc}",
-            f"Błąd sieci podczas sprawdzania choroby rośliny: {exc}"
-        ))
-    except Exception as exc:
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Plant disease request error: {exc}",
-            f"Chyba požadavku při zjišťování choroby rostliny: {exc}",
-            f"Błąd żądania podczas sprawdzania choroby rośliny: {exc}"
-        ))
-
-async def mushroom_identify(files: List[UploadFile], language: str) -> dict:
-    if not MUSHROOM_ID_API_KEY:
-        raise HTTPException(503, tr_lang(
-            language,
-            "Mushroom recognition service is not configured.",
-            "Služba pro rozpoznávání hub není nastavená.",
-            "Usługa rozpoznawania grzybów nie jest skonfigurowana."
-        ))
-    encoded_images = []
-    for index, upload in enumerate(files):
-        content = await upload.read()
-        if not content:
-            raise HTTPException(400, tr_lang(
-                language,
-                f"Image {index + 1} is empty.",
-                f"Obrázek {index + 1} je prázdný.",
-                f"Obraz {index + 1} jest pusty."
-            ))
-        encoded_images.append(base64.b64encode(content).decode("ascii"))
-        await upload.seek(0)
-    params = {
-        "details": "common_names,url,description,edibility,psychoactive,look_alikes,taxonomy,characteristics",
-        "language": normalize_language_code(language, default="en"),
-    }
-    payload = {
-        "images": encoded_images,
-        "similar_images": True,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            response = await client.post(
-                MUSHROOM_ID_API_URL,
-                params=params,
-                headers={"Api-Key": MUSHROOM_ID_API_KEY},
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:500]
-        if exc.response.status_code in (401, 403):
-            raise HTTPException(502, tr_lang(
-                language,
-                "Mushroom recognition service rejected the API key.",
-                "Služba pro rozpoznávání hub odmítla API klíč.",
-                "Usługa rozpoznawania grzybów odrzuciła klucz API."
-            ))
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Mushroom recognition failed: {detail}",
-            f"Rozpoznání houby selhalo: {detail}",
-            f"Rozpoznanie grzyba nie powiodło się: {detail}"
-        ))
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Mushroom recognition network error: {exc}",
-            f"Síťová chyba při rozpoznání houby: {exc}",
-            f"Błąd sieci podczas rozpoznawania grzyba: {exc}"
-        ))
-    except Exception as exc:
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Mushroom recognition request error: {exc}",
-            f"Chyba požadavku při rozpoznání houby: {exc}",
-            f"Błąd żądania podczas rozpoznawania grzyba: {exc}"
-        ))
-
-def build_plant_guidance(language: str, display_name: str, scientific_name: str, family: str = "", genus: str = "") -> tuple[str, str]:
-    labels = plant_guidance_labels(language)
-    common_label = display_name or scientific_name or labels["subject_fallback"]
-    if not ai_client:
-        summary = tr_lang(
-            language,
-            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Family: {family or labels['unknown']}.",
-            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Čeleď: {family or labels['unknown']}.",
-            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Rodzina: {family or labels['unknown']}."
-        )
-        return summary, summary
-    prompt = (
-        f"Plant identified as {common_label} ({scientific_name}). Family: {family or labels['unknown']}. Genus: {genus or labels['unknown']}.\n"
-        f"{labels['instruction']}\n"
-        f"Return exactly 4 short lines:\n"
-        f"1. {labels['description']}: ...\n"
-        f"2. {labels['needs']}: ...\n"
-        f"3. {labels['best_place']}: ...\n"
-        f"4. {labels['note']}: mention uncertainty if species can vary."
-    )
-    try:
-        response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You write short practical plant summaries."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=220,
-        )
-        guidance = (response.choices[0].message.content or "").strip()
-        spoken = tr_lang(
-            language,
-            f"It is most likely {common_label}. {guidance.splitlines()[0] if guidance else ''}",
-            f"Nejspíš je to {common_label}. {guidance.splitlines()[0] if guidance else ''}",
-            f"Najprawdopodobniej to {common_label}. {guidance.splitlines()[0] if guidance else ''}",
-        ).strip()
-        return guidance or common_label, spoken
-    except Exception:
-        fallback = tr_lang(
-            language,
-            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Family: {family or labels['unknown']}.",
-            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Čeleď: {family or labels['unknown']}.",
-            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Rodzina: {family or labels['unknown']}."
-        )
-        return fallback, fallback
-
-def build_plant_health_guidance(language: str, issue_name: str, description: str, treatment: dict, is_healthy: bool) -> tuple[str, str]:
-    labels = plant_health_labels(language)
-    treatment = flatten_treatment_items(treatment)
-    if not issue_name and is_healthy:
-        summary = tr_lang(
-            language,
-            "The plant looks healthy in the supplied photos. Keep monitoring new symptoms and maintain regular care.",
-            "Rostlina na dodaných fotkách působí zdravě. Sleduj nové příznaky a pokračuj v běžné péči.",
-            "Roślina na przesłanych zdjęciach wygląda zdrowo. Obserwuj nowe objawy i kontynuuj zwykłą pielęgnację."
-        )
-        return summary, summary
-    treatment_payload = json.dumps(treatment, ensure_ascii=False)
-    if not ai_client:
-        fallback = tr_lang(
-            language,
-            f"Most likely issue: {issue_name}. Description: {description or 'No description available.'}",
-            f"Nejpravděpodobnější problém: {issue_name}. Popis: {description or 'Popis není k dispozici.'}",
-            f"Najbardziej prawdopodobny problem: {issue_name}. Opis: {description or 'Brak opisu.'}"
-        )
-        return fallback, fallback
-    prompt = (
-        f"Plant health assessment result.\n"
-        f"Top issue: {issue_name or labels['healthy']}\n"
-        f"Plant looks healthy: {'yes' if is_healthy else 'no'}\n"
-        f"Description: {description or 'n/a'}\n"
-        f"Treatment data JSON: {treatment_payload}\n"
-        f"{labels['instruction']}\n"
-        f"Return exactly 4 short lines:\n"
-        f"1. {labels['finding']}: ...\n"
-        f"2. {labels['cause']}: ...\n"
-        f"3. {labels['treatment']}: ...\n"
-        f"4. {labels['prevention']}: ...\n"
-        f"If the plant looks healthy, mention that clearly and give practical monitoring advice."
-    )
-    try:
-        response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You write short practical plant disease summaries and treatment guidance."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=260,
-        )
-        guidance = (response.choices[0].message.content or "").strip()
-        spoken = tr_lang(
-            language,
-            f"Most likely issue: {issue_name}. {guidance.splitlines()[0] if guidance else ''}",
-            f"Nejpravděpodobnější problém: {issue_name}. {guidance.splitlines()[0] if guidance else ''}",
-            f"Najbardziej prawdopodobny problem: {issue_name}. {guidance.splitlines()[0] if guidance else ''}",
-        ).strip()
-        return guidance or issue_name or labels["healthy"], spoken
-    except Exception:
-        fallback = tr_lang(
-            language,
-            f"Most likely issue: {issue_name}. Description: {description or 'No description available.'}",
-            f"Nejpravděpodobnější problém: {issue_name}. Popis: {description or 'Popis není k dispozici.'}",
-            f"Najbardziej prawdopodobny problem: {issue_name}. Opis: {description or 'Brak opisu.'}"
-        )
-        return fallback, fallback
-
-def build_mushroom_guidance(
-    language: str,
-    display_name: str,
-    scientific_name: str,
-    description: str,
-    edibility: str,
-    family: str,
-    genus: str,
-    look_alikes: List[str],
-    psychoactive: Optional[bool],
-) -> tuple[str, str]:
-    labels = mushroom_guidance_labels(language)
-    common_label = display_name or scientific_name or labels["subject_fallback"]
-    lookalikes_text = ", ".join(look_alikes[:3]) if look_alikes else labels["unknown"]
-    psychoactive_text = (
-        tr_lang(language, "yes", "ano", "tak")
-        if psychoactive is True else
-        tr_lang(language, "no", "ne", "nie")
-        if psychoactive is False else labels["unknown"]
-    )
-    if not ai_client:
-        fallback = tr_lang(
-            language,
-            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Edibility: {edibility or labels['unknown']}. Never confirm edibility from a photo alone.",
-            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Jedlost: {edibility or labels['unknown']}. Jedlost nikdy nepotvrzuj jen podle fotografie.",
-            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Jadalność: {edibility or labels['unknown']}. Nigdy nie potwierdzaj jadalności wyłącznie na podstawie zdjęcia."
-        )
-        return fallback, fallback
-    prompt = (
-        f"Mushroom identified as {common_label} ({scientific_name}).\n"
-        f"Description: {description or labels['unknown']}\n"
-        f"Edibility: {edibility or labels['unknown']}\n"
-        f"Family: {family or labels['unknown']}\n"
-        f"Genus: {genus or labels['unknown']}\n"
-        f"Look-alikes: {lookalikes_text}\n"
-        f"Psychoactive: {psychoactive_text}\n"
-        f"{labels['instruction']}\n"
-        f"Return exactly 4 short lines:\n"
-        f"1. {labels['description']}: ...\n"
-        f"2. {labels['edibility']}: ...\n"
-        f"3. {labels['habitat']}: infer likely habitat if possible from taxonomy, otherwise say unknown.\n"
-        f"4. {labels['warning']}: clearly state that photo recognition is not enough to confirm edibility and mention look-alikes if relevant."
-    )
-    try:
-        response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You write short practical mushroom identification summaries with safety warnings."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=260,
-        )
-        guidance = (response.choices[0].message.content or "").strip()
-        spoken = tr_lang(
-            language,
-            f"It is most likely {common_label}. Never confirm edibility from a photo alone.",
-            f"Nejspíš je to {common_label}. Jedlost nikdy nepotvrzuj jen podle fotografie.",
-            f"Najprawdopodobniej to {common_label}. Nigdy nie potwierdzaj jadalności wyłącznie na podstawie zdjęcia.",
-        ).strip()
-        return guidance or common_label, spoken
-    except Exception:
-        fallback = tr_lang(
-            language,
-            f"Most likely match: {common_label}. Scientific name: {scientific_name}. Edibility: {edibility or labels['unknown']}. Never confirm edibility from a photo alone.",
-            f"Nejpravděpodobnější shoda: {common_label}. Vědecký název: {scientific_name}. Jedlost: {edibility or labels['unknown']}. Jedlost nikdy nepotvrzuj jen podle fotografie.",
-            f"Najbardziej prawdopodobne dopasowanie: {common_label}. Nazwa naukowa: {scientific_name}. Jadalność: {edibility or labels['unknown']}. Nigdy nie potwierdzaj jadalności wyłącznie na podstawie zdjęcia."
-        )
-        return fallback, fallback
-
-def map_plantnet_result(raw: dict, language: str, requested_organs: List[str]) -> dict:
-    results = raw.get("results") or []
-    if not results:
-        raise HTTPException(404, tr_lang(
-            language,
-            "No matching plant was found. Try clearer photos of the whole plant, leaf, flower or fruit.",
-            "Nebyla nalezena shoda. Zkus jasnější fotky celé rostliny, listu, květu nebo plodu.",
-            "Nie znaleziono pasującej rośliny. Spróbuj wyraźniejszych zdjęć całej rośliny, liścia, kwiatu albo owocu."
-        ))
-    def suggestion(item: dict) -> dict:
-        species = item.get("species") or {}
-        common_names = flatten_plant_list(species.get("commonNames"))
-        scientific_name = flatten_plant_text(
-            species.get("scientificNameWithoutAuthor") or species.get("scientificName")
-        )
-        family = extract_plant_taxon_name(species.get("family"))
-        genus = extract_plant_taxon_name(species.get("genus"))
-        display_name = common_names[0] if common_names else scientific_name
-        return {
-            "display_name": display_name,
-            "scientific_name": scientific_name,
-            "common_names": common_names,
-            "family": family,
-            "genus": genus,
-            "score": normalize_plant_score(item.get("score")),
-        }
-    top = suggestion(results[0])
-    guidance, spoken = build_plant_guidance(language, top["display_name"], top["scientific_name"], top["family"] or "", top["genus"] or "")
-    return {
-        "database": "Pl@ntNet",
-        "display_name": top["display_name"],
-        "scientific_name": top["scientific_name"],
-        "common_names": top["common_names"],
-        "family": top["family"],
-        "genus": top["genus"],
-        "score": top["score"],
-        "organs": requested_organs,
-        "guidance": guidance,
-        "spoken_summary": spoken,
-        "suggestions": [suggestion(item) for item in results[:5]],
-    }
-
-def map_plant_health_result(raw: dict, language: str) -> dict:
-    result = raw.get("result") or {}
-    is_healthy = result.get("is_healthy") or {}
-    suggestions_raw = ((result.get("disease") or {}).get("suggestions")) or []
-
-    def health_suggestion(item: dict) -> dict:
-        details = item.get("details") or {}
-        treatment = flatten_treatment_items(details.get("treatment") or {})
-        common_names = details.get("common_names") or []
-        return {
-            "name": item.get("name") or details.get("local_name") or "",
-            "probability": float(item.get("probability") or 0.0),
-            "common_names": common_names,
-            "description": details.get("description"),
-            "treatment": treatment,
-            "classification": details.get("classification") or [],
-        }
-
-    suggestions = [health_suggestion(item) for item in suggestions_raw[:5]]
-    preferred = next((item for item in suggestions_raw if not item.get("redundant")), suggestions_raw[0] if suggestions_raw else None)
-    top = health_suggestion(preferred) if preferred else None
-    healthy_binary = bool(is_healthy.get("binary"))
-    healthy_probability = float(is_healthy.get("probability") or 0.0)
-    guidance, spoken = build_plant_health_guidance(
-        language,
-        top["name"] if top else "",
-        top.get("description") or "" if top else "",
-        top.get("treatment") or {} if top else {},
-        healthy_binary,
-    )
-    return {
-        "database": "Plant.id Health Assessment",
-        "is_healthy": healthy_binary,
-        "health_probability": healthy_probability,
-        "top_issue_name": top["name"] if top else None,
-        "top_issue_common_names": top["common_names"] if top else [],
-        "top_issue_probability": top["probability"] if top else 0.0,
-        "top_issue_description": top["description"] if top else None,
-        "guidance": guidance,
-        "spoken_summary": spoken,
-        "suggestions": suggestions,
-    }
-
-def map_mushroom_result(raw: dict, language: str) -> dict:
-    suggestions_raw = extract_mushroom_suggestions(raw)
-    if not suggestions_raw:
-        raise HTTPException(404, tr_lang(
-            language,
-            "No matching mushroom was found. Try clearer photos of the whole mushroom, underside, and stem or base.",
-            "Nebyla nalezena shoda. Zkus jasnější fotky celé houby, spodní strany a třeně nebo báze.",
-            "Nie znaleziono dopasowania. Spróbuj wyraźniejszych zdjęć całego grzyba, spodu oraz trzonu lub podstawy."
-        ))
-
-    def mushroom_suggestion(item: dict) -> dict:
-        details = item.get("details") if isinstance(item.get("details"), dict) else {}
-        taxonomy = details.get("taxonomy") if isinstance(details.get("taxonomy"), dict) else {}
-        common_names = flatten_mushroom_list(details.get("common_names"))
-        look_alikes = flatten_mushroom_list(details.get("look_alikes"))
-        characteristics = flatten_mushroom_list(details.get("characteristics"))
-        name = (
-            item.get("name")
-            or flatten_mushroom_text(details.get("scientific_name"))
-            or flatten_mushroom_text(details.get("name"))
-            or ""
-        )
-        display_name = common_names[0] if common_names else name
-        return {
-            "name": name,
-            "display_name": display_name,
-            "common_names": common_names,
-            "probability": normalize_plant_score(item.get("probability") or item.get("score")),
-            "description": flatten_mushroom_text(details.get("description")),
-            "url": flatten_mushroom_text(details.get("url")),
-            "edibility": flatten_mushroom_text(details.get("edibility") or details.get("edible")),
-            "psychoactive": flatten_mushroom_bool(details.get("psychoactive") or details.get("is_psychoactive")),
-            "family": flatten_mushroom_text(taxonomy.get("family")),
-            "genus": flatten_mushroom_text(taxonomy.get("genus")),
-            "look_alikes": look_alikes,
-            "characteristics": characteristics,
-        }
-
-    suggestions = [mushroom_suggestion(item) for item in suggestions_raw[:5] if isinstance(item, dict)]
-    suggestions = [item for item in suggestions if item.get("name") or item.get("display_name")]
-    if not suggestions:
-        raise HTTPException(404, tr_lang(
-            language,
-            "No usable mushroom match was returned. Try clearer photos of the whole mushroom, underside, and stem or base.",
-            "Nebyla vrácena použitelná shoda houby. Zkus jasnější fotky celé houby, spodní strany a třeně nebo báze.",
-            "Nie zwrócono użytecznego dopasowania grzyba. Spróbuj wyraźniejszych zdjęć całego grzyba, spodu oraz trzonu lub podstawy."
-        ))
-    top = suggestions[0]
-    guidance, spoken = build_mushroom_guidance(
-        language,
-        top["display_name"],
-        top["name"],
-        top.get("description") or "",
-        top.get("edibility") or "",
-        top.get("family") or "",
-        top.get("genus") or "",
-        top.get("look_alikes") or [],
-        top.get("psychoactive"),
-    )
-    return {
-        "database": "mushroom.id",
-        "display_name": top["display_name"],
-        "scientific_name": top["name"],
-        "common_names": top["common_names"],
-        "probability": top["probability"],
-        "description": top["description"],
-        "url": top["url"],
-        "edibility": top["edibility"],
-        "psychoactive": top["psychoactive"],
-        "family": top["family"],
-        "genus": top["genus"],
-        "look_alikes": top["look_alikes"],
-        "characteristics": top["characteristics"],
-        "guidance": guidance,
-        "spoken_summary": spoken,
-        "suggestions": [
-            {
-                "name": item["name"],
-                "common_names": item["common_names"],
-                "probability": item["probability"],
-                "description": item["description"],
-                "url": item["url"],
-                "edibility": item["edibility"],
-                "psychoactive": item["psychoactive"],
-                "family": item["family"],
-                "genus": item["genus"],
-                "look_alikes": item["look_alikes"],
-                "characteristics": item["characteristics"],
-            }
-            for item in suggestions
-        ],
-    }
+WA_PHONE_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+WA_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
+WA_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "designleaf_webhook_2026")
+WA_API_URL = f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
 
 def parse_database_config():
     database_url = os.getenv("DATABASE_URL", "")
@@ -2420,149 +270,26 @@ def init_pool():
             db_pool.putconn(conn2)
             print("Roles seeded")
         except Exception as e: print(f"Role seed: {e}")
+        # Seed default service rates
         try:
-            conn_perm = db_pool.getconn()
-            with conn_perm.cursor() as cur:
+            conn3 = db_pool.getconn()
+            with conn3.cursor() as cur:
                 cur.execute("SET search_path TO crm, public")
-            seed_permissions(conn_perm)
-            db_pool.putconn(conn_perm)
-            print("Permissions seeded")
-        except Exception as e: print(f"Permission seed: {e}")
-        # NOTE: Service rates are NOT seeded on startup.
-        # They must be configured per tenant via the settings UI or onboarding flow.
-        # Hardcoded landscaping rates were removed — do not re-add them here.
-        try:
-            conn_sections = db_pool.getconn()
-            with conn_sections.cursor() as cur:
-                cur.execute("SET search_path TO crm, public")
-                for section_code, display_name, sort_order in DEFAULT_CONTACT_SECTIONS:
-                    cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order)
-                        VALUES (1, %s, %s, TRUE, %s)
-                        ON CONFLICT (tenant_id, section_code) DO UPDATE SET
-                            display_name=EXCLUDED.display_name,
-                            sort_order=EXCLUDED.sort_order,
-                            is_active=TRUE,
-                            updated_at=now()""",
-                        (section_code, display_name, sort_order))
-                conn_sections.commit()
-            db_pool.putconn(conn_sections)
-            print("Contact sections seeded")
-        except Exception as e: print(f"Contact section seed: {e}")
-        try:
-            conn_repair = db_pool.getconn()
-            with conn_repair.cursor() as cur:
-                cur.execute("SET search_path TO crm, public")
-            apply_python_repair_024(conn_repair)
-            db_pool.putconn(conn_repair)
-        except Exception as e: print(f"Python repair 024 error: {e}")
-        try:
-            conn_ind = db_pool.getconn()
-            with conn_ind.cursor() as cur:
-                cur.execute("SET search_path TO crm, public")
-            seed_industry_catalog(conn_ind)
-            db_pool.putconn(conn_ind)
-            print("Industry catalog seeded")
-        except Exception as e: print(f"Industry catalog seed: {e}")
-        try:
-            conn_act = db_pool.getconn()
-            with conn_act.cursor() as cur:
-                cur.execute("SET search_path TO crm, public")
-            seed_activity_templates(conn_act)
-            db_pool.putconn(conn_act)
-            print("Activity templates seeded")
-        except Exception as e: print(f"Activity templates seed: {e}")
-        try:
-            conn_ui = db_pool.getconn()
-            with conn_ui.cursor() as cur:
-                cur.execute("SET search_path TO crm, public")
-            seed_activity_pricing_ui_controls(conn_ui)
-            db_pool.putconn(conn_ui)
-            print("Activity pricing UI controls seeded")
-        except Exception as e: print(f"Activity pricing UI controls seed: {e}")
-        # Auto-apply pending SQL migrations from migrations/ directory
-        try:
-            import glob, os as _os
-            conn_mig = db_pool.getconn()
-            with conn_mig.cursor() as cur:
-                cur.execute("SET search_path TO crm, public")
-                mig_dir = _os.path.join(_os.path.dirname(__file__), "migrations")
-                sql_files = sorted(glob.glob(_os.path.join(mig_dir, "*.sql")))
-                for fpath in sql_files:
-                    fname = _os.path.basename(fpath)
-                    if fname.endswith("_rollback.sql"): continue
-                    cur.execute("SELECT 1 FROM migration_log WHERE filename=%s", (fname,))
-                    if cur.fetchone(): continue
-                    print(f"Applying pending migration: {fname}")
-                    try:
-                        sql = open(fpath, encoding="utf-8").read()
-                        body = sql.replace("BEGIN;","").replace("COMMIT;","")
-                        # Smart split: don't split inside dollar-quoted blocks (DO $$ ... $$)
-                        stmts = []
-                        current = []
-                        in_dollar = False
-                        for line in body.splitlines(keepends=True):
-                            current.append(line)
-                            if '$$' in line:
-                                in_dollar = not in_dollar
-                            if not in_dollar and line.rstrip().endswith(';'):
-                                stmt = ''.join(current).strip()
-                                if stmt:
-                                    stmts.append(stmt)
-                                current = []
-                        # Flush any remaining (no trailing semicolon)
-                        remainder = ''.join(current).strip()
-                        if remainder:
-                            stmts.append(remainder)
-                        cur.execute("SAVEPOINT mig_auto")
-                        for stmt in stmts:
-                            cur.execute(stmt)
-                        cur.execute("INSERT INTO migration_log (filename) VALUES (%s) ON CONFLICT DO NOTHING", (fname,))
-                        conn_mig.commit()
-                        print(f"Migration applied: {fname}")
-                    except Exception as me:
-                        cur.execute("ROLLBACK TO SAVEPOINT mig_auto")
-                        conn_mig.commit()
-                        print(f"Migration FAILED {fname}: {me}")
-            db_pool.putconn(conn_mig)
-        except Exception as e: print(f"Auto-migration error: {e}")
-
-        # Self-heal: re-seed activity_templates if incomplete (fewer than 100 = partial seed)
-        # Runs AFTER auto-migration so migration 023 has already fixed industry subtypes
-        try:
-            conn_heal = db_pool.getconn()
-            act_count = 0
-            with conn_heal.cursor() as cur:
-                cur.execute("SET search_path TO crm, public")
-                cur.execute("SELECT COUNT(*) FROM activity_templates WHERE is_active=true")
-                act_count = cur.fetchone()[0]
-                if act_count < 100:
-                    print(f"activity_templates incomplete ({act_count} rows) — rebuilding")
-                    # Clear migration log so seed_activity_templates will re-run
-                    cur.execute("DELETE FROM migration_log WHERE filename='2026_05_06_activity_templates_020.sql'")
-                    # Use DELETE instead of TRUNCATE to avoid CASCADE lock issues
-                    cur.execute("DELETE FROM tenant_activity_pricing")
-                    cur.execute("DELETE FROM activity_templates")
-                    # Reset sequences (safe, ignore if sequence name differs)
-                    try:
-                        cur.execute("ALTER SEQUENCE activity_templates_id_seq RESTART WITH 1")
-                    except Exception: pass
-            conn_heal.commit()
-            db_pool.putconn(conn_heal)
-            if act_count < 100:
-                conn_reseed = db_pool.getconn()
-                with conn_reseed.cursor() as cur:
-                    cur.execute("SET search_path TO crm, public")
-                seed_activity_templates(conn_reseed)
-                db_pool.putconn(conn_reseed)
-                # Verify re-seed result
-                conn_verify = db_pool.getconn()
-                with conn_verify.cursor() as cur:
-                    cur.execute("SET search_path TO crm, public")
-                    cur.execute("SELECT COUNT(*) FROM activity_templates WHERE is_active=true")
-                    new_count = cur.fetchone()[0]
-                    print(f"activity_templates after re-seed: {new_count} rows")
-                db_pool.putconn(conn_verify)
-        except Exception as e: print(f"Self-heal activity_templates error: {e}")
+                for rt, rate, desc in [
+                    ("garden_maintenance", 27, "Garden maintenance: cleaning, weeding, planting, grass strimming"),
+                    ("hedge_trimming", 31, "Hedge trimming & pruning"),
+                    ("arborist_works", 34, "Arboristic works, tree surgeon"),
+                    ("hourly_rate", 27, "Default hourly rate"),
+                    ("hourly_cost", 15, "Internal hourly cost"),
+                    ("garden_waste_bulkbag", 55, "Garden waste bulk bag"),
+                    ("minimum_charge", 150, "Minimum charge per job"),
+                ]:
+                    cur.execute("""INSERT INTO default_rates (tenant_id, rate_type, rate, description)
+                        VALUES (1, %s, %s, %s) ON CONFLICT (tenant_id, rate_type) DO NOTHING""", (rt, rate, desc))
+                conn3.commit()
+            db_pool.putconn(conn3)
+            print("Service rates seeded")
+        except Exception as e: print(f"Rate seed: {e}")
     except Exception as e: print(f"DB pool FAIL: {e}")
 
 def get_db_conn():
@@ -2591,293 +318,7 @@ def release_conn(conn):
         try: conn.close()
         except: pass
 
-def get_db():
-    """FastAPI Depends()-compatible generator that provides a pooled DB connection."""
-    conn = get_db_conn()
-    try:
-        yield conn
-    finally:
-        release_conn(conn)
-
-def _get_tenant_settings(conn, tenant_id: int) -> dict:
-    """Return tenant_settings row as dict. Falls back to empty dict on error."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT company_name, contact_name, phone, default_location,
-                          industry_description, currency, app_version, logo_url,
-                          whatsapp_footer, invoice_footer
-                   FROM crm.tenant_settings WHERE tenant_id = %s LIMIT 1""",
-                (tenant_id,)
-            )
-            row = cur.fetchone()
-            return dict(row) if row else {}
-    except Exception:
-        return {}
-
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ACTION HANDLERS — registered with action_executor
-# These are the canonical implementations. Both voice and manual UI must
-# call execute_action(action_code, ...) instead of inline SQL.
-#
-# Pattern: @register_handler("module.verb")
-#          def handle_xxx(args, conn, tenant_id, user_id, lang, **kw):
-#              ...
-#              return ActionResult(ok=True, reply="...", action_type="REFRESH")
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ── task.create ──────────────────────────────────────────────────────────────
-@register_handler("task.create")
-def handle_task_create(args, conn, tenant_id, user_id, lang, **kw):
-    title       = (args.get("title") or "").strip()
-    client_name = args.get("client_name") or args.get("client") or ""
-    due_date    = args.get("due_date")
-    assigned_to = args.get("assigned_to")
-    priority    = args.get("priority", "normal")
-    notes       = args.get("notes") or args.get("description") or ""
-    if not title:
-        return ActionResult(ok=False,
-            reply=_at("Task title is required.", "Název úkolu je povinný.", "Tytuł zadania jest wymagany.", lang),
-            error="missing_title")
-    try:
-        with conn.cursor() as cur:
-            client_id = None
-            if client_name:
-                cur.execute("""SELECT id FROM clients WHERE tenant_id=%s AND display_name ILIKE %s
-                               AND deleted_at IS NULL LIMIT 1""", (tenant_id, f"%{client_name}%"))
-                r = cur.fetchone()
-                if r: client_id = r["id"]
-            cur.execute("""INSERT INTO tasks (tenant_id,title,client_id,due_date,priority,notes,
-                               status,created_by,assigned_to,is_completed)
-                           VALUES (%s,%s,%s,%s,%s,%s,'nova',%s,%s,FALSE) RETURNING id""",
-                (tenant_id, title, client_id, due_date, priority, notes, user_id, assigned_to))
-            row = cur.fetchone()
-            task_id = row["id"]
-            log_activity(conn, "task", task_id, "create", f"Vytvoren ukol: {title}",
-                         tenant_id=tenant_id, user_id=user_id)
-        conn.commit()
-        reply = _at(f"Task '{title}' created.", f"Úkol '{title}' vytvořen.", f"Zadanie '{title}' utworzone.", lang)
-        return ActionResult(ok=True, reply=reply, action_type="REFRESH", action_data={"task_id": task_id})
-    except Exception as e:
-        conn.rollback()
-        return ActionResult(ok=False, reply=str(e), error=str(e))
-
-
-# ── task.complete ─────────────────────────────────────────────────────────────
-@register_handler("task.complete")
-def handle_task_complete(args, conn, tenant_id, user_id, lang, **kw):
-    title_q = (args.get("title") or "").strip()
-    result  = args.get("result") or _at("Completed", "Dokončeno", "Ukończono", lang)
-    if not title_q:
-        return ActionResult(ok=False,
-            reply=_at("Specify which task.", "Uveď který úkol.", "Podaj które zadanie.", lang),
-            error="missing_title")
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""SELECT id,title FROM tasks
-                            WHERE tenant_id=%s AND title ILIKE %s
-                              AND is_completed=FALSE
-                            ORDER BY created_at DESC LIMIT 1""",
-                (tenant_id, f"%{title_q}%"))
-            row = cur.fetchone()
-            if not row:
-                return ActionResult(ok=False,
-                    reply=_at(f"Task '{title_q}' not found.", f"Úkol '{title_q}' nenalezen.", f"Zadanie '{title_q}' nie znalezione.", lang),
-                    error="not_found")
-            cur.execute("""UPDATE tasks SET status='hotovo',is_completed=TRUE,
-                                result=%s,updated_at=now()
-                            WHERE id=%s""", (result, row["id"]))
-            log_activity(conn, "task", row["id"], "complete",
-                         f"Ukol '{row['title']}' dokoncen: {result}",
-                         tenant_id=tenant_id, user_id=user_id)
-        conn.commit()
-        reply = _at(f"Task '{row['title']}' completed.",
-                    f"Úkol '{row['title']}' dokončen.",
-                    f"Zadanie '{row['title']}' ukończone.", lang)
-        return ActionResult(ok=True, reply=reply, action_type="REFRESH",
-                            action_data={"task_id": row["id"]})
-    except Exception as e:
-        conn.rollback()
-        return ActionResult(ok=False, reply=str(e), error=str(e))
-
-
-# ── task.list ─────────────────────────────────────────────────────────────────
-@register_handler("task.list")
-def handle_task_list(args, conn, tenant_id, user_id, lang, **kw):
-    status      = args.get("status")
-    client_name = args.get("client_name") or args.get("client")
-    only_active = args.get("only_active", False)
-    try:
-        with conn.cursor() as cur:
-            q = """SELECT t.id, t.title, t.status, t.priority, t.due_date,
-                          c.display_name as client_name
-                     FROM tasks t
-                     LEFT JOIN clients c ON c.id = t.client_id AND c.deleted_at IS NULL
-                    WHERE t.tenant_id=%s AND t.is_completed=FALSE"""
-            params = [tenant_id]
-            if status:
-                q += " AND t.status=%s"; params.append(status)
-            if client_name:
-                q += " AND c.display_name ILIKE %s"; params.append(f"%{client_name}%")
-            if only_active:
-                q += " AND t.status NOT IN ('hotovo','zruseno')"
-            q += " ORDER BY t.due_date NULLS LAST, t.created_at DESC LIMIT 20"
-            cur.execute(q, params)
-            tasks = [dict(r) for r in cur.fetchall()]
-        for t in tasks:
-            if t.get("due_date"):
-                t["due_date"] = str(t["due_date"])
-        if not tasks:
-            reply = _at("No tasks found.", "Žádné úkoly nenalezeny.", "Nie znaleziono zadań.", lang)
-        else:
-            lines = [_at("Your tasks:", "Tvoje úkoly:", "Twoje zadania:", lang)]
-            for t in tasks[:5]:
-                dd = f" ({t['due_date']})" if t.get("due_date") else ""
-                cl = f" — {t['client_name']}" if t.get("client_name") else ""
-                lines.append(f"- {t['title']}{cl}{dd}")
-            if len(tasks) > 5:
-                lines.append(f"... +{len(tasks)-5} more")
-            reply = "\n".join(lines)
-        return ActionResult(ok=True, reply=reply, action_type="SHOW_TASKS",
-                            action_data={"tasks": tasks, "count": len(tasks)})
-    except Exception as e:
-        return ActionResult(ok=False, reply=str(e), error=str(e))
-
-
-# ── contact.create ────────────────────────────────────────────────────────────
-@register_handler("contact.create")
-def handle_contact_create(args, conn, tenant_id, user_id, lang, **kw):
-    name  = (args.get("name") or "").strip()
-    email = args.get("email") or ""
-    phone = args.get("phone") or ""
-    if not name:
-        return ActionResult(ok=False,
-            reply=_at("Contact name is required.", "Jméno kontaktu je povinné.", "Imię kontaktu jest wymagane.", lang),
-            error="missing_name")
-    try:
-        with conn.cursor() as cur:
-            owner_row = get_active_user_row(conn, tenant_id, user_id) or get_default_hierarchy_user(conn, tenant_id)
-            if not owner_row:
-                return ActionResult(ok=False, reply=_at("No active owner available.", "Není dostupný vlastník.", "Brak dostępnego właściciela.", lang), error="no_owner")
-            code = f"CL-{uuid.uuid4().hex[:6].upper()}"
-            display = clean_contact_display_name(name)
-            cur.execute("""INSERT INTO clients
-                               (client_code,client_type,display_name,email_primary,phone_primary,
-                                status,tenant_id,owner_user_id,hierarchy_status)
-                           VALUES (%s,'domestic',%s,%s,%s,'active',%s,%s,'pending')
-                           RETURNING id,display_name""",
-                (code, display, email or None, phone or None, tenant_id, int(owner_row["id"])))
-            row = cur.fetchone()
-            log_activity(conn, "client", row["id"], "create", f"Klient {display} vytvoren",
-                         tenant_id=tenant_id, user_id=user_id)
-        conn.commit()
-        reply = _at(f"Contact '{display}' created.", f"Kontakt '{display}' vytvořen.", f"Kontakt '{display}' utworzony.", lang)
-        return ActionResult(ok=True, reply=reply, action_type="REFRESH",
-                            action_data={"client_id": row["id"], "display_name": row["display_name"]})
-    except Exception as e:
-        conn.rollback()
-        return ActionResult(ok=False, reply=str(e), error=str(e))
-
-
-# ── contact.search ────────────────────────────────────────────────────────────
-@register_handler("contact.search")
-def handle_contact_search(args, conn, tenant_id, user_id, lang, **kw):
-    query = (args.get("query") or args.get("name") or "").strip()
-    if not query:
-        return ActionResult(ok=False,
-            reply=_at("Search term required.", "Zadej hledaný výraz.", "Podaj szukaną frazę.", lang),
-            error="missing_query")
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""SELECT id,display_name,email_primary,phone_primary,status
-                             FROM clients
-                            WHERE tenant_id=%s AND deleted_at IS NULL
-                              AND (display_name ILIKE %s OR email_primary ILIKE %s OR phone_primary ILIKE %s)
-                            ORDER BY display_name LIMIT 10""",
-                (tenant_id, f"%{query}%", f"%{query}%", f"%{query}%"))
-            results = [dict(r) for r in cur.fetchall()]
-        if not results:
-            reply = _at(f"No contacts found for '{query}'.", f"Kontakt '{query}' nenalezen.", f"Nie znaleziono kontaktu '{query}'.", lang)
-        else:
-            lines = [_at(f"Found {len(results)} contact(s):", f"Nalezeno {len(results)} kontakt(ů):", f"Znaleziono {len(results)} kontakt(ów):", lang)]
-            for c in results[:5]:
-                ph = f" {c['phone_primary']}" if c.get("phone_primary") else ""
-                lines.append(f"- {c['display_name']}{ph}")
-            reply = "\n".join(lines)
-        return ActionResult(ok=True, reply=reply, action_type="SHOW_CONTACTS",
-                            action_data={"contacts": results, "count": len(results)})
-    except Exception as e:
-        return ActionResult(ok=False, reply=str(e), error=str(e))
-
-
-# ── note.add ──────────────────────────────────────────────────────────────────
-@register_handler("note.add")
-def handle_note_add(args, conn, tenant_id, user_id, lang, **kw):
-    entity_type = args.get("entity_type", "client")
-    entity_name = args.get("entity_name") or args.get("client_name") or ""
-    content_txt = (args.get("content") or args.get("note") or "").strip()
-    if not content_txt:
-        return ActionResult(ok=False,
-            reply=_at("Note content is required.", "Obsah poznámky je povinný.", "Treść notatki jest wymagana.", lang),
-            error="missing_content")
-    try:
-        with conn.cursor() as cur:
-            entity_id = None
-            if entity_name:
-                table = "clients" if entity_type == "client" else "jobs"
-                cur.execute(f"""SELECT id FROM {table} WHERE tenant_id=%s AND display_name ILIKE %s
-                               AND deleted_at IS NULL LIMIT 1""",
-                    (tenant_id, f"%{entity_name}%"))
-                r = cur.fetchone()
-                if r: entity_id = r["id"]
-            cur.execute("""INSERT INTO notes (tenant_id,entity_type,entity_id,content,created_by)
-                           VALUES (%s,%s,%s,%s,%s) RETURNING id""",
-                (tenant_id, entity_type, entity_id, content_txt, user_id))
-            note_id = cur.fetchone()["id"]
-            log_activity(conn, entity_type, entity_id or 0, "add_note",
-                         content_txt[:100], tenant_id=tenant_id, user_id=user_id)
-        conn.commit()
-        reply = _at("Note saved.", "Poznámka uložena.", "Notatka zapisana.", lang)
-        return ActionResult(ok=True, reply=reply, action_type="REFRESH",
-                            action_data={"note_id": note_id})
-    except Exception as e:
-        conn.rollback()
-        return ActionResult(ok=False, reply=str(e), error=str(e))
-
-
-# ── lead.create ───────────────────────────────────────────────────────────────
-@register_handler("lead.create")
-def handle_lead_create(args, conn, tenant_id, user_id, lang, **kw):
-    name    = (args.get("name") or args.get("contact_name") or "").strip()
-    source  = args.get("source", "voice")
-    notes   = args.get("notes") or ""
-    phone   = args.get("phone") or ""
-    email   = args.get("email") or ""
-    if not name:
-        return ActionResult(ok=False,
-            reply=_at("Lead name required.", "Jméno leadu je povinné.", "Imię leada jest wymagane.", lang),
-            error="missing_name")
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""INSERT INTO leads (tenant_id,display_name,phone_primary,email_primary,
-                               source,status,notes,created_by)
-                           VALUES (%s,%s,%s,%s,%s,'new',%s,%s) RETURNING id""",
-                (tenant_id, name, phone or None, email or None, source, notes or None, user_id))
-            lead_id = cur.fetchone()["id"]
-            log_activity(conn, "lead", lead_id, "create", f"Lead {name} vytvoren",
-                         tenant_id=tenant_id, user_id=user_id)
-        conn.commit()
-        reply = _at(f"Lead '{name}' created.", f"Lead '{name}' vytvořen.", f"Lead '{name}' utworzony.", lang)
-        return ActionResult(ok=True, reply=reply, action_type="REFRESH",
-                            action_data={"lead_id": lead_id})
-    except Exception as e:
-        conn.rollback()
-        return ActionResult(ok=False, reply=str(e), error=str(e))
-
-
+from contextlib import contextmanager
 @contextmanager
 def db_conn():
     """Context manager that auto-releases connection back to pool."""
@@ -2887,244 +328,16 @@ def db_conn():
     finally:
         release_conn(c)
 
-def complete_permission_map(values: Optional[Dict[str, Any]] = None) -> Dict[str, bool]:
-    src = values or {}
-    return {code: bool(src.get(code, False)) for code in ALL_PERMISSION_CODES}
-
-def default_permissions_for_role(role_name: Optional[str]) -> Dict[str, bool]:
-    key = (role_name or "viewer").lower()
-    return complete_permission_map(ROLE_PERMISSION_DEFAULTS.get(key, ROLE_PERMISSION_DEFAULTS["viewer"]))
-
-def normalize_permission_payload(raw: Any) -> Dict[str, bool]:
-    if not isinstance(raw, dict):
-        return {}
-    normalized = {}
-    for code, value in raw.items():
-        if code in ALL_PERMISSION_CODES:
-            normalized[code] = bool(value)
-    return normalized
-
-def ensure_permission_tables(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS permissions (
-                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                permission_code TEXT NOT NULL UNIQUE,
-                module_name TEXT NOT NULL,
-                name TEXT NOT NULL,
-                description TEXT,
-                created_at TIMESTAMPTZ DEFAULT now(),
-                updated_at TIMESTAMPTZ DEFAULT now()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS role_permissions (
-                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                role_id BIGINT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-                permission_id BIGINT NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
-                allowed BOOLEAN NOT NULL DEFAULT true,
-                created_at TIMESTAMPTZ DEFAULT now(),
-                updated_at TIMESTAMPTZ DEFAULT now(),
-                CONSTRAINT uq_role_permissions UNIQUE (role_id, permission_id)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS user_permission_overrides (
-                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                permission_id BIGINT NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
-                allowed BOOLEAN NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT now(),
-                updated_at TIMESTAMPTZ DEFAULT now(),
-                CONSTRAINT uq_user_permission_overrides UNIQUE (user_id, permission_id)
-            )
-        """)
-    conn.commit()
-
-def seed_permissions(conn):
-    ensure_permission_tables(conn)
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        for permission in PERMISSION_DEFINITIONS:
-            cur.execute("""
-                INSERT INTO permissions (permission_code, module_name, name, description, updated_at)
-                VALUES (%s, %s, %s, %s, now())
-                ON CONFLICT (permission_code) DO UPDATE SET
-                    module_name = EXCLUDED.module_name,
-                    name = EXCLUDED.name,
-                    description = EXCLUDED.description,
-                    updated_at = now()
-            """, (
-                permission["permission_code"],
-                permission["module_name"],
-                permission["name"],
-                permission["description"],
-            ))
-        cur.execute("SELECT id, permission_code FROM permissions")
-        permission_ids = {row["permission_code"]: row["id"] for row in cur.fetchall()}
-        for role_name, defaults in ROLE_PERMISSION_DEFAULTS.items():
-            cur.execute("SELECT id FROM roles WHERE role_name=%s", (role_name,))
-            role_row = cur.fetchone()
-            if not role_row:
-                continue
-            for permission_code in ALL_PERMISSION_CODES:
-                permission_id = permission_ids.get(permission_code)
-                if permission_id is None:
-                    continue
-                cur.execute("""
-                    INSERT INTO role_permissions (role_id, permission_id, allowed, updated_at)
-                    VALUES (%s, %s, %s, now())
-                    ON CONFLICT (role_id, permission_id) DO UPDATE SET
-                        allowed = EXCLUDED.allowed,
-                        updated_at = now()
-                """, (role_row["id"], permission_id, bool(defaults.get(permission_code, False))))
-    conn.commit()
-
-def load_permission_catalog(conn) -> List[Dict[str, Any]]:
-    ensure_permission_tables(conn)
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT permission_code, module_name, name, description
-            FROM permissions
-            ORDER BY module_name, id
-        """)
-        return [dict(row) for row in cur.fetchall()]
-
-def load_role_permission_maps(conn) -> Dict[str, Dict[str, bool]]:
-    ensure_permission_tables(conn)
-    role_maps: Dict[str, Dict[str, bool]] = {}
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT r.role_name, p.permission_code, rp.allowed
-            FROM role_permissions rp
-            JOIN roles r ON r.id = rp.role_id
-            JOIN permissions p ON p.id = rp.permission_id
-        """)
-        for row in cur.fetchall():
-            role_name = (row["role_name"] or "viewer").lower()
-            role_maps.setdefault(role_name, {})[row["permission_code"]] = bool(row["allowed"])
-    for role_name in ROLE_PERMISSION_DEFAULTS.keys():
-        merged = default_permissions_for_role(role_name)
-        merged.update(role_maps.get(role_name, {}))
-        role_maps[role_name] = merged
-    return role_maps
-
-def load_user_permission_overrides(conn, tenant_id: int, user_ids: Optional[List[int]] = None) -> Dict[int, Dict[str, bool]]:
-    ensure_permission_tables(conn)
-    params: List[Any] = [tenant_id]
-    user_filter = ""
-    if user_ids:
-        user_filter = " AND u.id = ANY(%s)"
-        params.append(user_ids)
-    overrides: Dict[int, Dict[str, bool]] = {}
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(f"""
-            SELECT u.id AS user_id, p.permission_code, upo.allowed
-            FROM user_permission_overrides upo
-            JOIN users u ON u.id = upo.user_id
-            JOIN permissions p ON p.id = upo.permission_id
-            WHERE u.tenant_id = %s AND u.deleted_at IS NULL{user_filter}
-        """, params)
-        for row in cur.fetchall():
-            overrides.setdefault(int(row["user_id"]), {})[row["permission_code"]] = bool(row["allowed"])
-    return overrides
-
-def get_effective_permissions(conn, tenant_id: int, user_id: int, role_name: Optional[str] = None) -> Dict[str, bool]:
-    resolved_role = role_name
-    if not resolved_role:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT r.role_name
-                FROM users u
-                LEFT JOIN roles r ON r.id = u.role_id
-                WHERE u.id=%s AND u.tenant_id=%s AND u.deleted_at IS NULL
-            """, (user_id, tenant_id))
-            row = cur.fetchone()
-            resolved_role = row["role_name"] if row else "viewer"
-    role_permissions = load_role_permission_maps(conn).get((resolved_role or "viewer").lower(), default_permissions_for_role(resolved_role))
-    overrides = load_user_permission_overrides(conn, tenant_id, [user_id]).get(user_id, {})
-    effective = dict(role_permissions)
-    effective.update(overrides)
-    return complete_permission_map(effective)
-
-def save_user_permission_overrides(conn, tenant_id: int, user_id: int, role_name: Optional[str], permissions: Dict[str, bool]):
-    normalized = normalize_permission_payload(permissions)
-    if not normalized:
-        return
-    role_defaults = load_role_permission_maps(conn).get((role_name or "viewer").lower(), default_permissions_for_role(role_name))
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT p.id, p.permission_code
-            FROM permissions p
-        """)
-        permission_rows = {row["permission_code"]: row["id"] for row in cur.fetchall()}
-        for code in ALL_PERMISSION_CODES:
-            if code not in normalized:
-                continue
-            permission_id = permission_rows.get(code)
-            if permission_id is None:
-                continue
-            requested = bool(normalized[code])
-            default_value = bool(role_defaults.get(code, False))
-            if requested == default_value:
-                cur.execute("DELETE FROM user_permission_overrides WHERE user_id=%s AND permission_id=%s", (user_id, permission_id))
-            else:
-                cur.execute("""
-                    INSERT INTO user_permission_overrides (user_id, permission_id, allowed, updated_at)
-                    VALUES (%s, %s, %s, now())
-                    ON CONFLICT (user_id, permission_id) DO UPDATE SET
-                        allowed = EXCLUDED.allowed,
-                        updated_at = now()
-                """, (user_id, permission_id, requested))
-
-def clear_user_permission_overrides(conn, user_id: int):
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM user_permission_overrides WHERE user_id=%s", (user_id,))
-
-def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1, user_id=None, details=None, source_channel=None, user_name=None):
-    resolved_user_name = user_name
-    if not resolved_user_name:
-        try:
-            resolved_user_name = get_user_display_name(conn, tenant_id, user_id) if user_id else None
-        except Exception:
-            resolved_user_name = None
-    if not resolved_user_name:
-        resolved_user_name = str(user_id) if user_id else "system"
+def log_activity(conn, entity_type, entity_id, action, description, tenant_id=1, user_id=None, details=None):
     with conn.cursor() as cur:
         cur.execute("""INSERT INTO activity_timeline
-            (entity_type, entity_id, action, description, user_name, tenant_id, user_id_ref, source_channel, details_json, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())""",
+            (entity_type, entity_id, action, description, user_name, tenant_id, user_id_ref, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())""",
             (entity_type, str(entity_id), action,
              description[:500] if description else "",
-             resolved_user_name,
+             str(user_id) if user_id else "system",
              tenant_id,
-             str(user_id) if user_id else None,
-             source_channel,
-             json.dumps(details or {}, ensure_ascii=False)))
-
-def audit_request_event(request: Request, action: str, description: str, entity_type: str = "app_usage", entity_id: Any = "", details: Optional[dict] = None, source_channel: Optional[str] = None):
-    try:
-        user = get_request_user_payload(request)
-        conn = get_db_conn()
-        try:
-            log_activity(
-                conn,
-                entity_type,
-                entity_id or action,
-                action,
-                description,
-                tenant_id=user["tenant_id"],
-                user_id=user["user_id"],
-                details=details,
-                source_channel=source_channel,
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            release_conn(conn)
-    except Exception as e:
-        print(f"audit_request_event failed: {e}")
+             str(user_id) if user_id else None))
 
 # ========== TENANT CONFIG LOADER ==========
 _tenant_config_cache = {}
@@ -3136,12 +349,6 @@ def get_tenant_config(conn, tenant_id):
     config = {"tenant_id": tenant_id, "found": False}
     try:
         with conn.cursor() as cur:
-            # Basic tenant info from tenants table
-            cur.execute("SELECT name, slug FROM tenants WHERE id=%s", (tenant_id,))
-            t_row = cur.fetchone()
-            if t_row:
-                config["tenant_name"] = t_row["name"]
-                config["tenant_slug"] = t_row["slug"]
             cur.execute("SELECT * FROM tenant_operating_profile WHERE tenant_id=%s", (tenant_id,))
             profile = cur.fetchone()
             if profile:
@@ -3164,1282 +371,29 @@ def get_tenant_config(conn, tenant_id):
             cur.execute("SELECT * FROM subscription_limits WHERE tenant_id=%s", (tenant_id,))
             limits = cur.fetchone()
             config["limits"] = dict(limits) if limits else None
-            # Try crm schema first (correct schema), fall back to public
-            try:
-                cur.execute("SELECT * FROM crm.tenant_settings WHERE tenant_id=%s", (tenant_id,))
-                settings = cur.fetchone()
-                config["settings"] = dict(settings) if settings else None
-            except Exception:
-                config["settings"] = None
+            cur.execute("SELECT * FROM tenant_settings WHERE tenant_id=%s", (tenant_id,))
+            settings = cur.fetchone()
+            config["settings"] = dict(settings) if settings else None
     except Exception: pass
     _tenant_config_cache[tenant_id] = config
     return config
 
 def resolve_response_language(config, request_lang=None):
-    """Determine which internal language the AI should work in (assistant side)."""
+    """Determine which language the AI should respond in."""
     if request_lang:
-        return normalize_language_code(request_lang, default=DEFAULT_ASSISTANT_LANG)
+        code = request_lang.split("-")[0].lower()
+        if code in ("cs","en","pl","de","fr","es","sk","ro"): return code
     if config.get("found"):
-        return normalize_language_code(config.get("default_internal_lang"), default=DEFAULT_ASSISTANT_LANG)
-    return DEFAULT_ASSISTANT_LANG
-
-def resolve_customer_language(config, request_lang=None):
-    """Determine default outgoing customer language (fallback)."""
-    if request_lang:
-        return normalize_language_code(request_lang, default=DEFAULT_CUSTOMER_LANG)
-    if config.get("found"):
-        return normalize_language_code(config.get("default_customer_lang"), default=DEFAULT_CUSTOMER_LANG)
-    return DEFAULT_CUSTOMER_LANG
+        return config.get("default_internal_lang", "en")
+    return "en"
 
 def resolve_voice_language(config, request_lang=None):
     """Determine voice session language from config."""
-    if request_lang:
-        return normalize_language_code(request_lang, default=DEFAULT_ASSISTANT_LANG)
+    if request_lang and request_lang != "en":
+        return request_lang.split("-")[0].lower()
     if config.get("found"):
-        return normalize_language_code(config.get("default_internal_lang"), default=DEFAULT_ASSISTANT_LANG)
-    return DEFAULT_ASSISTANT_LANG
-
-def parse_planning_datetime(value: Any) -> Optional[datetime]:
-    if value is None:
-        return None
-    raw = str(value).strip()
-    if not raw:
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
-    except Exception:
-        pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(raw, fmt)
-        except Exception:
-            continue
-    return None
-
-def planning_window_from_values(start_value: Any = None, end_value: Any = None, date_value: Any = None) -> tuple[Optional[datetime], Optional[datetime]]:
-    start_dt = parse_planning_datetime(start_value)
-    end_dt = parse_planning_datetime(end_value)
-    if not start_dt and date_value:
-        date_dt = parse_planning_datetime(date_value)
-        if date_dt:
-            start_dt = date_dt.replace(hour=9, minute=0, second=0, microsecond=0)
-            end_dt = start_dt + timedelta(hours=1)
-    elif start_dt and not end_dt:
-        end_dt = start_dt + timedelta(hours=1)
-    return start_dt, end_dt
-
-def format_planning_datetime(value: Optional[datetime]) -> Optional[str]:
-    return value.strftime("%Y-%m-%dT%H:%M:%S") if value else None
-
-def clean_user_display_name(value: Optional[str]) -> str:
-    cleaned = re.sub(r"\*+", " ", value or "")
-    return re.sub(r"\s+", " ", cleaned).strip()
-
-def clean_contact_display_name(value: Optional[str]) -> str:
-    cleaned = re.sub(r"\*+", " ", str(value or ""))
-    return re.sub(r"\s+", " ", cleaned).strip()
-
-def clean_user_row_display_name(row: dict) -> dict:
-    row["display_name"] = clean_user_display_name(row.get("display_name")) or row.get("email") or row.get("display_name")
-    return row
-
-def get_user_display_name(conn, tenant_id: int, user_id: Optional[int]) -> Optional[str]:
-    if not user_id:
-        return None
-    with conn.cursor() as cur:
-        cur.execute("""SELECT display_name
-            FROM users
-            WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""", (user_id, tenant_id))
-        row = cur.fetchone()
-    return clean_user_display_name(row["display_name"]) if row else None
-
-def resolve_assigned_user(conn, tenant_id: int, assigned_user_id: Any = None, assigned_to: Any = None) -> tuple[Optional[int], Optional[str]]:
-    if assigned_user_id not in (None, "", 0, "0"):
-        with conn.cursor() as cur:
-            cur.execute("""SELECT id, display_name
-                FROM users
-                WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""", (assigned_user_id, tenant_id))
-            row = cur.fetchone()
-        if row:
-            return int(row["id"]), clean_user_display_name(row["display_name"])
-    assignee_text = (assigned_to or "").strip()
-    if assignee_text:
-        with conn.cursor() as cur:
-            cur.execute("""SELECT id, display_name
-                FROM users
-                WHERE tenant_id=%s AND deleted_at IS NULL AND (
-                    display_name ILIKE %s OR email ILIKE %s OR COALESCE(phone,'') ILIKE %s
-                )
-                ORDER BY status='active' DESC, id
-                LIMIT 1""", (tenant_id, f"%{assignee_text}%", f"%{assignee_text}%", f"%{assignee_text}%"))
-            row = cur.fetchone()
-        if row:
-            return int(row["id"]), clean_user_display_name(row["display_name"])
-        return None, assignee_text
-    return None, None
-
-def get_active_user_row(conn, tenant_id: int, user_id: Optional[int]) -> Optional[dict]:
-    if not user_id:
-        return None
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT u.id, u.display_name, u.email, COALESCE(r.role_name, 'viewer') AS role_name
-            FROM users u
-            LEFT JOIN roles r ON r.id = u.role_id
-            WHERE u.id=%s
-              AND u.tenant_id=%s
-              AND u.deleted_at IS NULL
-              AND COALESCE(u.status, 'active')='active'
-        """, (user_id, tenant_id))
-        row = cur.fetchone()
-    return clean_user_row_display_name(dict(row)) if row else None
-
-def validate_active_user(conn, tenant_id: int, user_id: Optional[int], label: str = "assigned user") -> dict:
-    row = get_active_user_row(conn, tenant_id, user_id)
-    if not row:
-        raise HTTPException(422, f"{label.capitalize()} must be an active user")
-    return row
-
-def validate_task_planning(task_payload: dict) -> tuple[Optional[datetime], Optional[datetime], Optional[str]]:
-    planning_start, planning_end = planning_window_from_values(
-        task_payload.get("planned_start_at"),
-        task_payload.get("planned_end_at"),
-        task_payload.get("planned_date") or task_payload.get("deadline"),
-    )
-    deadline = (task_payload.get("deadline") or "").strip() or None
-    if not planning_start and not deadline:
-        raise HTTPException(422, "Task must have planned_start_at or deadline")
-    return planning_start, planning_end, deadline
-
-def is_task_open_for_workflow(task_row: Optional[dict]) -> bool:
-    if not task_row:
-        return False
-    if bool(task_row.get("is_completed")):
-        return False
-    return (task_row.get("status") or "novy") not in ("hotovo", "zruseno")
-
-def next_business_day_at_nine(base_dt: Optional[datetime] = None) -> datetime:
-    candidate = (base_dt or datetime.utcnow()).replace(hour=9, minute=0, second=0, microsecond=0)
-    if candidate <= (base_dt or datetime.utcnow()):
-        candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate
-
-def merge_planning_note(existing_note: Optional[str], extra_note: str) -> str:
-    existing = (existing_note or "").strip()
-    extra = (extra_note or "").strip()
-    if not existing:
-        return extra
-    if extra in existing:
-        return existing
-    return f"{existing}\n\n{extra}"
-
-def get_default_hierarchy_user(conn, tenant_id: int) -> Optional[dict]:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT u.id, u.display_name, u.email, COALESCE(r.role_name, 'viewer') AS role_name
-            FROM users u
-            LEFT JOIN roles r ON r.id = u.role_id
-            WHERE u.tenant_id=%s
-              AND u.deleted_at IS NULL
-              AND COALESCE(u.status, 'active')='active'
-            ORDER BY CASE
-                WHEN COALESCE(r.role_name, '')='manager' THEN 0
-                WHEN COALESCE(r.role_name, '')='admin' THEN 1
-                ELSE 2
-            END, u.id
-            LIMIT 1
-        """, (tenant_id,))
-        row = cur.fetchone()
-    return clean_user_row_display_name(dict(row)) if row else None
-
-def get_valid_client_next_action_task(conn, tenant_id: int, client_id: int, task_id: Optional[str] = None) -> Optional[dict]:
-    params: List[Any] = [tenant_id, client_id]
-    sql = """
-        SELECT t.id, t.title, t.client_id, t.job_id, t.assigned_user_id, t.assigned_to,
-               t.status, COALESCE(t.is_completed, FALSE) AS is_completed,
-               t.planned_start_at::text AS planned_start_at, t.deadline,
-               u.display_name AS assignee_display_name
-        FROM tasks t
-        JOIN users u
-          ON u.id = t.assigned_user_id
-         AND u.tenant_id = t.tenant_id
-         AND u.deleted_at IS NULL
-         AND COALESCE(u.status, 'active')='active'
-        WHERE t.tenant_id=%s
-          AND t.client_id=%s
-          AND t.job_id IS NULL
-          AND COALESCE(t.is_completed, FALSE)=FALSE
-          AND COALESCE(t.status, 'novy') NOT IN ('hotovo', 'zruseno')
-          AND (t.planned_start_at IS NOT NULL OR NULLIF(COALESCE(t.deadline, ''), '') IS NOT NULL)
-    """
-    if task_id:
-        sql += " AND t.id=%s"
-        params.append(task_id)
-    sql += " ORDER BY COALESCE(t.planned_start_at, t.created_at) ASC LIMIT 1"
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        row = cur.fetchone()
-    return dict(row) if row else None
-
-def get_valid_job_next_action_task(conn, tenant_id: int, job_id: int, task_id: Optional[str] = None) -> Optional[dict]:
-    params: List[Any] = [tenant_id, job_id]
-    sql = """
-        SELECT t.id, t.title, t.client_id, t.job_id, t.assigned_user_id, t.assigned_to,
-               t.status, COALESCE(t.is_completed, FALSE) AS is_completed,
-               t.planned_start_at::text AS planned_start_at, t.deadline,
-               u.display_name AS assignee_display_name
-        FROM tasks t
-        JOIN users u
-          ON u.id = t.assigned_user_id
-         AND u.tenant_id = t.tenant_id
-         AND u.deleted_at IS NULL
-         AND COALESCE(u.status, 'active')='active'
-        WHERE t.tenant_id=%s
-          AND t.job_id=%s
-          AND COALESCE(t.is_completed, FALSE)=FALSE
-          AND COALESCE(t.status, 'novy') NOT IN ('hotovo', 'zruseno')
-          AND (t.planned_start_at IS NOT NULL OR NULLIF(COALESCE(t.deadline, ''), '') IS NOT NULL)
-    """
-    if task_id:
-        sql += " AND t.id=%s"
-        params.append(task_id)
-    sql += " ORDER BY COALESCE(t.planned_start_at, t.created_at) ASC LIMIT 1"
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        row = cur.fetchone()
-    return dict(row) if row else None
-
-def validate_client_hierarchy(conn, tenant_id: int, client_id: int) -> dict:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, display_name, owner_user_id, next_action_task_id, hierarchy_status
-            FROM clients
-            WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
-        """, (tenant_id, client_id))
-        client_row = cur.fetchone()
-    if not client_row:
-        return {"valid": False, "issues": ["client_not_found"], "client": None, "next_action_task": None}
-    client = dict(client_row)
-    issues: List[str] = []
-    owner_row = get_active_user_row(conn, tenant_id, client.get("owner_user_id"))
-    if not owner_row:
-        issues.append("missing_or_inactive_owner")
-    next_action = None
-    if client.get("next_action_task_id"):
-        next_action = get_valid_client_next_action_task(conn, tenant_id, client_id, str(client["next_action_task_id"]))
-    if not next_action:
-        issues.append("missing_or_invalid_next_action")
-    return {
-        "valid": len(issues) == 0,
-        "issues": issues,
-        "client": client,
-        "owner": owner_row,
-        "next_action_task": next_action,
-    }
-
-def validate_job_hierarchy(conn, tenant_id: int, job_id: int) -> dict:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, job_title, client_id, assigned_user_id, assigned_to, next_action_task_id, hierarchy_status
-            FROM jobs
-            WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
-        """, (tenant_id, job_id))
-        job_row = cur.fetchone()
-    if not job_row:
-        return {"valid": False, "issues": ["job_not_found"], "job": None, "next_action_task": None}
-    job = dict(job_row)
-    issues: List[str] = []
-    owner_row = get_active_user_row(conn, tenant_id, job.get("assigned_user_id"))
-    if not owner_row:
-        issues.append("missing_or_inactive_owner")
-    next_action = None
-    if job.get("next_action_task_id"):
-        next_action = get_valid_job_next_action_task(conn, tenant_id, job_id, str(job["next_action_task_id"]))
-    if not next_action:
-        issues.append("missing_or_invalid_next_action")
-    return {
-        "valid": len(issues) == 0,
-        "issues": issues,
-        "job": job,
-        "owner": owner_row,
-        "next_action_task": next_action,
-    }
-
-def get_task_row(conn, tenant_id: int, task_id: str) -> Optional[dict]:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT *
-            FROM tasks
-            WHERE tenant_id=%s AND id=%s
-        """, (tenant_id, str(task_id)))
-        row = cur.fetchone()
-    return dict(row) if row else None
-
-def get_task_next_action_links(conn, tenant_id: int, task_id: str) -> List[dict]:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT 'client' AS entity_type,
-                   c.id AS entity_id,
-                   c.display_name AS entity_name,
-                   c.next_action_task_id,
-                   c.owner_user_id,
-                   c.id AS client_id,
-                   NULL::BIGINT AS job_id
-            FROM clients c
-            WHERE c.tenant_id=%s
-              AND c.deleted_at IS NULL
-              AND c.next_action_task_id=%s
-            UNION ALL
-            SELECT 'job' AS entity_type,
-                   j.id AS entity_id,
-                   j.job_title AS entity_name,
-                   j.next_action_task_id,
-                   j.assigned_user_id AS owner_user_id,
-                   j.client_id,
-                   j.id AS job_id
-            FROM jobs j
-            WHERE j.tenant_id=%s
-              AND j.deleted_at IS NULL
-              AND j.next_action_task_id=%s
-        """, (tenant_id, str(task_id), tenant_id, str(task_id)))
-        rows = cur.fetchall()
-    return [dict(row) for row in rows]
-
-def set_client_next_action(conn, tenant_id: int, client_id: int, task_id: str) -> None:
-    candidate = get_valid_client_next_action_task(conn, tenant_id, client_id, str(task_id))
-    if not candidate:
-        raise HTTPException(422, "Client next action must be an open planned task assigned to an active user")
-    with conn.cursor() as cur:
-        cur.execute("""
-            UPDATE clients
-            SET next_action_task_id=%s,
-                hierarchy_status='valid',
-                updated_at=now()
-            WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
-        """, (str(task_id), tenant_id, client_id))
-
-def set_job_next_action(conn, tenant_id: int, job_id: int, task_id: str) -> None:
-    candidate = get_valid_job_next_action_task(conn, tenant_id, job_id, str(task_id))
-    if not candidate:
-        raise HTTPException(422, "Job next action must be an open planned task assigned to an active user")
-    with conn.cursor() as cur:
-        cur.execute("""
-            UPDATE jobs
-            SET next_action_task_id=%s,
-                hierarchy_status='valid',
-                updated_at=now()
-            WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
-        """, (str(task_id), tenant_id, job_id))
-
-def create_workflow_task(
-    conn,
-    tenant_id: int,
-    task_payload: dict,
-    *,
-    actor_name: str,
-    default_client_id: Optional[int] = None,
-    default_client_name: Optional[str] = None,
-    default_job_id: Optional[int] = None,
-    default_property_id: Optional[int] = None,
-    default_property_address: Optional[str] = None,
-    source: str = "workflow",
-) -> dict:
-    if not isinstance(task_payload, dict):
-        raise HTTPException(422, "Task payload is required")
-    title = (task_payload.get("title") or "").strip()
-    if not title:
-        raise HTTPException(422, "Task title is required")
-    assigned_user_id, assigned_to = resolve_assigned_user(
-        conn,
-        tenant_id,
-        task_payload.get("assigned_user_id"),
-        task_payload.get("assigned_to"),
-    )
-    assignee = validate_active_user(conn, tenant_id, assigned_user_id, "task assignee")
-    planning_start, planning_end, deadline = validate_task_planning(task_payload)
-    task_id = str(task_payload.get("id") or uuid.uuid4())
-    client_id = task_payload.get("client_id", default_client_id)
-    client_name = task_payload.get("client_name", default_client_name)
-    job_id = task_payload.get("job_id", default_job_id)
-    property_id = task_payload.get("property_id", default_property_id)
-    property_address = task_payload.get("property_address", default_property_address)
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO tasks (
-                id,title,description,task_type,status,priority,deadline,planned_date,
-                planned_start_at,planned_end_at,estimated_minutes,created_by,assigned_to,assigned_user_id,
-                planning_note,reminder_for_assignee_only,delegated_by,client_id,client_name,job_id,property_id,property_address,
-                is_recurring,recurrence_rule,communication_method,source,is_billable,has_cost,checklist,calendar_sync_enabled,tenant_id
-            ) VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,%s,%s,%s,%s
-            ) RETURNING *
-        """, (
-            task_id,
-            title,
-            task_payload.get("description"),
-            task_payload.get("task_type", "interni_poznamka"),
-            task_payload.get("status", "novy"),
-            task_payload.get("priority", "bezna"),
-            deadline,
-            task_payload.get("planned_date") or deadline,
-            planning_start,
-            planning_end,
-            task_payload.get("estimated_minutes"),
-            actor_name,
-            assigned_to or assignee["display_name"],
-            int(assignee["id"]),
-            task_payload.get("planning_note"),
-            task_payload.get("reminder_for_assignee_only", True),
-            task_payload.get("delegated_by") or actor_name,
-            client_id,
-            client_name,
-            job_id,
-            property_id,
-            property_address,
-            task_payload.get("is_recurring", False),
-            task_payload.get("recurrence_rule"),
-            task_payload.get("communication_method"),
-            task_payload.get("source") or source,
-            task_payload.get("is_billable", False),
-            task_payload.get("has_cost", False),
-            json.dumps(task_payload.get("checklist", [])),
-            task_payload.get("calendar_sync_enabled", True),
-            tenant_id,
-        ))
-        row = cur.fetchone()
-    return dict(row)
-
-def resolve_replacement_task_for_link(
-    conn,
-    tenant_id: int,
-    link: dict,
-    current_task_id: str,
-    *,
-    replacement_task_id: Optional[str] = None,
-    replacement_task_payload: Optional[dict] = None,
-    actor_name: str,
-    fallback_task: Optional[dict] = None,
-) -> dict:
-    if replacement_task_id:
-        if str(replacement_task_id) == str(current_task_id):
-            raise HTTPException(422, "Replacement task must be different from current next action")
-        candidate = (
-            get_valid_client_next_action_task(conn, tenant_id, int(link["entity_id"]), str(replacement_task_id))
-            if link["entity_type"] == "client"
-            else get_valid_job_next_action_task(conn, tenant_id, int(link["entity_id"]), str(replacement_task_id))
-        )
-        if not candidate:
-            raise HTTPException(422, "Replacement task must be an open planned task linked to the same entity")
-        return candidate
-    if not replacement_task_payload:
-        raise HTTPException(422, "Current next action cannot be completed without replacement_task_id or replacement_task_payload")
-    payload = dict(replacement_task_payload)
-    if fallback_task:
-        payload.setdefault("client_id", fallback_task.get("client_id"))
-        payload.setdefault("client_name", fallback_task.get("client_name"))
-        payload.setdefault("job_id", fallback_task.get("job_id"))
-        payload.setdefault("property_id", fallback_task.get("property_id"))
-        payload.setdefault("property_address", fallback_task.get("property_address"))
-    if link["entity_type"] == "client":
-        payload["client_id"] = int(link["entity_id"])
-        payload["job_id"] = None
-    else:
-        payload["job_id"] = int(link["entity_id"])
-        payload.setdefault("client_id", link.get("client_id"))
-    return create_workflow_task(
-        conn,
-        tenant_id,
-        payload,
-        actor_name=actor_name,
-        default_client_id=payload.get("client_id"),
-        default_client_name=payload.get("client_name"),
-        default_job_id=payload.get("job_id"),
-        default_property_id=payload.get("property_id"),
-        default_property_address=payload.get("property_address"),
-        source="replacement_workflow",
-    )
-
-def replace_next_action_links(
-    conn,
-    tenant_id: int,
-    task_row: dict,
-    *,
-    replacement_task_id: Optional[str] = None,
-    replacement_task_payload: Optional[dict] = None,
-    actor_user_id: Optional[int] = None,
-    actor_name: str,
-) -> List[dict]:
-    links = get_task_next_action_links(conn, tenant_id, str(task_row["id"]))
-    replacements: List[dict] = []
-    for link in links:
-        replacement = resolve_replacement_task_for_link(
-            conn,
-            tenant_id,
-            link,
-            str(task_row["id"]),
-            replacement_task_id=replacement_task_id,
-            replacement_task_payload=replacement_task_payload,
-            actor_name=actor_name,
-            fallback_task=task_row,
-        )
-        if link["entity_type"] == "client":
-            set_client_next_action(conn, tenant_id, int(link["entity_id"]), str(replacement["id"]))
-            log_activity(
-                conn,
-                "client",
-                int(link["entity_id"]),
-                "change_next_action",
-                f"Client next action changed from {task_row['id']} to {replacement['id']}",
-                tenant_id=tenant_id,
-                user_id=actor_user_id,
-                source_channel="hierarchy",
-                details={"before": str(task_row["id"]), "after": str(replacement["id"])},
-            )
-        else:
-            set_job_next_action(conn, tenant_id, int(link["entity_id"]), str(replacement["id"]))
-            log_activity(
-                conn,
-                "job",
-                int(link["entity_id"]),
-                "change_next_action",
-                f"Job next action changed from {task_row['id']} to {replacement['id']}",
-                tenant_id=tenant_id,
-                user_id=actor_user_id,
-                source_channel="hierarchy",
-                details={"before": str(task_row["id"]), "after": str(replacement["id"])},
-            )
-        replacements.append({"link": link, "task": replacement})
-    return replacements
-
-def get_user_deactivation_blockers(conn, tenant_id: int, user_id: int) -> dict:
-    blockers = {"clients": [], "jobs": [], "open_tasks": [], "next_action_tasks": []}
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, display_name
-            FROM clients
-            WHERE tenant_id=%s AND deleted_at IS NULL AND owner_user_id=%s
-            ORDER BY id
-            LIMIT 20
-        """, (tenant_id, user_id))
-        blockers["clients"] = [dict(row) for row in cur.fetchall()]
-        cur.execute("""
-            SELECT id, job_title
-            FROM jobs
-            WHERE tenant_id=%s AND deleted_at IS NULL AND assigned_user_id=%s
-            ORDER BY id
-            LIMIT 20
-        """, (tenant_id, user_id))
-        blockers["jobs"] = [dict(row) for row in cur.fetchall()]
-        cur.execute("""
-            SELECT id, title, client_id, job_id
-            FROM tasks
-            WHERE tenant_id=%s
-              AND assigned_user_id=%s
-              AND COALESCE(is_completed, FALSE)=FALSE
-              AND COALESCE(status, 'novy') NOT IN ('hotovo', 'zruseno')
-            ORDER BY created_at DESC
-            LIMIT 20
-        """, (tenant_id, user_id))
-        blockers["open_tasks"] = [dict(row) for row in cur.fetchall()]
-        cur.execute("""
-            SELECT t.id, t.title, c.id AS client_id, j.id AS job_id
-            FROM tasks t
-            LEFT JOIN clients c
-              ON c.tenant_id=t.tenant_id
-             AND c.deleted_at IS NULL
-             AND c.next_action_task_id=t.id
-            LEFT JOIN jobs j
-              ON j.tenant_id=t.tenant_id
-             AND j.deleted_at IS NULL
-             AND j.next_action_task_id=t.id
-            WHERE t.tenant_id=%s
-              AND t.assigned_user_id=%s
-              AND (c.id IS NOT NULL OR j.id IS NOT NULL)
-            ORDER BY t.created_at DESC
-            LIMIT 20
-        """, (tenant_id, user_id))
-        blockers["next_action_tasks"] = [dict(row) for row in cur.fetchall()]
-    blockers["has_blockers"] = any(bool(blockers[key]) for key in ("clients", "jobs", "open_tasks", "next_action_tasks"))
-    return blockers
-
-def create_hierarchy_placeholder_task(
-    conn,
-    tenant_id: int,
-    *,
-    assigned_user_id: int,
-    assigned_to: str,
-    client_id: Optional[int] = None,
-    client_name: Optional[str] = None,
-    job_id: Optional[int] = None,
-    property_id: Optional[int] = None,
-    property_address: Optional[str] = None,
-    created_by: str = "system_migration",
-) -> dict:
-    task_id = str(uuid.uuid4())
-    planned_start = next_business_day_at_nine()
-    planned_end = planned_start + timedelta(hours=1)
-    placeholder_note = "Systémově vytvořený task při migraci hierarchie. Nutná ruční kontrola."
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO tasks (
-                id, title, description, task_type, status, priority, deadline, planned_date,
-                planned_start_at, planned_end_at, created_by, assigned_to, assigned_user_id,
-                planning_note, reminder_for_assignee_only, delegated_by,
-                client_id, client_name, job_id, property_id, property_address,
-                source, calendar_sync_enabled, tenant_id
-            ) VALUES (
-                %s, %s, %s, 'interni_poznamka', 'novy', 'vysoka', %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, TRUE, %s,
-                %s, %s, %s, %s, %s,
-                'system_migration', TRUE, %s
-            )
-            RETURNING id, title, assigned_user_id, assigned_to, client_id, job_id,
-                      planned_start_at::text AS planned_start_at, deadline
-        """, (
-            task_id,
-            "Doplnit další krok",
-            "Systémově vytvořený task při migraci hierarchie. Nutná ruční kontrola.",
-            planned_start.strftime("%Y-%m-%d %H:%M:%S"),
-            planned_start.strftime("%Y-%m-%d"),
-            planned_start,
-            planned_end,
-            created_by,
-            assigned_to,
-            assigned_user_id,
-            placeholder_note,
-            created_by,
-            client_id,
-            client_name,
-            job_id,
-            property_id,
-            property_address,
-            tenant_id,
-        ))
-        row = cur.fetchone()
-    return dict(row)
-
-def build_blocked_user_deactivations(conn, tenant_id: int) -> List[dict]:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT u.id, u.display_name, u.email,
-                EXISTS(SELECT 1 FROM clients c WHERE c.tenant_id=u.tenant_id AND c.deleted_at IS NULL AND c.owner_user_id=u.id) AS owns_clients,
-                EXISTS(SELECT 1 FROM jobs j WHERE j.tenant_id=u.tenant_id AND j.deleted_at IS NULL AND j.assigned_user_id=u.id) AS owns_jobs,
-                EXISTS(
-                    SELECT 1 FROM tasks t
-                    WHERE t.tenant_id=u.tenant_id
-                      AND t.assigned_user_id=u.id
-                      AND COALESCE(t.is_completed, FALSE)=FALSE
-                      AND COALESCE(t.status, 'novy') NOT IN ('hotovo', 'zruseno')
-                ) AS has_open_tasks,
-                EXISTS(
-                    SELECT 1
-                    FROM clients c
-                    JOIN tasks t ON t.id = c.next_action_task_id
-                    WHERE c.tenant_id=u.tenant_id
-                      AND c.deleted_at IS NULL
-                      AND t.assigned_user_id=u.id
-                ) OR EXISTS(
-                    SELECT 1
-                    FROM jobs j
-                    JOIN tasks t ON t.id = j.next_action_task_id
-                    WHERE j.tenant_id=u.tenant_id
-                      AND j.deleted_at IS NULL
-                      AND t.assigned_user_id=u.id
-                ) AS owns_next_actions
-            FROM users u
-            WHERE u.tenant_id=%s
-              AND u.deleted_at IS NULL
-              AND COALESCE(u.status, 'active')='active'
-            ORDER BY u.display_name, u.id
-        """, (tenant_id,))
-        rows = cur.fetchall()
-    blocked = []
-    for row in rows:
-        item = dict(row)
-        reasons = []
-        if item.get("owns_clients"):
-            reasons.append("client_owner")
-        if item.get("owns_jobs"):
-            reasons.append("job_owner")
-        if item.get("has_open_tasks"):
-            reasons.append("open_task_assignee")
-        if item.get("owns_next_actions"):
-            reasons.append("next_action_assignee")
-        if reasons:
-            item["reasons"] = reasons
-            blocked.append(item)
-    return blocked
-
-def get_hierarchy_integrity_report(conn, tenant_id: int) -> dict:
-    orphan_clients: List[dict] = []
-    orphan_jobs: List[dict] = []
-    orphan_tasks: List[dict] = []
-    next_action_mismatches: List[dict] = []
-
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, display_name, owner_user_id, next_action_task_id, hierarchy_status
-            FROM clients
-            WHERE tenant_id=%s AND deleted_at IS NULL
-            ORDER BY display_name, id
-        """, (tenant_id,))
-        client_rows = [dict(row) for row in cur.fetchall()]
-        cur.execute("""
-            SELECT id, job_title, client_id, assigned_user_id, assigned_to, next_action_task_id, hierarchy_status
-            FROM jobs
-            WHERE tenant_id=%s AND deleted_at IS NULL
-            ORDER BY created_at DESC, id DESC
-        """, (tenant_id,))
-        job_rows = [dict(row) for row in cur.fetchall()]
-        cur.execute("""
-            SELECT t.id, t.title, t.client_id, t.job_id, t.assigned_user_id, t.assigned_to, t.status,
-                   COALESCE(t.is_completed, FALSE) AS is_completed,
-                   t.planned_start_at::text AS planned_start_at, t.deadline,
-                   u.id AS active_user_id
-            FROM tasks t
-            LEFT JOIN users u
-              ON u.id = t.assigned_user_id
-             AND u.tenant_id = t.tenant_id
-             AND u.deleted_at IS NULL
-             AND COALESCE(u.status, 'active')='active'
-            WHERE t.tenant_id=%s
-            ORDER BY t.created_at DESC
-        """, (tenant_id,))
-        task_rows = [dict(row) for row in cur.fetchall()]
-
-    for client in client_rows:
-        validation = validate_client_hierarchy(conn, tenant_id, client["id"])
-        if not validation["valid"]:
-            item = {
-                "id": client["id"],
-                "display_name": client["display_name"],
-                "owner_user_id": client.get("owner_user_id"),
-                "next_action_task_id": client.get("next_action_task_id"),
-                "issues": validation["issues"],
-            }
-            orphan_clients.append(item)
-            if any("next_action" in issue for issue in validation["issues"]):
-                next_action_mismatches.append({"entity_type": "client", **item})
-
-    for job in job_rows:
-        validation = validate_job_hierarchy(conn, tenant_id, job["id"])
-        if not validation["valid"]:
-            item = {
-                "id": job["id"],
-                "job_title": job["job_title"],
-                "client_id": job.get("client_id"),
-                "assigned_user_id": job.get("assigned_user_id"),
-                "next_action_task_id": job.get("next_action_task_id"),
-                "issues": validation["issues"],
-            }
-            orphan_jobs.append(item)
-            if any("next_action" in issue for issue in validation["issues"]):
-                next_action_mismatches.append({"entity_type": "job", **item})
-
-    for task in task_rows:
-        issues: List[str] = []
-        if not task.get("assigned_user_id") or not task.get("active_user_id"):
-            issues.append("missing_or_inactive_assignee")
-        if not task.get("planned_start_at") and not ((task.get("deadline") or "").strip()):
-            issues.append("missing_planning")
-        if issues:
-            orphan_tasks.append({
-                "id": task["id"],
-                "title": task["title"],
-                "client_id": task.get("client_id"),
-                "job_id": task.get("job_id"),
-                "assigned_user_id": task.get("assigned_user_id"),
-                "status": task.get("status"),
-                "issues": issues,
-            })
-
-    blocked_user_deactivations = build_blocked_user_deactivations(conn, tenant_id)
-    return {
-        "tenant_id": tenant_id,
-        "orphan_clients": orphan_clients,
-        "orphan_jobs": orphan_jobs,
-        "orphan_tasks": orphan_tasks,
-        "blocked_user_deactivations": blocked_user_deactivations,
-        "next_action_mismatches": next_action_mismatches,
-        "summary": {
-            "orphan_clients": len(orphan_clients),
-            "orphan_jobs": len(orphan_jobs),
-            "orphan_tasks": len(orphan_tasks),
-            "blocked_user_deactivations": len(blocked_user_deactivations),
-            "next_action_mismatches": len(next_action_mismatches),
-        },
-    }
-
-def run_hierarchy_backfill(conn, tenant_id: int, actor_user_id: Optional[int] = None, dry_run: bool = True) -> dict:
-    default_user = get_default_hierarchy_user(conn, tenant_id)
-    if not default_user:
-        raise HTTPException(422, "No active user is available for hierarchy backfill")
-
-    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system_migration"
-    updates = {"clients": [], "jobs": [], "tasks": []}
-    client_owner_cache: Dict[int, dict] = {}
-
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, display_name, owner_user_id, next_action_task_id
-            FROM clients
-            WHERE tenant_id=%s AND deleted_at IS NULL
-            ORDER BY id
-        """, (tenant_id,))
-        clients = [dict(row) for row in cur.fetchall()]
-
-    for client in clients:
-        active_owner = get_active_user_row(conn, tenant_id, client.get("owner_user_id"))
-        next_action = get_valid_client_next_action_task(conn, tenant_id, client["id"], client.get("next_action_task_id"))
-        fallback_task = next_action or get_valid_client_next_action_task(conn, tenant_id, client["id"])
-        target_owner = active_owner
-        if not target_owner and fallback_task:
-            target_owner = get_active_user_row(conn, tenant_id, fallback_task.get("assigned_user_id"))
-        if not target_owner:
-            target_owner = default_user
-        target_task = fallback_task
-        if not target_task and not dry_run:
-            target_task = create_hierarchy_placeholder_task(
-                conn,
-                tenant_id,
-                assigned_user_id=int(target_owner["id"]),
-                assigned_to=target_owner["display_name"],
-                client_id=client["id"],
-                client_name=client["display_name"],
-                created_by=actor_name,
-            )
-        changes = {
-            "owner_user_id": int(target_owner["id"]),
-            "next_action_task_id": target_task["id"] if target_task else "placeholder_required",
-            "placeholder_created": bool(target_task and target_task.get("id") not in (client.get("next_action_task_id"), None) and not fallback_task),
-        }
-        client_owner_cache[client["id"]] = target_owner
-        needs_update = (
-            client.get("owner_user_id") != changes["owner_user_id"] or
-            str(client.get("next_action_task_id") or "") != str(changes["next_action_task_id"] or "")
-        )
-        if needs_update and not dry_run and target_task:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE clients
-                    SET owner_user_id=%s, next_action_task_id=%s, hierarchy_status='valid', updated_at=now()
-                    WHERE tenant_id=%s AND id=%s
-                """, (changes["owner_user_id"], changes["next_action_task_id"], tenant_id, client["id"]))
-            log_activity(
-                conn, "client", client["id"], "hierarchy_backfill",
-                f"Client hierarchy backfilled for {client['display_name']}",
-                tenant_id=tenant_id, user_id=actor_user_id, source_channel="hierarchy_migration",
-                details={"before": client, "after": changes},
-            )
-        if needs_update or changes["next_action_task_id"] == "placeholder_required":
-            updates["clients"].append({
-                "id": client["id"],
-                "display_name": client["display_name"],
-                "changes": changes,
-            })
-
-    job_owner_cache: Dict[int, dict] = {}
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT j.id, j.job_title, j.client_id, j.property_id, j.assigned_user_id, j.next_action_task_id,
-                   c.display_name AS client_name, p.property_name, p.address_line1
-            FROM jobs j
-            LEFT JOIN clients c ON c.id = j.client_id
-            LEFT JOIN properties p ON p.id = j.property_id
-            WHERE j.tenant_id=%s AND j.deleted_at IS NULL
-            ORDER BY j.id
-        """, (tenant_id,))
-        jobs = [dict(row) for row in cur.fetchall()]
-
-    for job in jobs:
-        active_owner = get_active_user_row(conn, tenant_id, job.get("assigned_user_id"))
-        next_action = get_valid_job_next_action_task(conn, tenant_id, job["id"], job.get("next_action_task_id"))
-        fallback_task = next_action or get_valid_job_next_action_task(conn, tenant_id, job["id"])
-        target_owner = active_owner
-        if not target_owner and fallback_task:
-            target_owner = get_active_user_row(conn, tenant_id, fallback_task.get("assigned_user_id"))
-        if not target_owner and job.get("client_id"):
-            target_owner = client_owner_cache.get(int(job["client_id"]))
-        if not target_owner:
-            target_owner = default_user
-        job_owner_cache[job["id"]] = target_owner
-        target_task = fallback_task
-        if not target_task and not dry_run:
-            target_task = create_hierarchy_placeholder_task(
-                conn,
-                tenant_id,
-                assigned_user_id=int(target_owner["id"]),
-                assigned_to=target_owner["display_name"],
-                client_id=job.get("client_id"),
-                client_name=job.get("client_name"),
-                job_id=job["id"],
-                property_id=job.get("property_id"),
-                property_address=job.get("address_line1") or job.get("property_name"),
-                created_by=actor_name,
-            )
-        changes = {
-            "assigned_user_id": int(target_owner["id"]),
-            "assigned_to": target_owner["display_name"],
-            "next_action_task_id": target_task["id"] if target_task else "placeholder_required",
-            "placeholder_created": bool(target_task and target_task.get("id") not in (job.get("next_action_task_id"), None) and not fallback_task),
-        }
-        needs_update = (
-            job.get("assigned_user_id") != changes["assigned_user_id"] or
-            (job.get("next_action_task_id") or "") != (changes["next_action_task_id"] or "")
-        )
-        if needs_update and not dry_run and target_task:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE jobs
-                    SET assigned_user_id=%s,
-                        assigned_to=%s,
-                        next_action_task_id=%s,
-                        hierarchy_status='valid',
-                        updated_at=now()
-                    WHERE tenant_id=%s AND id=%s
-                """, (changes["assigned_user_id"], changes["assigned_to"], changes["next_action_task_id"], tenant_id, job["id"]))
-            log_activity(
-                conn, "job", job["id"], "hierarchy_backfill",
-                f"Job hierarchy backfilled for {job['job_title']}",
-                tenant_id=tenant_id, user_id=actor_user_id, source_channel="hierarchy_migration",
-                details={"before": job, "after": changes},
-            )
-        if needs_update or changes["next_action_task_id"] == "placeholder_required":
-            updates["jobs"].append({
-                "id": job["id"],
-                "job_title": job["job_title"],
-                "changes": changes,
-            })
-
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT t.id, t.title, t.client_id, t.job_id, t.assigned_user_id, t.assigned_to, t.planning_note,
-                   t.planned_start_at::text AS planned_start_at, t.planned_end_at::text AS planned_end_at, t.deadline,
-                   u.id AS active_user_id
-            FROM tasks t
-            LEFT JOIN users u
-              ON u.id = t.assigned_user_id
-             AND u.tenant_id = t.tenant_id
-             AND u.deleted_at IS NULL
-             AND COALESCE(u.status, 'active')='active'
-            WHERE t.tenant_id=%s
-            ORDER BY t.created_at DESC
-        """, (tenant_id,))
-        tasks = [dict(row) for row in cur.fetchall()]
-
-    for task in tasks:
-        needs_assignee = not task.get("assigned_user_id") or not task.get("active_user_id")
-        has_planning = bool(task.get("planned_start_at")) or bool((task.get("deadline") or "").strip())
-        if not needs_assignee and has_planning:
-            continue
-        target_owner = None
-        if task.get("job_id"):
-            target_owner = job_owner_cache.get(int(task["job_id"]))
-        if not target_owner and task.get("client_id"):
-            target_owner = client_owner_cache.get(int(task["client_id"]))
-        if not target_owner:
-            target_owner = default_user
-        planning_start = parse_planning_datetime(task.get("planned_start_at"))
-        planning_end = parse_planning_datetime(task.get("planned_end_at"))
-        deadline = (task.get("deadline") or "").strip() or None
-        planning_note = task.get("planning_note")
-        if not planning_start and not deadline:
-            planning_start = next_business_day_at_nine()
-            planning_end = planning_start + timedelta(hours=1)
-            deadline = planning_start.strftime("%Y-%m-%d %H:%M:%S")
-            planning_note = merge_planning_note(planning_note, "Systémově doplněný termín během migrace hierarchie. Nutná ruční kontrola.")
-        changes = {
-            "assigned_user_id": int(target_owner["id"]),
-            "assigned_to": target_owner["display_name"],
-            "planned_start_at": format_planning_datetime(planning_start),
-            "planned_end_at": format_planning_datetime(planning_end),
-            "deadline": deadline,
-        }
-        if not dry_run:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE tasks
-                    SET assigned_user_id=%s,
-                        assigned_to=%s,
-                        planned_start_at=%s,
-                        planned_end_at=%s,
-                        deadline=%s,
-                        planning_note=%s,
-                        updated_at=now()
-                    WHERE tenant_id=%s AND id=%s
-                """, (
-                    changes["assigned_user_id"],
-                    changes["assigned_to"],
-                    planning_start,
-                    planning_end,
-                    deadline,
-                    planning_note,
-                    tenant_id,
-                    task["id"],
-                ))
-            log_activity(
-                conn, "task", task["id"], "hierarchy_backfill",
-                f"Task hierarchy backfilled for {task['title']}",
-                tenant_id=tenant_id, user_id=actor_user_id, source_channel="hierarchy_migration",
-                details={"before": task, "after": changes},
-            )
-        updates["tasks"].append({
-            "id": task["id"],
-            "title": task["title"],
-            "changes": changes,
-        })
-
-    if not dry_run:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE clients
-                SET hierarchy_status = CASE
-                    WHEN owner_user_id IS NOT NULL AND next_action_task_id IS NOT NULL THEN 'valid'
-                    ELSE 'invalid'
-                END
-                WHERE tenant_id=%s AND deleted_at IS NULL
-            """, (tenant_id,))
-            cur.execute("""
-                UPDATE jobs
-                SET hierarchy_status = CASE
-                    WHEN assigned_user_id IS NOT NULL AND next_action_task_id IS NOT NULL THEN 'valid'
-                    ELSE 'invalid'
-                END
-                WHERE tenant_id=%s AND deleted_at IS NULL
-            """, (tenant_id,))
-
-    return {
-        "tenant_id": tenant_id,
-        "dry_run": dry_run,
-        "default_user": {"id": default_user["id"], "display_name": default_user["display_name"]},
-        "updates": updates,
-        "summary": {
-            "clients": len(updates["clients"]),
-            "jobs": len(updates["jobs"]),
-            "tasks": len(updates["tasks"]),
-        },
-    }
-
-def build_calendar_entry(
-    entry_type: str,
-    source: dict,
-    current_user_id: Optional[int],
-    job_title: Optional[str] = None,
-) -> Optional[dict]:
-    planned_start, planned_end = planning_window_from_values(
-        source.get("planned_start_at"),
-        source.get("planned_end_at"),
-        source.get("planned_date") or source.get("start_date_planned") or source.get("deadline"),
-    )
-    if not planned_start:
-        return None
-    assigned_user_id = source.get("assigned_user_id")
-    try:
-        assigned_user_id = int(assigned_user_id) if assigned_user_id is not None else None
-    except Exception:
-        assigned_user_id = None
-    assigned_to = source.get("assigned_to")
-    is_assigned_to_current = bool(current_user_id and assigned_user_id and current_user_id == assigned_user_id)
-    if entry_type == "task":
-        display_mode = "reminder" if is_assigned_to_current else "info"
-    else:
-        display_mode = "assigned" if is_assigned_to_current else "shared"
-    return {
-        "entry_key": f"{entry_type}:{source.get('id')}",
-        "entry_type": entry_type,
-        "source_id": source.get("id"),
-        "title": source.get("title") or source.get("job_title") or "",
-        "client_name": source.get("client_name"),
-        "job_title": job_title,
-        "assigned_user_id": assigned_user_id,
-        "assigned_to": assigned_to,
-        "is_assigned_to_current": is_assigned_to_current,
-        "display_mode": display_mode,
-        "planned_start_at": format_planning_datetime(planned_start),
-        "planned_end_at": format_planning_datetime(planned_end),
-        "planned_date": source.get("planned_date") or source.get("start_date_planned") or source.get("deadline"),
-        "description": source.get("planning_note") or source.get("handover_note"),
-        "calendar_sync_enabled": bool(source.get("calendar_sync_enabled", True)),
-        "reminder_for_assignee_only": bool(source.get("reminder_for_assignee_only", True)),
-        "status": source.get("status") or source.get("job_status"),
-    }
-
-def encode_photo_data_url(content: bytes, filename: str, content_type: Optional[str] = None) -> str:
-    ext = os.path.splitext(filename or "")[1].lower()
-    mime = content_type or {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-    }.get(ext, "image/jpeg")
-    encoded = base64.b64encode(content).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-def guess_mime_type(filename: str) -> str:
-    ext = os.path.splitext(filename or "")[1].lower()
-    return {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-    }.get(ext, "image/jpeg")
-
-def map_photo_row_to_job_photo(row: dict) -> dict:
-    return {
-        "id": row["id"],
-        "job_id": int(row["entity_id"]),
-        "url": row.get("file_path") or row.get("thumbnail_base64") or "",
-        "description": row.get("description"),
-        "photo_type": row.get("photo_type") or "general",
-        "uploaded_by": row.get("created_by"),
-        "uploaded_at": row.get("created_at"),
-    }
-
-def history_type_label(language: str, recognition_type: str) -> str:
-    key = (recognition_type or "").lower()
-    return {
-        "plant_identification": tr_lang(language, "Plant", "Rostlina", "Roślina"),
-        "plant_health_assessment": tr_lang(language, "Plant disease", "Choroba rostliny", "Choroba rośliny"),
-        "mushroom_identification": tr_lang(language, "Mushroom", "Houba", "Grzyb"),
-    }.get(key, recognition_type)
-
-def map_nature_history_entry(row: dict, language: str) -> dict:
-    result_json = row.get("result_json") or {}
-    photos = row.get("photos_json") or []
-    return {
-        "id": row["id"],
-        "recognition_type": row.get("recognition_type"),
-        "recognition_label": history_type_label(language, row.get("recognition_type") or ""),
-        "display_name": row.get("display_name") or "",
-        "scientific_name": row.get("scientific_name") or "",
-        "confidence": float(row.get("confidence") or 0.0),
-        "guidance": row.get("guidance"),
-        "database": row.get("database_name"),
-        "captured_at": row.get("captured_at"),
-        "created_at": row.get("created_at"),
-        "latitude": row.get("latitude"),
-        "longitude": row.get("longitude"),
-        "accuracy_meters": row.get("accuracy_meters"),
-        "location_source": row.get("location_source"),
-        "owner_user_id": row.get("owner_user_id"),
-        "owner_display_name": row.get("owner_display_name") or "",
-        "owner_email": row.get("owner_email") or "",
-        "photos": photos if isinstance(photos, list) else [],
-        "result": result_json if isinstance(result_json, dict) else {},
-    }
-
-def map_admin_activity_entry(row: dict) -> dict:
-    details = row.get("details_json") or {}
-    return {
-        "id": row["id"],
-        "entity_type": row.get("entity_type") or "",
-        "entity_id": row.get("entity_id") or "",
-        "action": row.get("action") or "",
-        "description": row.get("description") or "",
-        "source_channel": row.get("source_channel") or "",
-        "created_at": row.get("created_at"),
-        "actor_user_id": int(row["actor_user_id"]) if row.get("actor_user_id") not in (None, "") else None,
-        "actor_display_name": row.get("actor_display_name") or row.get("user_name") or "",
-        "actor_email": row.get("actor_email") or "",
-        "details": details if isinstance(details, dict) else {},
-    }
-
-async def build_history_photos(
-    uploads: List[UploadFile],
-    photo_types: Optional[List[str]] = None,
-) -> List[dict]:
-    photos = []
-    for index, upload in enumerate(uploads):
-        content = await upload.read()
-        if content:
-            filename = upload.filename or f"capture_{index + 1}.jpg"
-            photos.append({
-                "filename": filename,
-                "photo_type": (photo_types[index] if photo_types and index < len(photo_types) else "capture") or "capture",
-                "content_type": upload.content_type or guess_mime_type(filename),
-                "size_bytes": len(content),
-                "url": encode_photo_data_url(content, filename, upload.content_type),
-            })
-        await upload.seek(0)
-    return photos
-
-def store_nature_history(
-    conn,
-    tenant_id: int,
-    user_id: Optional[int],
-    recognition_type: str,
-    language: str,
-    result: dict,
-    photos: List[dict],
-    captured_at: Optional[str] = None,
-    latitude: Optional[float] = None,
-    longitude: Optional[float] = None,
-    accuracy_meters: Optional[float] = None,
-    location_source: Optional[str] = None,
-):
-    with conn.cursor() as cur:
-        cur.execute(
-            """INSERT INTO nature_recognition_history
-              (tenant_id, user_id, recognition_type, language, display_name, scientific_name,
-               confidence, guidance, database_name, result_json, photos_json, captured_at,
-               latitude, longitude, accuracy_meters, location_source)
-             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s)
-             RETURNING id""",
-            (
-                tenant_id,
-                user_id,
-                recognition_type,
-                language,
-                result.get("display_name") or result.get("top_issue_name") or "",
-                result.get("scientific_name") or "",
-                result.get("score") or result.get("probability") or result.get("top_issue_probability") or result.get("health_probability") or 0.0,
-                result.get("guidance"),
-                result.get("database"),
-                json.dumps(result, ensure_ascii=False),
-                json.dumps(photos, ensure_ascii=False),
-                captured_at,
-                latitude,
-                longitude,
-                accuracy_meters,
-                location_source,
-            ),
-        )
-        history_id = cur.fetchone()[0]
-        for index, photo in enumerate(photos or []):
-            cur.execute(
-                """INSERT INTO nature_recognition_photos
-                  (history_id, tenant_id, sort_order, filename, photo_type, content_type, size_bytes, photo_data_url)
-                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (
-                    history_id,
-                    tenant_id,
-                    index,
-                    photo.get("filename"),
-                    photo.get("photo_type") or "capture",
-                    photo.get("content_type"),
-                    photo.get("size_bytes"),
-                    photo.get("url") or "",
-                ),
-            )
-
-def map_audit_row_to_job_audit(row: dict) -> dict:
-    return {
-        "id": row["id"],
-        "job_id": int(row["entity_id"]),
-        "action_type": row.get("action"),
-        "description": row.get("description") or "",
-        "user_name": row.get("user_name"),
-        "created_at": row.get("created_at"),
-    }
+        return config.get("default_internal_lang", "en")
+    return "en"
 
 # ========== TENANT GUARD ==========
 def verify_tenant(conn, tenant_id):
@@ -4468,726 +422,8 @@ def audit_config_change(conn, tenant_id, action, detail):
     """Log configuration change to activity_timeline."""
     log_activity(conn, "tenant_config", str(tenant_id), action, detail, tenant_id=tenant_id)
 
-def normalize_phone(phone: Optional[str]) -> str:
-    raw = (phone or "").strip()
-    return "".join(ch for ch in raw if ch.isdigit())
-
-def normalize_whatsapp_phone(phone: Optional[str]) -> str:
-    digits = normalize_phone(phone)
-    if digits.startswith("00"):
-        digits = digits[2:]
-    if digits.startswith("0"):
-        if len(digits) == 11:
-            digits = "44" + digits[1:]
-        elif len(digits) == 10:
-            digits = "420" + digits[1:]
-    elif len(digits) == 9:
-        # Likely Czech local number
-        digits = "420" + digits
-    return digits
-
-def normalize_contact_phone(phone: Optional[str]) -> str:
-    digits = normalize_phone(phone)
-    if digits.startswith("00"):
-        digits = digits[2:]
-    if digits.startswith("44") and len(digits) >= 11:
-        digits = "0" + digits[2:]
-    return digits
-
-def normalize_communication_source(source: Optional[str]) -> str:
-    raw = (source or "").strip().lower().replace(" ", "")
-    aliases = {
-        "wa": "whatsapp",
-        "whatsup": "whatsapp",
-        "whatsappmessage": "whatsapp",
-        "text": "sms",
-        "txt": "sms",
-        "smsmessage": "sms",
-        "phone": "telefon",
-        "call": "telefon",
-    }
-    return aliases.get(raw, raw or "manual")
-
-def parse_communication_timestamp(value: Any) -> Optional[datetime]:
-    if value is None or value == "":
-        return None
-    try:
-        if isinstance(value, (int, float)):
-            timestamp = float(value)
-            if timestamp > 100000000000:
-                timestamp = timestamp / 1000.0
-            return datetime.fromtimestamp(timestamp, ZoneInfo("UTC"))
-        text = str(value).strip()
-        if not text:
-            return None
-        if re.fullmatch(r"\d+(\.\d+)?", text):
-            return parse_communication_timestamp(float(text))
-        try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return parsedate_to_datetime(text)
-    except Exception:
-        return None
-
-def find_client_by_communication_phone(cur, tenant_id: int, phone: Optional[str]) -> Optional[Dict[str, Any]]:
-    wanted = normalize_whatsapp_phone(phone)
-    if not wanted:
-        return None
-    cur.execute("""
-        SELECT id, display_name, phone_primary, phone_secondary
-        FROM clients
-        WHERE tenant_id=%s AND deleted_at IS NULL
-    """, (tenant_id,))
-    for row in cur.fetchall():
-        if normalize_whatsapp_phone(row.get("phone_primary")) == wanted or normalize_whatsapp_phone(row.get("phone_secondary")) == wanted:
-            return dict(row)
-    return None
-
-def upsert_communication_message(cur, tenant_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
-    source = normalize_communication_source(data.get("source") or data.get("comm_type"))
-    comm_type = data.get("comm_type") or ("whatsapp" if source == "whatsapp" else "sms" if source == "sms" else source)
-    direction = (data.get("direction") or "inbound").strip().lower()
-    if direction.startswith("out"):
-        direction = "outbound"
-    elif direction.startswith("in"):
-        direction = "inbound"
-    message = data.get("message") or data.get("message_summary") or data.get("body") or ""
-    source_phone = data.get("source_phone") or data.get("from")
-    target_phone = data.get("target_phone") or data.get("to")
-    peer_phone = data.get("phone")
-    if peer_phone and not source_phone and direction == "inbound":
-        source_phone = peer_phone
-    if peer_phone and not target_phone and direction == "outbound":
-        target_phone = peer_phone
-    if not peer_phone:
-        peer_phone = source_phone if direction == "inbound" else target_phone
-    conversation_key = data.get("conversation_key") or normalize_whatsapp_phone(peer_phone)
-    sent_at = parse_communication_timestamp(data.get("sent_at") or data.get("timestamp") or data.get("date_sent"))
-    external_id = (str(data.get("external_message_id") or data.get("message_id") or data.get("sid") or "").strip() or None)
-    if not external_id and source in ("sms", "whatsapp") and (message or peer_phone or sent_at):
-        seed = f"{source}|{direction}|{source_phone or ''}|{target_phone or ''}|{sent_at.isoformat() if sent_at else ''}|{message}"
-        external_id = "generated-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
-
-    client_id = data.get("client_id")
-    client_match = None
-    if client_id:
-        cur.execute("SELECT id, display_name FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (client_id, tenant_id))
-        row = cur.fetchone()
-        if row:
-            client_match = dict(row)
-        else:
-            client_id = None
-    if not client_id:
-        client_match = find_client_by_communication_phone(cur, tenant_id, peer_phone)
-        client_id = client_match["id"] if client_match else None
-
-    subject = data.get("subject") or f"{source.upper()} {'od' if direction == 'inbound' else 'pro'} {peer_phone or ''}".strip()
-    notes = data.get("notes")
-
-    if external_id:
-        cur.execute("""
-            SELECT id FROM communications
-            WHERE tenant_id=%s AND source=%s AND external_message_id=%s
-            LIMIT 1
-        """, (tenant_id, source, external_id))
-        existing = cur.fetchone()
-        if existing:
-            cur.execute("""
-                UPDATE communications
-                SET client_id=COALESCE(%s, client_id),
-                    job_id=COALESCE(%s, job_id),
-                    comm_type=%s,
-                    subject=%s,
-                    message_summary=%s,
-                    direction=%s,
-                    notes=COALESCE(%s, notes),
-                    sent_at=COALESCE(%s, sent_at),
-                    source_phone=COALESCE(%s, source_phone),
-                    target_phone=COALESCE(%s, target_phone),
-                    conversation_key=COALESCE(%s, conversation_key),
-                    imported_at=now()
-                WHERE id=%s
-                RETURNING id
-            """, (client_id, data.get("job_id"), comm_type, subject, str(message)[:4000], direction,
-                  notes, sent_at, source_phone, target_phone, conversation_key, existing["id"]))
-            row = cur.fetchone()
-            return {"id": row["id"], "created": False, "matched": bool(client_id)}
-
-    cur.execute("""
-        INSERT INTO communications (
-            tenant_id, client_id, job_id, comm_type, source, external_message_id,
-            source_phone, target_phone, conversation_key, subject, message_summary,
-            direction, notes, sent_at, imported_at
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, now()),now())
-        RETURNING id
-    """, (tenant_id, client_id, data.get("job_id"), comm_type, source, external_id,
-          source_phone, target_phone, conversation_key, subject, str(message)[:4000],
-          direction, notes, sent_at))
-    row = cur.fetchone()
-    return {"id": row["id"], "created": True, "matched": bool(client_id)}
-
-def normalize_email(email: Optional[str]) -> str:
-    return (email or "").strip().lower()
-
-def build_contact_key(name: Optional[str], phone: Optional[str], email: Optional[str]) -> str:
-    normalized_phone = normalize_contact_phone(phone)
-    normalized_email = normalize_email(email)
-    normalized_name = clean_contact_display_name(name).lower()
-    return normalized_phone or normalized_email or normalized_name
-
-def normalize_section_code(value: Optional[str]) -> str:
-    raw = (value or "").strip().lower()
-    if not raw:
-        return ""
-    chars = []
-    prev_sep = False
-    for ch in raw:
-        if ch.isalnum():
-            chars.append(ch)
-            prev_sep = False
-        elif not prev_sep:
-            chars.append("_")
-            prev_sep = True
-    return "".join(chars).strip("_")
-
-def choose_preferred_value(*values):
-    best = ""
-    for value in values:
-        candidate = (value or "").strip()
-        if len(candidate) > len(best):
-            best = candidate
-    return best or None
-
-def clean_optional_text(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-def extract_contact_address_fields(data: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    address_line1 = clean_optional_text(
-        data.get("address_line1")
-        or data.get("billing_address_line1")
-        or data.get("street")
-    )
-    city = clean_optional_text(data.get("city") or data.get("billing_city"))
-    postcode = clean_optional_text(data.get("postcode") or data.get("billing_postcode"))
-    country = clean_optional_text(data.get("country") or data.get("billing_country"))
-    formatted = clean_optional_text(data.get("address"))
-    if not formatted:
-        formatted = ", ".join(part for part in [address_line1, city, postcode, country] if part) or None
-    return {
-        "address": formatted,
-        "address_line1": address_line1,
-        "city": city,
-        "postcode": postcode,
-        "country": country,
-    }
-
-UK_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", re.IGNORECASE)
-CZ_POSTCODE_RE = re.compile(r"\b(\d{3}\s?\d{2})\b")
-ADDRESS_LABEL_RE = re.compile(
-    r"^\s*(?:address|addr|adresa|adres|billing address|client address|zakaznik|klient|bydliště|bydliste)\s*[:\-]\s*",
-    re.IGNORECASE,
-)
-STREET_HINT_RE = re.compile(
-    r"\b(street|st|road|rd|lane|ln|avenue|ave|drive|dr|close|cl|way|court|ct|"
-    r"crescent|cres|place|pl|terrace|terr|gardens|gdns|green|grove|grv|park|"
-    r"hill|row|mews|yard|house|flat|apartment|apt|unit|ulice|ul\.|náměstí|nám\.|třída|tr\.|nábřeží|nábř\.|č\.p\.|č\.|popisné)\b",
-    re.IGNORECASE,
-)
-PHONE_IN_TEXT_RE = re.compile(r"(?:phone|tel|telephone|whatsapp|wa|from|to)\s*:?\s*(\+?\d[\d\s().-]{6,}\d)", re.IGNORECASE)
-
-def normalize_postcode(value: Optional[str]) -> Optional[str]:
-    if not value: return None
-    uk_match = UK_POSTCODE_RE.search(value)
-    if uk_match:
-        compact = re.sub(r"\s+", "", uk_match.group(1).upper())
-        if len(compact) <= 3: return compact
-        return f"{compact[:-3]} {compact[-3:]}"
-    cz_match = CZ_POSTCODE_RE.search(value)
-    if cz_match:
-        compact = re.sub(r"\s+", "", cz_match.group(1))
-        return f"{compact[:3]} {compact[3:]}"
-    return None
-
-def clean_address_fragment(value: Optional[str]) -> str:
-    text = (value or "").replace("\r", "\n")
-    text = re.sub(r"https?://\S+", " ", text)
-    text = re.sub(r"\b(?:phone|tel|telephone|whatsapp|wa)\s*:?\s*\+?\d[\d\s().-]{6,}\d\b", " ", text, flags=re.IGNORECASE)
-    text = text.replace("\n", ", ")
-    text = ADDRESS_LABEL_RE.sub("", text)
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\s*,\s*", ", ", text)
-    text = re.sub(r"(,\s*){2,}", ", ", text)
-    return text.strip(" ,.;")
-
-def score_address_candidate(candidate: str) -> float:
-    if not UK_POSTCODE_RE.search(candidate) and not CZ_POSTCODE_RE.search(candidate):
-        return 0.0
-    cleaned = clean_address_fragment(candidate)
-    if len(cleaned) < 10 or len(cleaned) > 240:
-        return 0.0
-    score = 0.45
-    if re.search(r"\b\d+[A-Z/]?\b", cleaned, re.IGNORECASE):
-        score += 0.18
-    if STREET_HINT_RE.search(cleaned):
-        score += 0.2
-    if "," in cleaned:
-        score += 0.08
-    if ADDRESS_LABEL_RE.search(candidate):
-        score += 0.08
-    if re.search(r"\b(hours?|hodin|pytl|total|£|invoice|faktura)\b", cleaned, re.IGNORECASE):
-        score -= 0.2
-    return max(0.0, min(0.98, score))
-
-def split_uk_address(raw_address: str, postcode: str) -> Dict[str, Optional[str]]:
-    cleaned = clean_address_fragment(raw_address)
-    cleaned = UK_POSTCODE_RE.sub("", cleaned).strip(" ,.;")
-    parts = [part.strip(" ,.;") for part in cleaned.split(",") if part.strip(" ,.;")]
-    city = None
-    line1 = cleaned or None
-    if len(parts) >= 2:
-        city = parts[-1]
-        line1 = ", ".join(parts[:-1]) or None
-    elif len(parts) == 1:
-        line1 = parts[0]
-    return {
-        "address": ", ".join(part for part in [line1, city, postcode, "GB"] if part),
-        "address_line1": line1,
-        "city": city,
-        "postcode": postcode,
-        "country": "GB",
-    }
-
-def split_cz_address(raw_address: str, postcode: str) -> Dict[str, Optional[str]]:
-    cleaned = clean_address_fragment(raw_address)
-    cleaned = CZ_POSTCODE_RE.sub("", cleaned).strip(" ,.;")
-    # Czech address: Street 123, City
-    parts = [part.strip(" ,.;") for part in cleaned.split(",") if part.strip(" ,.;")]
-    city = None
-    line1 = cleaned or None
-    if len(parts) >= 2:
-        city = parts[-1]
-        line1 = ", ".join(parts[:-1]) or None
-    elif len(parts) == 1:
-        # Try to find city if it's near postcode but regex took it out
-        line1 = parts[0]
-    return {
-        "address": ", ".join(part for part in [line1, city, postcode, "CZ"] if part),
-        "address_line1": line1,
-        "city": city,
-        "postcode": postcode,
-        "country": "CZ",
-    }
-
-def extract_cz_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not text: return None
-    print(f"DEBUG ADDR: Scanning text for CZ address: {text[:100]}...")
-    raw_lines = [line.strip() for line in str(text).replace("\r", "\n").split("\n")]
-    lines = [line for line in raw_lines if line]
-    candidates: List[str] = []
-    for index, line in enumerate(lines):
-        if CZ_POSTCODE_RE.search(line):
-            candidates.append(line)
-            if index > 0: candidates.append(f"{lines[index - 1]}, {line}")
-            if index > 1: candidates.append(f"{lines[index - 2]}, {lines[index - 1]}, {line}")
-    if not candidates:
-        for chunk in re.split(r"[;\n]", str(text)):
-            if CZ_POSTCODE_RE.search(chunk): candidates.append(chunk)
-
-    print(f"DEBUG ADDR: Found {len(candidates)} candidates with CZ postcode.")
-    best = None
-    best_score = 0.0
-    for candidate in candidates:
-        score = score_address_candidate(candidate)
-        print(f"DEBUG ADDR: Candidate [{candidate}] score: {score}")
-        if score > best_score:
-            best = candidate
-            best_score = score
-    if not best or best_score < 0.6:
-        if best: print(f"DEBUG ADDR: Best candidate [{best}] rejected due to low score {best_score}")
-        return None
-    postcode = normalize_postcode(best)
-    if not postcode: return None
-    address = split_cz_address(best, postcode)
-    if not address.get("address_line1"): return None
-    address["raw"] = clean_address_fragment(best)
-    address["confidence"] = round(best_score, 2)
-    print(f"DEBUG ADDR: Extracted CZ address: {address}")
-    return address
-
-def extract_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
-    # Prioritize UK addresses for English context
-    res = extract_uk_address_from_text(text)
-    if res: return res
-    return extract_cz_address_from_text(text)
-
-def extract_uk_address_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not text: return None
-    print(f"DEBUG ADDR UK: Scanning text: {text[:100]}...")
-    raw_lines = [line.strip() for line in str(text).replace("\r", "\n").split("\n")]
-    lines = [line for line in raw_lines if line]
-    candidates: List[str] = []
-    for index, line in enumerate(lines):
-        if UK_POSTCODE_RE.search(line):
-            candidates.append(line)
-            for match in UK_POSTCODE_RE.finditer(line):
-                start = max(0, match.start() - 140)
-                end = min(len(line), match.end() + 80)
-                candidates.append(line[start:end])
-            if index > 0:
-                candidates.append(f"{lines[index - 1]}, {line}")
-            if index > 1:
-                candidates.append(f"{lines[index - 2]}, {lines[index - 1]}, {line}")
-    if not candidates:
-        for chunk in re.split(r"[;\n]", str(text)):
-            if UK_POSTCODE_RE.search(chunk):
-                candidates.append(chunk)
-
-    print(f"DEBUG ADDR UK: Found {len(candidates)} candidates.")
-    best = None
-    best_score = 0.0
-    for candidate in candidates:
-        score = score_address_candidate(candidate)
-        print(f"DEBUG ADDR UK: Candidate [{candidate}] score: {score}")
-        if score > best_score:
-            best = candidate
-            best_score = score
-
-    if not best or best_score < 0.65:
-        if best: print(f"DEBUG ADDR UK: Rejected [{best}] due to low score {best_score}")
-        return None
-    postcode = normalize_postcode(best)
-    if not postcode: return None
-    address = split_uk_address(best, postcode)
-    if not address.get("address_line1"): return None
-    address["raw"] = clean_address_fragment(best)
-    address["confidence"] = round(best_score, 2)
-    print(f"DEBUG ADDR UK: Extracted: {address}")
-    return address
-
-def extract_whatsapp_phone_from_text(*parts: Optional[str]) -> Optional[str]:
-    text = "\n".join(part for part in parts if part)
-    match = PHONE_IN_TEXT_RE.search(text)
-    return match.group(1) if match else None
-
-def find_client_by_whatsapp_phone(cur, tenant_id: int, phone: Optional[str]) -> Optional[Dict[str, Any]]:
-    normalized = normalize_whatsapp_phone(phone)
-    if not normalized:
-        return None
-    cur.execute("""SELECT id, display_name, phone_primary, billing_address_line1, billing_city,
-                          billing_postcode, billing_country
-                   FROM clients
-                   WHERE tenant_id=%s AND deleted_at IS NULL""", (tenant_id,))
-    for row in cur.fetchall():
-        client = dict(row)
-        if normalize_whatsapp_phone(client.get("phone_primary")) == normalized:
-            return client
-    return None
-
-def find_client_by_voice_name(cur, tenant_id: int, name: Optional[str]) -> Optional[Dict[str, Any]]:
-    normalized_target = normalize_voice_name_key(name)
-    if not normalized_target:
-        return None
-    target_tokens = [token for token in normalized_target.split() if token]
-    cur.execute("""
-        SELECT id, display_name, phone_primary, phone_secondary
-        FROM clients
-        WHERE tenant_id=%s AND deleted_at IS NULL
-    """, (tenant_id,))
-    ranked = []
-    for row in cur.fetchall():
-        client = dict(row)
-        normalized_name = normalize_voice_name_key(client.get("display_name"))
-        if not normalized_name:
-            continue
-        tokens = [token for token in normalized_name.split() if token]
-        score = None
-        if normalized_name == normalized_target:
-            score = 0
-        elif target_tokens and all(token in tokens for token in target_tokens):
-            score = 10 + abs(len(tokens) - len(target_tokens))
-        elif normalized_target in normalized_name or normalized_name in normalized_target:
-            score = 20 + abs(len(normalized_name) - len(normalized_target))
-        elif target_tokens:
-            overlap = sum(1 for token in target_tokens if token in tokens)
-            if overlap:
-                score = 60 - (overlap * 5) + abs(len(tokens) - len(target_tokens))
-        if score is None:
-            continue
-        ranked.append((
-            score,
-            1 if not (client.get("phone_primary") or client.get("phone_secondary")) else 0,
-            abs(len(normalized_name) - len(normalized_target)),
-            len(normalized_name),
-            client,
-        ))
-    if not ranked:
-        return None
-    ranked.sort(key=lambda item: item[:4])
-    return ranked[0][4]
-
-def client_info_score(row: Dict[str, Any]) -> int:
-    keys = [
-        "display_name", "first_name", "last_name", "company_name", "phone_primary",
-        "email_primary", "billing_address_line1", "billing_city", "billing_postcode", "website"
-    ]
-    return sum(1 for key in keys if row.get(key))
-
-def find_matching_clients(cur, tenant_id: int, normalized_phone: str, normalized_email: str):
-    if not normalized_phone and not normalized_email:
-        return []
-    cur.execute("SELECT * FROM clients WHERE tenant_id=%s AND deleted_at IS NULL", (tenant_id,))
-    rows = [dict(row) for row in cur.fetchall()]
-    matches = []
-    for row in rows:
-        client_phone = normalize_contact_phone(row.get("phone_primary"))
-        client_email = normalize_email(row.get("email_primary"))
-        if (normalized_phone and client_phone == normalized_phone) or (normalized_email and client_email == normalized_email):
-            matches.append(row)
-    return matches
-
-def load_selected_contact_rows(cur, tenant_id: int, normalized_phone: str, normalized_email: str, linked_client_id: Optional[int] = None):
-    clauses = []
-    params: List[Any] = [tenant_id]
-    if linked_client_id:
-        clauses.append("linked_client_id = %s")
-        params.append(linked_client_id)
-    if normalized_phone:
-        clauses.append("normalized_phone = %s")
-        params.append(normalized_phone)
-    if normalized_email:
-        clauses.append("normalized_email = %s")
-        params.append(normalized_email)
-    if not clauses:
-        return []
-    cur.execute(f"""SELECT * FROM user_contact_sync
-        WHERE tenant_id=%s AND is_client=TRUE AND ({' OR '.join(clauses)})""", params)
-    return [dict(row) for row in cur.fetchall()]
-
-def merge_contact_rows_into_client(conn, tenant_id: int, primary_client_id: int, selected_rows: List[Dict[str, Any]], existing_client: Optional[Dict[str, Any]] = None):
-    if not selected_rows:
-        return
-    with conn.cursor() as cur:
-        if existing_client is None:
-            cur.execute("SELECT * FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (primary_client_id, tenant_id))
-            existing_client = dict(cur.fetchone() or {})
-        names = [clean_contact_display_name(row.get("display_name")) for row in selected_rows]
-        phones = [row.get("phone_primary") for row in selected_rows]
-        emails = [row.get("email_primary") for row in selected_rows]
-        address_lines = [row.get("address_line1") or row.get("address") for row in selected_rows]
-        cities = [row.get("city") for row in selected_rows]
-        postcodes = [row.get("postcode") for row in selected_rows]
-        countries = [row.get("country") for row in selected_rows]
-        display_name = choose_preferred_value(clean_contact_display_name(existing_client.get("display_name")), *names)
-        phone_primary = choose_preferred_value(existing_client.get("phone_primary"), *phones)
-        email_primary = choose_preferred_value(existing_client.get("email_primary"), *emails)
-        billing_address_line1 = choose_preferred_value(*address_lines) or existing_client.get("billing_address_line1")
-        billing_city = choose_preferred_value(*cities) or existing_client.get("billing_city")
-        billing_postcode = choose_preferred_value(*postcodes) or existing_client.get("billing_postcode")
-        billing_country = choose_preferred_value(*countries) or existing_client.get("billing_country") or "GB"
-        cur.execute("""UPDATE clients
-            SET display_name=%s,
-                phone_primary=%s,
-                email_primary=%s,
-                billing_address_line1=%s,
-                billing_city=%s,
-                billing_postcode=%s,
-                billing_country=%s,
-                source=COALESCE(source, 'synced_contact'),
-                updated_at=now()
-            WHERE id=%s AND tenant_id=%s""",
-            (
-                display_name,
-                phone_primary,
-                email_primary,
-                billing_address_line1,
-                billing_city,
-                billing_postcode,
-                billing_country,
-                primary_client_id,
-                tenant_id,
-            ))
-
-def reconcile_contact_selection(conn, tenant_id: int, user_id: int, contact_key: str):
-    with conn.cursor() as cur:
-        cur.execute("""SELECT * FROM user_contact_sync
-            WHERE tenant_id=%s AND user_id=%s AND contact_key=%s""", (tenant_id, user_id, contact_key))
-        row = cur.fetchone()
-        if not row:
-            return None
-        row = dict(row)
-        linked_client_id = row.get("linked_client_id")
-        normalized_phone = row.get("normalized_phone") or ""
-        normalized_email = row.get("normalized_email") or ""
-        if not row.get("is_client"):
-            if linked_client_id:
-                cur.execute("""SELECT COUNT(*) AS c FROM user_contact_sync
-                    WHERE tenant_id=%s AND linked_client_id=%s AND is_client=TRUE""", (tenant_id, linked_client_id))
-                selected_count = int((cur.fetchone() or {}).get("c") or 0)
-                if selected_count == 0:
-                    cur.execute("SELECT source FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (linked_client_id, tenant_id))
-                    client = cur.fetchone()
-                    if client and (client.get("source") or "") == "synced_contact":
-                        cur.execute("UPDATE clients SET deleted_at=now(), status='archived', updated_at=now() WHERE id=%s AND tenant_id=%s", (linked_client_id, tenant_id))
-                cur.execute("""UPDATE user_contact_sync
-                    SET linked_client_id=NULL, updated_at=now()
-                    WHERE tenant_id=%s AND user_id=%s AND contact_key=%s""", (tenant_id, user_id, contact_key))
-            return None
-
-        selected_rows = load_selected_contact_rows(cur, tenant_id, normalized_phone, normalized_email, linked_client_id)
-        matches = find_matching_clients(cur, tenant_id, normalized_phone, normalized_email)
-        primary = max(matches, key=client_info_score) if matches else None
-        if primary is None:
-            code_seed = normalized_phone[-6:] if normalized_phone else uuid.uuid4().hex[:6].upper()
-            code = f"CL-SYNC-{code_seed.upper()}"
-            address = extract_contact_address_fields(row)
-            cur.execute("""INSERT INTO clients (
-                    tenant_id, client_code, client_type, display_name, phone_primary, email_primary,
-                    billing_address_line1, billing_city, billing_postcode, billing_country, status, source
-                )
-                VALUES (%s,%s,'individual',%s,%s,%s,%s,%s,%s,%s,'active','synced_contact')
-                RETURNING *""",
-                (
-                    tenant_id,
-                    code,
-                    clean_contact_display_name(row.get("display_name")) or "Client",
-                    row.get("phone_primary"),
-                    row.get("email_primary"),
-                    address.get("address_line1") or address.get("address"),
-                    address.get("city"),
-                    address.get("postcode"),
-                    address.get("country") or "GB",
-                ))
-            primary = dict(cur.fetchone())
-        merge_contact_rows_into_client(conn, tenant_id, primary["id"], selected_rows, primary)
-        for duplicate in matches:
-            if duplicate["id"] == primary["id"]:
-                continue
-            if (duplicate.get("source") or "") == "synced_contact":
-                cur.execute("""UPDATE clients
-                    SET deleted_at=now(), status='archived', updated_at=now()
-                    WHERE id=%s AND tenant_id=%s""", (duplicate["id"], tenant_id))
-        cur.execute("""UPDATE user_contact_sync
-            SET linked_client_id=%s, updated_at=now()
-            WHERE tenant_id=%s AND is_client=TRUE
-              AND (linked_client_id=%s OR normalized_phone=%s OR normalized_email=%s)""",
-            (primary["id"], tenant_id, primary["id"], normalized_phone or None, normalized_email or None))
-        return primary["id"]
-
-def ensure_contact_section(cur, tenant_id: int, section_code: str):
-    cur.execute("""SELECT section_code, display_name
-        FROM contact_sections
-        WHERE tenant_id=%s AND section_code=%s AND is_active=TRUE""", (tenant_id, section_code))
-    section = cur.fetchone()
-    if not section:
-        raise HTTPException(404, "Contact section not found")
-    return dict(section)
-
-def find_shared_contact(cur, tenant_id: int, normalized_phone: str, normalized_email: str):
-    if not normalized_phone and not normalized_email:
-        return None
-    clauses = []
-    params: List[Any] = [tenant_id]
-    if normalized_phone:
-        clauses.append("normalized_phone=%s")
-        params.append(normalized_phone)
-    if normalized_email:
-        clauses.append("normalized_email=%s")
-        params.append(normalized_email)
-    cur.execute(f"""SELECT *
-        FROM shared_contacts
-        WHERE tenant_id=%s AND deleted_at IS NULL AND ({' OR '.join(clauses)})
-        ORDER BY updated_at DESC LIMIT 1""", params)
-    row = cur.fetchone()
-    return dict(row) if row else None
-
-def merge_shared_contact(cur, tenant_id: int, user_id: Optional[int], data: Dict[str, Any], source: str = "manual"):
-    section_code = normalize_section_code(data.get("section_code"))
-    if not section_code:
-        raise HTTPException(400, "section_code required")
-    ensure_contact_section(cur, tenant_id, section_code)
-    display_name = clean_contact_display_name(data.get("display_name") or data.get("name"))
-    if not display_name:
-        raise HTTPException(400, "display_name required")
-    company_name = (data.get("company_name") or "").strip() or None
-    phone_primary = (data.get("phone_primary") or data.get("phone") or "").strip() or None
-    email_primary = (data.get("email_primary") or data.get("email") or "").strip() or None
-    address_fields = extract_contact_address_fields(data)
-    notes = (data.get("notes") or "").strip() or None
-    normalized_phone = normalize_phone(phone_primary)
-    normalized_email = normalize_email(email_primary)
-    existing = find_shared_contact(cur, tenant_id, normalized_phone, normalized_email)
-    if existing:
-        cur.execute("""UPDATE shared_contacts
-            SET section_code=%s,
-                display_name=%s,
-                company_name=%s,
-                phone_primary=%s,
-                email_primary=%s,
-                address=%s,
-                address_line1=%s,
-                city=%s,
-                postcode=%s,
-                country=%s,
-                notes=%s,
-                source=%s,
-                normalized_phone=%s,
-                normalized_email=%s,
-                updated_by=%s,
-                updated_at=now()
-            WHERE id=%s AND tenant_id=%s
-            RETURNING *""",
-            (
-                section_code,
-                choose_preferred_value(clean_contact_display_name(existing.get("display_name")), display_name),
-                choose_preferred_value(existing.get("company_name"), company_name),
-                choose_preferred_value(existing.get("phone_primary"), phone_primary),
-                choose_preferred_value(existing.get("email_primary"), email_primary),
-                address_fields.get("address") or existing.get("address"),
-                address_fields.get("address_line1") or existing.get("address_line1"),
-                address_fields.get("city") or existing.get("city"),
-                address_fields.get("postcode") or existing.get("postcode"),
-                address_fields.get("country") or existing.get("country"),
-                choose_preferred_value(existing.get("notes"), notes),
-                existing.get("source") or source,
-                normalized_phone or existing.get("normalized_phone"),
-                normalized_email or existing.get("normalized_email"),
-                user_id,
-                existing["id"],
-                tenant_id,
-            ))
-        return dict(cur.fetchone()), False
-    cur.execute("""INSERT INTO shared_contacts
-        (tenant_id, section_code, display_name, company_name, phone_primary, email_primary,
-         address, address_line1, city, postcode, country, notes, source,
-         normalized_phone, normalized_email, created_by, updated_by)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        RETURNING *""",
-        (
-            tenant_id,
-            section_code,
-            display_name,
-            company_name,
-            phone_primary,
-            email_primary,
-            address_fields.get("address"),
-            address_fields.get("address_line1"),
-            address_fields.get("city"),
-            address_fields.get("postcode"),
-            address_fields.get("country"),
-            notes,
-            source,
-            normalized_phone or None,
-            normalized_email or None,
-            user_id,
-            user_id,
-        ))
-    return dict(cur.fetchone()), True
-
-def run_startup_bootstrap():
+@app.on_event("startup")
+async def startup():
     init_pool()
     try:
         conn = get_db_conn()
@@ -5202,38 +438,9 @@ def run_startup_bootstrap():
         release_conn(conn)
     except Exception as e: print(f"Schema check: {e}")
 
-def ensure_contact_address_schema():
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            for table in ("user_contact_sync", "shared_contacts"):
-                for column in ("address", "address_line1", "city", "postcode", "country"):
-                    cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} TEXT")
-            conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"Contact address schema check: {e}")
-    finally:
-        release_conn(conn)
-
-def close_db_pool():
+@app.on_event("shutdown")
+async def shutdown():
     if db_pool: db_pool.closeall()
-
-@asynccontextmanager
-async def app_lifespan(_: FastAPI):
-    run_startup_bootstrap()
-    ensure_contact_address_schema()
-    ensure_quote_items_table()
-    ensure_hierarchy_workflow_schema()
-    print(
-        "Startup routes: "
-        f"admin_activity_log={any(getattr(route, 'path', None) == '/admin/activity-log' for route in app.routes)} "
-        f"nature_services_status={any(getattr(route, 'path', None) == '/nature/services/status' for route in app.routes)}"
-    )
-    yield
-    close_db_pool()
-
-app.router.lifespan_context = app_lifespan
 
 # === MODELS ===
 class ChatMessage(BaseModel):
@@ -5243,29 +450,14 @@ class MessageRequest(BaseModel):
     text: str; history: List[ChatMessage] = []
     context_entity_id: Optional[int] = None; context_type: Optional[str] = None
     calendar_context: Optional[str] = None; current_datetime: Optional[str] = None
-    internal_language: Optional[str] = None  # assistant-side override (rare)
-    external_language: Optional[str] = None  # customer override (rare)
-    customer_id: Optional[int] = None
+    internal_language: Optional[str] = None; external_language: Optional[str] = None
 
 # === AI PROCESS ===
 @app.post("/process")
-async def process_message(msg: MessageRequest, request: Request):
+async def process_message(msg: MessageRequest):
+    if not ai_client: return {"reply_cs": "AI neni nakonfigurovana."}
     try:
         now = msg.current_datetime or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        audit_request_event(
-            request,
-            action="assistant_query",
-            description=msg.text,
-            entity_type="assistant",
-            entity_id=msg.context_entity_id or "general",
-            details={
-                "context_type": msg.context_type,
-                "context_entity_id": msg.context_entity_id,
-                "internal_language": msg.internal_language,
-                "external_language": msg.external_language,
-            },
-            source_channel="text",
-        )
         entity_ctx = ""
         if msg.context_entity_id and msg.context_type == "client":
             conn = get_db_conn()
@@ -5273,156 +465,41 @@ async def process_message(msg: MessageRequest, request: Request):
                 with conn.cursor() as cur:
                     cur.execute("SELECT display_name,email_primary,phone_primary FROM clients WHERE id=%s", (msg.context_entity_id,))
                     r = cur.fetchone()
-                    if r: entity_ctx = f"Aktualni klient: {r['display_name']}"
+                    if r: entity_ctx = f"Marek se diva na klienta: {r['display_name']}"
             finally: release_conn(conn)
 
-        tenant_id = get_request_tenant_id(request)
-        request_user = getattr(request.state, "user", {}) or {}
-        current_user_id = request_user.get("user_id")
+        # Language from tenant config + request override
+        tenant_config = get_tenant_config(conn if 'conn' in dir() else get_db_conn(), 1)
+        lang = resolve_response_language(tenant_config, msg.internal_language)
+        if lang == "cs":
+            lang_instruction = "JAZYK: Odpovídej VÝHRADNĚ česky. Celá tvoje odpověď musí být v češtině. Nikdy nepřepínej do jiného jazyka. Uživatel může psát česky, anglicky nebo polsky — ty VŽDY odpovídáš POUZE česky."
+        elif lang == "en":
+            lang_instruction = "LANGUAGE: You MUST respond EXCLUSIVELY in English. Your entire response must be in English. Never switch to another language. The user may write in Czech, English or Polish — you ALWAYS respond ONLY in English."
+        elif lang == "pl":
+            lang_instruction = "JĘZYK: Odpowiadaj WYŁĄCZNIE po polsku. Cała twoja odpowiedź musi być po polsku. Nigdy nie przełączaj się na inny język. Użytkownik może pisać po czesku, angielsku lub polsku — ty ZAWSZE odpowiadasz TYLKO po polsku."
+        else:
+            lang_instruction = "LANGUAGE: Respond in English only."
 
-        # Language: resolve internal (assistant) + external (customer)
-        tenant_conn = get_db_conn()
-        try:
-            tenant_config = get_tenant_config(tenant_conn, tenant_id)
-        finally:
-            release_conn(tenant_conn)
-
-        customer_lang = get_customer_output_language(msg.customer_id, tenant_id)
-        assistant_lang_info = get_assistant_internal_language(current_user_id, tenant_id)
-        assistant_lang  = assistant_lang_info.get("lang",  DEFAULT_ASSISTANT_LANG)
-        assistant_tone  = assistant_lang_info.get("tone",  DEFAULT_ASSISTANT_TONE)
-        assistant_style = assistant_lang_info.get("style", DEFAULT_ASSISTANT_STYLE)
-
-        internal_lang = assistant_lang if assistant_lang_info.get("locked", True) else normalize_language_code(msg.internal_language, assistant_lang)
-        external_lang = normalize_language_code(customer_lang, DEFAULT_CUSTOMER_LANG)
-
-        lang_instruction = (
-            "Always work internally in {internal}. "
-            "Always respond to the customer in {external}. "
-            "If no customer language is stored, use English UK (en-GB) with British spelling. "
-            "Never switch language based only on the input message. "
-            "Tone: {tone}. Style: {style}."
-        ).format(internal=internal_lang, external=external_lang,
-                 tone=assistant_tone, style=assistant_style)
-
-        def tr(en: str, cs: str, pl: str) -> str:
-            short = normalize_language_short(external_lang, "en")
-            return cs if short == "cs" else en if short == "en" else pl if short == "pl" else en
-
-        def error_reply(e: Exception, prefix_en: str = "Error", prefix_cs: str = "Chyba", prefix_pl: str = "Błąd"):
-            return {"reply_cs": f"{tr(prefix_en, prefix_cs, prefix_pl)}: {e}"}
-
-        memory_command = extract_assistant_memory_command(msg.text)
-        if memory_command:
-            memory_action, memory_text, memory_type = memory_command
-            memory_conn = get_db_conn()
-            try:
-                if memory_action == "remember":
-                    remembered = remember_assistant_memory(memory_conn, tenant_id, current_user_id, memory_text, memory_type)
-                    memory_conn.commit()
-                    reply = tr(
-                        f"I will remember: {memory_text}",
-                        f"Zapamatovala jsem si: {memory_text}",
-                        f"Zapamiętałam: {memory_text}",
-                    )
-                    return {"reply_cs": reply, "action_type": "MEMORY_REMEMBERED", "action_data": remembered}
-                forgotten = forget_assistant_memory(memory_conn, tenant_id, current_user_id, memory_text)
-                memory_conn.commit()
-                if forgotten["count"] > 0:
-                    reply = tr(
-                        f"I forgot {forgotten['count']} matching memory item(s).",
-                        f"Zapomněla jsem {forgotten['count']} odpovídající položek paměti.",
-                        f"Zapomniałam {forgotten['count']} pasujących pozycji pamięci.",
-                    )
-                else:
-                    reply = tr(
-                        "I did not find a matching memory item to forget.",
-                        "Nenašla jsem odpovídající položku paměti ke smazání.",
-                        "Nie znalazłam pasującej pozycji pamięci do usunięcia.",
-                    )
-                return {"reply_cs": reply, "action_type": "MEMORY_FORGOTTEN", "action_data": forgotten}
-            except Exception as e:
-                memory_conn.rollback()
-                return error_reply(e)
-            finally:
-                release_conn(memory_conn)
-
-        if not ai_client:
-            return {"reply_cs": tr("AI is not configured.", "AI neni nakonfigurovana.", "AI nie jest skonfigurowane.")}
-
-        memory_ctx = "None."
-        memory_conn = get_db_conn()
-        try:
-            memories = load_assistant_memories(memory_conn, tenant_id, current_user_id)
-            # Also load recent session summaries (last 5)
-            session_memories = []
-            try:
-                cur_mem = memory_conn.cursor()
-                cur_mem.execute(
-                    """SELECT content, created_at FROM crm.assistant_memory
-                       WHERE tenant_id = %s AND user_id IS NOT DISTINCT FROM %s
-                         AND memory_type = 'session' AND is_active = TRUE
-                       ORDER BY created_at DESC LIMIT 5""",
-                    (tenant_id, current_user_id)
-                )
-                session_memories = cur_mem.fetchall()
-            except Exception:
-                pass
-            parts = []
-            if memories:
-                parts.append("Remembered facts:\n" + "\n".join(f"- {item['content']}" for item in memories))
-            if session_memories:
-                parts.append("Recent conversations:\n" + "\n".join(
-                    f"- [{row[1].strftime('%Y-%m-%d %H:%M') if hasattr(row[1], 'strftime') else str(row[1])[:16]}] {row[0]}"
-                    for row in session_memories
-                ))
-            if parts:
-                memory_ctx = "\n\n".join(parts)
-        except Exception as e:
-            print(f"Memory load warning: {e}")
-        finally:
-            release_conn(memory_conn)
-
-        # Load tenant settings for dynamic voice prompt
-        _ts_conn2 = get_db_conn()
-        try:
-            _ts = _get_tenant_settings(_ts_conn2, tenant_id)
-        except Exception:
-            _ts = {}
-        finally:
-            release_conn(_ts_conn2)
-        _ts_company   = _ts.get("company_name") or "the company"
-        _ts_industry  = _ts.get("industry_description") or "business services"
-        _ts_location  = _ts.get("default_location") or ""
-        _ts_loc_str   = f", {_ts_location}" if _ts_location else ""
-
-        system_prompt = f"""You are an intelligent VOICE secretary of {_ts_company} ({_ts_industry}{_ts_loc_str}).
+        system_prompt = f"""You are an intelligent VOICE secretary of DesignLeaf company (landscaping services, Oxfordshire UK).
 {lang_instruction}
 TIME: {now}. CONTEXT: {entity_ctx or 'None.'}
 CALENDAR: {msg.calendar_context or 'None.'}
-MEMORY:
-{memory_ctx}
 RULES:
 - You are a VOICE assistant. The user speaks to you and you speak back. NEVER say you can only communicate via text. NEVER say you are a text-based AI. You ARE a voice assistant.
 - Be concise, human, friendly. Remember conversation history.
 - NEVER say 'executing...' or 'performing...' — always respond naturally describing what you did.
-- To create a task use create_task. To change status, planning or assignment use update_task. To complete use complete_task.
+- To create a task use create_task. To change status use update_task. To complete use complete_task.
 - To list tasks use list_tasks.
-- For jobs: create_job for new, update_job for status changes, planning and handover.
+- For jobs: create_job for new, update_job for status change.
 - For notes: add_note with entity_type 'client' or 'job'.
 - For leads: create_lead.
 - For calendar: list_calendar_events, add/modify/delete_calendar_event.
 - For contacts: search_contacts, call_contact.
-- For navigation, maps, route, directions, "navigace", "naviguj", "spust mapy", or "nawigacja", use start_navigation. Do not give instructions; return the action so Android opens maps directly.
-- When the user says 'zapamatuj si', 'pamatuj si', 'remember', or 'zapamiętaj', save the fact with remember_memory.
-- When the user says 'zapomeň', 'forget', or 'zapomnij', remove matching facts with forget_memory.
 - When user asks 'what do I have to do' or 'my tasks', use list_tasks.
 - When user says 'done' or 'completed' for a task, use complete_task.
 - When user says 'work report', 'log work', 'enter hours', 'report work', use start_work_report.
 - When user asks about weather, forecast, rain, temperature, wind, or whether to work outside, use get_weather.
-- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Pass the contact plus the message content naturally in the user's current/internal language; the server resolves the contact and translates the outgoing message to the customer's configured language before Android opens WhatsApp.
-- For email inbox: use search_email to find messages, read_email to read a message or latest matching message aloud, and reply_email to answer an existing email thread.
-- For new outbound email use send_email. For replies to an existing incoming email always use reply_email so the reply goes to the original sender.
+- When user says 'napis na whatsapp', 'posli whatsapp', 'whatsapp message', use send_whatsapp. Find client by name, get their phone, send message.
 - When user asks about clients database, how many clients, client statistics, sources, types, or any question about CRM data, use query_clients. Examples: 'kolik mam klientu', 'odkud jsou klienti', 'jaci klienti jsou aktivni', 'kolik mam zakazek', 'statistiky', 'prehled databaze'."""
 
         tools = [
@@ -5431,26 +508,20 @@ RULES:
             {"type":"function","function":{"name":"delete_calendar_event","description":"Smaze udalost","parameters":{"type":"object","properties":{"event_title":{"type":"string"}},"required":["event_title"]}}},
             {"type":"function","function":{"name":"list_calendar_events","description":"Precte kalendar na N dni","parameters":{"type":"object","properties":{"days":{"type":"integer","default":7}}}}},
             {"type":"function","function":{"name":"search_contacts","description":"Hleda v CRM klientech i telefonnich kontaktech","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
-            {"type":"function","function":{"name":"call_contact","description":"Vytoci telefonni kontakt. Pokud neni zname cislo, vypln contact_name a Android kontakt dohleda v mobilu/CRM.","parameters":{"type":"object","properties":{"phone":{"type":"string"},"contact_name":{"type":"string"},"client_name":{"type":"string"}}}}},
-            {"type":"function","function":{"name":"start_navigation","description":"Otevre navigaci/mapy v Android telefonu na kontakt, klienta nebo adresu. Pouzij pro prikazy typu naviguj, spust navigaci, spust mapy, route, directions, nawigacja.","parameters":{"type":"object","properties":{"target":{"type":"string","description":"Jmeno kontaktu/klienta nebo adresa"},"address":{"type":"string","description":"Adresa, pokud ji uz znas"},"client_name":{"type":"string","description":"Jmeno CRM klienta"},"contact_name":{"type":"string","description":"Jmeno telefonniho kontaktu"}}}}},
+            {"type":"function","function":{"name":"call_contact","description":"Vytoci telefonni cislo","parameters":{"type":"object","properties":{"phone":{"type":"string"}},"required":["phone"]}}},
             {"type":"function","function":{"name":"send_email","description":"Posle email","parameters":{"type":"object","properties":{"to":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},"required":["to","subject","body"]}}},
-            {"type":"function","function":{"name":"search_email","description":"Vyhleda emaily ve schrankce podle textu, odesilatele nebo neprectenych zprav.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Text hledany v predmetu, odesilateli nebo tele emailu"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"unread_only":{"type":"boolean","default":False},"limit":{"type":"integer","default":5}}}}},
-            {"type":"function","function":{"name":"read_email","description":"Precte posledni nebo konkretni email. Pouzij pro 'precti email', 'otevri email', 'precti posledni email od ...'.","parameters":{"type":"object","properties":{"uid":{"type":"string","description":"UID emailu z vysledku search_email"},"query":{"type":"string","description":"Text pro nalezeni emailu, pokud UID neni znamy"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"unread_only":{"type":"boolean","default":False}}}}},
-            {"type":"function","function":{"name":"reply_email","description":"Odpovi na existujici email. Najde email podle UID nebo dotazu a posle odpoved puvodnimu odesilateli pres SMTP.","parameters":{"type":"object","properties":{"uid":{"type":"string","description":"UID emailu z vysledku search_email/read_email"},"query":{"type":"string","description":"Text pro nalezeni emailu, pokud UID neni znamy"},"sender":{"type":"string","description":"Jmeno nebo email odesilatele"},"body":{"type":"string","description":"Text odpovedi"}},"required":["body"]}}},
             {"type":"function","function":{"name":"create_client","description":"Vytvori noveho klienta v CRM","parameters":{"type":"object","properties":{"name":{"type":"string"},"email":{"type":"string"},"phone":{"type":"string"}},"required":["name"]}}},
-            {"type":"function","function":{"name":"create_task","description":"Vytvori ukol. Pouzij pro: zavolat, email, schuzka, objednavka, kalkulace, kontrola, pripomenuti.","parameters":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"task_type":{"type":"string","enum":["volat","email","schuzka","objednat_material","vytvorit_kalkulaci","poslat_kalkulaci","navsteva_klienta","zamereni","realizace","kontrola","reklamace","pripomenout_se","interni_poznamka","fotodokumentace"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"deadline":{"type":"string"},"planned_date":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"assigned_to":{"type":"string"},"planning_note":{"type":"string"},"client_name":{"type":"string"}},"required":["title"]}}},
-            {"type":"function","function":{"name":"create_job","description":"Vytvori novou zakazku","parameters":{"type":"object","properties":{"title":{"type":"string"},"client_name":{"type":"string"},"description":{"type":"string"},"start_date":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"assigned_to":{"type":"string"},"handover_note":{"type":"string"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"create_task","description":"Vytvori ukol. Pouzij pro: zavolat, email, schuzka, objednavka, kalkulace, kontrola, pripomenuti.","parameters":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"task_type":{"type":"string","enum":["volat","email","schuzka","objednat_material","vytvorit_kalkulaci","poslat_kalkulaci","navsteva_klienta","zamereni","realizace","kontrola","reklamace","pripomenout_se","interni_poznamka","fotodokumentace"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"deadline":{"type":"string"},"assigned_to":{"type":"string"},"client_name":{"type":"string"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"create_job","description":"Vytvori novou zakazku","parameters":{"type":"object","properties":{"title":{"type":"string"},"client_name":{"type":"string"},"description":{"type":"string"},"start_date":{"type":"string"}},"required":["title"]}}},
             {"type":"function","function":{"name":"add_note","description":"Prida poznamku ke klientovi nebo zakazce","parameters":{"type":"object","properties":{"entity_type":{"type":"string","enum":["client","job"]},"entity_name":{"type":"string"},"note":{"type":"string"}},"required":["entity_type","note"]}}},
             {"type":"function","function":{"name":"create_lead","description":"Vytvori novy lead/poptavku","parameters":{"type":"object","properties":{"name":{"type":"string"},"source":{"type":"string","enum":["checkatrade","web","telefon","doporuceni","jiny"]},"note":{"type":"string"}},"required":["name","source"]}}},
-            {"type":"function","function":{"name":"update_task","description":"Zmeni stav, prioritu, vysledek, plan nebo prirazeni ukolu","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev ukolu k nalezeni"},"status":{"type":"string","enum":["novy","naplanovany","v_reseni","ceka_na_klienta","ceka_na_material","ceka_na_platbu","hotovo","zruseno","predano_dal"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"result":{"type":"string","description":"Vysledek ukolu"},"assigned_to":{"type":"string"},"planned_date":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planning_note":{"type":"string"}},"required":["title"]}}},
-            {"type":"function","function":{"name":"update_job","description":"Zmeni stav, plan nebo predani zakazky","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev zakazky"},"status":{"type":"string","enum":["nova","v_reseni","ceka_na_klienta","ceka_na_material","naplanovano","v_realizaci","dokonceno","vyfakturovano","uzavreno","pozastaveno","zruseno"]},"assigned_to":{"type":"string"},"planned_start_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"planned_end_at":{"type":"string","description":"ISO format YYYY-MM-DDTHH:MM:SS"},"handover_note":{"type":"string"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"update_task","description":"Zmeni stav, prioritu nebo vysledek ukolu","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev ukolu k nalezeni"},"status":{"type":"string","enum":["novy","naplanovany","v_reseni","ceka_na_klienta","ceka_na_material","ceka_na_platbu","hotovo","zruseno","predano_dal"]},"priority":{"type":"string","enum":["nizka","bezna","vysoka","urgentni","kriticka"]},"result":{"type":"string","description":"Vysledek ukolu"}},"required":["title"]}}},
+            {"type":"function","function":{"name":"update_job","description":"Zmeni stav zakazky","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Nazev zakazky"},"status":{"type":"string","enum":["nova","v_reseni","ceka_na_klienta","ceka_na_material","naplanovano","v_realizaci","dokonceno","vyfakturovano","uzavreno","pozastaveno","zruseno"]}},"required":["title"]}}},
             {"type":"function","function":{"name":"list_tasks","description":"Vypise ukoly podle filtru","parameters":{"type":"object","properties":{"status":{"type":"string"},"client_name":{"type":"string"},"only_active":{"type":"boolean"}}}}},
             {"type":"function","function":{"name":"complete_task","description":"Dokonci ukol a zapise vysledek","parameters":{"type":"object","properties":{"title":{"type":"string"},"result":{"type":"string","description":"Co bylo udelano"}},"required":["title"]}}},
-            {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz uzivatel rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
-            {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: tenant default_location"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
-            {"type":"function","function":{"name":"send_whatsapp","description":"Otevre WhatsApp v mobilu s predvyplnenou zpravou pro kontakt nebo klienta. Message ma byt prirozeny obsah v internim jazyce uzivatele; server ji prelozi do nastaveneho jazyka komunikace se zakaznikem.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta nebo kontaktu"},"contact_name":{"type":"string","description":"Jmeno kontaktu, pokud nejde o CRM klienta"},"phone":{"type":"string","description":"Telefonni cislo, pokud je zname"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["message"]}}},
-            {"type":"function","function":{"name":"remember_memory","description":"Ulozi dlouhodobou nebo strednedobou pamet asistenta. Pouzij pro 'zapamatuj si ...', 'pamatuj si ...', 'remember ...'.","parameters":{"type":"object","properties":{"content":{"type":"string","description":"Presny obsah k zapamatovani"},"memory_type":{"type":"string","enum":["medium","long"],"default":"long"}},"required":["content"]}}},
-            {"type":"function","function":{"name":"forget_memory","description":"Smaze odpovidajici polozky pameti asistenta. Pouzij pro 'zapomen ...', 'forget ...'.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Co se ma zapomenout"}},"required":["query"]}}},
+            {"type":"function","function":{"name":"start_work_report","description":"Spusti hlasovy work report dialog. Pouzij kdyz Marek rekne ze chce zadat praci, work report, zapsat hodiny, nahlasit co delali.","parameters":{"type":"object","properties":{}}}},
+            {"type":"function","function":{"name":"get_weather","description":"Zjisti predpoved pocasi. Pouzij kdyz se uzivatel pta na pocasi, teplotu, dest, vitr. Muze se ptat na dnes, zitra, nebo na konkretni den.","parameters":{"type":"object","properties":{"location":{"type":"string","description":"Nazev mesta nebo GPS souradnice. Default: Didcot, Oxfordshire"},"days":{"type":"integer","description":"Pocet dni predpovedi (1-7)","default":3}}}}},
+            {"type":"function","function":{"name":"send_whatsapp","description":"Posle WhatsApp zpravu klientovi. Pouzij kdyz uzivatel rekne 'napis na whatsapp', 'posli whatsapp zpravu', 'whatsapp message'.","parameters":{"type":"object","properties":{"client_name":{"type":"string","description":"Jmeno klienta"},"message":{"type":"string","description":"Text zpravy k odeslani"}},"required":["client_name","message"]}}},
             {"type":"function","function":{"name":"query_clients","description":"Dotaz na databazi klientu. Pouzij kdyz se uzivatel pta kolik ma klientu, odkud jsou, jake typy, statistiky CRM, prehled databaze, aktivni/neaktivni klienti, zdroje klientu.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"Co chce uzivatel vedet o klientech/databazi. Napr: 'kolik klientu', 'statistiky', 'odkud jsou klienti', 'aktivni klienti', 'posledni klienti'"}},"required":["question"]}}},
         ]
 
@@ -5472,56 +543,15 @@ RULES:
             if action == "CREATE_CLIENT":
                 conn = get_db_conn()
                 try:
-                    tenant_id = get_request_tenant_id(request)
-                    actor_user_id = request.state.user.get("user_id")
-                    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
-                    owner = get_active_user_row(conn, tenant_id, actor_user_id) or get_default_hierarchy_user(conn, tenant_id)
-                    if not owner:
-                        return error_reply("No active owner is available for the new client.")
                     code = f"CL-{uuid.uuid4().hex[:6].upper()}"
                     with conn.cursor() as cur:
-                        client_display_name = clean_contact_display_name(args["name"])
-                        cur.execute("""INSERT INTO clients (
-                                client_code,client_type,display_name,email_primary,phone_primary,status,tenant_id,owner_user_id,hierarchy_status
-                            ) VALUES (%s,%s,%s,%s,%s,'active',%s,%s,'pending') RETURNING id,display_name""",
-                            (code,"domestic",client_display_name,args.get("email"),args.get("phone"),tenant_id,int(owner["id"])))
-                        client_row = dict(cur.fetchone())
-                        cid = client_row['id']
-                        first_action = create_workflow_task(
-                            conn,
-                            tenant_id,
-                            {
-                                "title": tr("Follow up with new client", "Navázat další krok s novým klientem", "Wykonać kolejny krok z nowym klientem"),
-                                "description": args.get("note") or args.get("description"),
-                                "assigned_user_id": int(owner["id"]),
-                                "planned_start_at": next_business_day_at_nine().isoformat(),
-                                "priority": "vysoka",
-                                "planning_note": "Systémově vytvořený první krok z AI flow.",
-                            },
-                            actor_name=actor_name,
-                            default_client_id=cid,
-                            default_client_name=client_row.get("display_name") or client_display_name,
-                            source="assistant_client_create",
-                        )
-                        set_client_next_action(conn, tenant_id, cid, str(first_action["id"]))
-                        log_activity(
-                            conn,
-                            "client",
-                            cid,
-                            "create",
-                            f"Klient {args['name']} vytvoren",
-                            tenant_id=tenant_id,
-                            user_id=actor_user_id,
-                            source_channel="assistant",
-                            details={"owner_user_id": int(owner["id"]), "next_action_task_id": str(first_action["id"])},
-                        )
+                        cur.execute("INSERT INTO clients (client_code,client_type,display_name,email_primary,phone_primary,status) VALUES (%s,%s,%s,%s,%s,'active') RETURNING id",
+                            (code,"domestic",args["name"],args.get("email"),args.get("phone")))
+                        cid = cur.fetchone()['id']
+                        log_activity(conn,"client",cid,"create",f"Klient {args['name']} vytvoren")
                         conn.commit()
-                    return {"reply_cs": tr(
-                        f"Client {args['name']} ({code}) is now in CRM.",
-                        f"Klient {args['name']} ({code}) je v CRM.",
-                        f"Klient {args['name']} ({code}) jest już w CRM."
-                    ),"action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return error_reply(e)
+                    return {"reply_cs":f"Klient {args['name']} ({code}) je v CRM.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
             if action == "SEARCH_CONTACTS":
@@ -5534,49 +564,24 @@ RULES:
                         cur.execute("SELECT id,client_code,display_name,email_primary,phone_primary FROM clients WHERE deleted_at IS NULL AND (display_name ILIKE %s OR email_primary ILIKE %s OR phone_primary ILIKE %s) LIMIT 10",(s,s,s))
                         crm = [dict(r) for r in cur.fetchall()]
                 finally: release_conn(conn)
-                return {"reply_cs":ai_msg.content or tr(
-                    f"Searching for '{q}'...",
-                    f"Hledam '{q}'...",
-                    f"Szukam '{q}'..."
-                ),"action_type":"SEARCH_CONTACTS","action_data":{"query":q,"crm_results":crm},"is_question":True}
+                return {"reply_cs":ai_msg.content or f"Hledam '{q}'...","action_type":"SEARCH_CONTACTS","action_data":{"query":q,"crm_results":crm},"is_question":True}
 
             if action == "CREATE_TASK":
                 t = args.get("title","Ukol")
                 conn = get_db_conn()
                 try:
-                    tenant_id = get_request_tenant_id(request)
-                    actor_user_id = request.state.user.get("user_id")
-                    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
-                    default_owner = get_active_user_row(conn, tenant_id, actor_user_id) or get_default_hierarchy_user(conn, tenant_id)
-                    task_payload = dict(args)
-                    task_payload.setdefault("assigned_user_id", default_owner["id"] if default_owner else None)
-                    task_payload.setdefault("planned_start_at", next_business_day_at_nine().isoformat())
-                    task_payload.setdefault("priority", "bezna")
-                    task = create_workflow_task(
-                        conn,
-                        tenant_id,
-                        task_payload,
-                        actor_name=actor_name,
-                        default_client_name=args.get("client_name"),
-                        source="hlasovy_prikaz",
-                    )
-                    log_activity(
-                        conn,
-                        "task",
-                        task["id"],
-                        "create",
-                        f"Ukol '{t}' vytvoren",
-                        tenant_id=tenant_id,
-                        user_id=actor_user_id,
-                        source_channel="assistant",
-                    )
-                    conn.commit()
-                    return {"reply_cs":tr(
-                        f"I created a task: {t}.",
-                        f"Vytvořila jsem úkol: {t}.",
-                        f"Utworzyłam zadanie: {t}."
-                    ),"action_type":"CREATE_TASK","action_data":task}
-                except Exception as e: conn.rollback(); return error_reply(e)
+                    tid = str(uuid.uuid4())
+                    with conn.cursor() as cur:
+                        cur.execute("""INSERT INTO tasks (id,title,description,task_type,status,priority,deadline,
+                            assigned_to,client_name,created_by,source) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                            (tid,t,args.get("description"),args.get("task_type","interni_poznamka"),"novy",
+                             args.get("priority","bezna"),args.get("deadline"),args.get("assigned_to"),
+                             args.get("client_name"),"Marek","hlasovy_prikaz"))
+                        task = dict(cur.fetchone())
+                        log_activity(conn,"task",tid,"create",f"Ukol '{t}' vytvoren")
+                        conn.commit()
+                    return {"reply_cs":f"Vytvořila jsem úkol: {t}.","action_type":"CREATE_TASK","action_data":task}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
             if action == "CREATE_JOB":
@@ -5584,69 +589,20 @@ RULES:
                 conn = get_db_conn()
                 try:
                     code = f"JOB-{uuid.uuid4().hex[:6].upper()}"
-                    tenant_id = get_request_tenant_id(request)
-                    actor_user_id = request.state.user.get("user_id")
-                    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
                     cname = args.get("client_name","")
                     cid = None
-                    assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
-                    owner = get_active_user_row(conn, tenant_id, assigned_user_id) or get_active_user_row(conn, tenant_id, actor_user_id) or get_default_hierarchy_user(conn, tenant_id)
-                    if not owner:
-                        return error_reply("No active owner is available for the new job.")
-                    planning_start, planning_end = planning_window_from_values(
-                        args.get("planned_start_at"), args.get("planned_end_at"), args.get("start_date")
-                    )
                     with conn.cursor() as cur:
                         if cname:
-                            cur.execute("SELECT id FROM clients WHERE tenant_id=%s AND display_name ILIKE %s AND deleted_at IS NULL LIMIT 1",(tenant_id, f"%{cname}%",))
+                            cur.execute("SELECT id FROM clients WHERE display_name ILIKE %s AND deleted_at IS NULL LIMIT 1",(f"%{cname}%",))
                             row = cur.fetchone()
                             if row: cid = row['id']
-                        cur.execute("""INSERT INTO jobs (
-                                tenant_id,job_number,client_id,job_title,job_status,start_date_planned,
-                                planned_start_at,planned_end_at,assigned_user_id,assigned_to,next_action_task_id,hierarchy_status,handover_note,
-                                handed_over_by,handed_over_at,calendar_sync_enabled
-                            ) VALUES (%s,%s,%s,%s,'nova',%s,%s,%s,%s,%s,NULL,'pending',%s,%s,%s,TRUE) RETURNING id""",
-                            (tenant_id, code, cid, t, args.get("start_date"), planning_start, planning_end,
-                             int(owner["id"]), assigned_to or owner["display_name"], args.get("handover_note"), actor_name,
-                             datetime.utcnow() if (assigned_to or args.get("handover_note")) else None))
+                        cur.execute("INSERT INTO jobs (job_number,client_id,job_title,job_status,start_date_planned) VALUES (%s,%s,%s,'nova',%s) RETURNING id",
+                            (code,cid,t,args.get("start_date")))
                         jid = cur.fetchone()['id']
-                        first_action = create_workflow_task(
-                            conn,
-                            tenant_id,
-                            {
-                                "title": tr("Continue with the new job", "Pokračovat v nové zakázce", "Kontynuować nowe zlecenie"),
-                                "description": args.get("description"),
-                                "assigned_user_id": int(owner["id"]),
-                                "planned_start_at": next_business_day_at_nine().isoformat(),
-                                "priority": "vysoka",
-                                "client_id": cid,
-                                "client_name": cname or None,
-                            },
-                            actor_name=actor_name,
-                            default_client_id=cid,
-                            default_client_name=cname or None,
-                            default_job_id=jid,
-                            source="assistant_job_create",
-                        )
-                        set_job_next_action(conn, tenant_id, jid, str(first_action["id"]))
-                        log_activity(
-                            conn,
-                            "job",
-                            jid,
-                            "create",
-                            f"Zakazka '{t}' ({code}) vytvorena",
-                            tenant_id=tenant_id,
-                            user_id=actor_user_id,
-                            source_channel="assistant",
-                            details={"assigned_user_id": int(owner["id"]), "next_action_task_id": str(first_action["id"])},
-                        )
+                        log_activity(conn,"job",jid,"create",f"Zakazka '{t}' ({code}) vytvorena")
                         conn.commit()
-                    return {"reply_cs":tr(
-                        f"Job {code}: {t} created.",
-                        f"Zakázka {code}: {t} vytvořena.",
-                        f"Zlecenie {code}: {t} zostało utworzone."
-                    ),"action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return error_reply(e)
+                    return {"reply_cs":f"Zakázka {code}: {t} vytvořena.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
             if action == "CREATE_LEAD":
@@ -5661,144 +617,27 @@ RULES:
                         lid = cur.fetchone()['id']
                         log_activity(conn,"lead",lid,"create",f"Lead '{n}' z {args.get('source','?')}")
                         conn.commit()
-                    return {"reply_cs":tr(
-                        f"Lead {code} from {n} has been recorded.",
-                        f"Lead {code} od {n} zaevidován.",
-                        f"Lead {code} od {n} został zapisany."
-                    ),"action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return error_reply(e)
+                    return {"reply_cs":f"Lead {code} od {n} zaevidován.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
             if action == "START_WORK_REPORT":
-                return {"reply_cs":tr("Starting work report.", "Spouštím work report dialog.", "Uruchamiam raport pracy."),
+                lang_map = {"cs-CZ":"cs","en-GB":"en","pl-PL":"pl"}
+                lang = lang_map.get(msg.internal_language,"en")
+                return {"reply_cs":"Spouštím work report dialog." if lang=="cs" else "Starting work report." if lang=="en" else "Uruchamiam raport pracy.",
                         "action_type":"START_WORK_REPORT","action_data":{}}
-
-            if action == "SEARCH_EMAIL":
-                try:
-                    query = str(args.get("query") or "").strip()
-                    sender = str(args.get("sender") or "").strip()
-                    unread_only = bool(args.get("unread_only") or False)
-                    try:
-                        limit = int(float(args.get("limit", 5)))
-                    except Exception:
-                        limit = 5
-                    emails = search_mail_messages(query=query, sender=sender, unread_only=unread_only, limit=limit)
-                    if not emails:
-                        return {"reply_cs": tr(
-                            "I did not find any matching emails.",
-                            "Nenašla jsem žádné odpovídající e-maily.",
-                            "Nie znalazłam pasujących e-maili."
-                        )}
-                    lines = []
-                    for idx, email_row in enumerate(emails, start=1):
-                        lines.append(
-                            f"{idx}. UID {email_row.get('uid')}: {email_row.get('from') or 'Unknown'} — "
-                            f"{email_row.get('subject') or tr('No subject', 'Bez předmětu', 'Bez tematu')}. "
-                            f"{email_row.get('summary') or ''}"
-                        )
-                    return {"reply_cs": tr(
-                        "I found these emails:\n" + "\n".join(lines),
-                        "Našla jsem tyto e-maily:\n" + "\n".join(lines),
-                        "Znalazłam te e-maile:\n" + "\n".join(lines)
-                    )}
-                except Exception as e:
-                    return {"reply_cs": tr(
-                        f"Email search is not available: {e}",
-                        f"Vyhledávání e-mailů není dostupné: {e}",
-                        f"Wyszukiwanie e-maili nie jest dostępne: {e}"
-                    )}
-
-            if action == "READ_EMAIL":
-                try:
-                    uid = str(args.get("uid") or "").strip()
-                    email_row = fetch_mail_by_uid(uid) if uid else None
-                    if not email_row:
-                        emails = search_mail_messages(
-                            query=str(args.get("query") or "").strip(),
-                            sender=str(args.get("sender") or "").strip(),
-                            unread_only=bool(args.get("unread_only") or False),
-                            limit=1,
-                        )
-                        email_row = emails[0] if emails else None
-                    if not email_row:
-                        return {"reply_cs": tr(
-                            "I could not find that email.",
-                            "Ten e-mail jsem nenašla.",
-                            "Nie znalazłam tego e-maila."
-                        )}
-                    body = (email_row.get("body") or "").strip()
-                    if len(body) > 1800:
-                        body = body[:1800].rstrip() + "..."
-                    return {"reply_cs": tr(
-                        f"Email from {email_row.get('from')}. Subject: {email_row.get('subject') or 'No subject'}. UID {email_row.get('uid')}. Text: {body}",
-                        f"E-mail od {email_row.get('from')}. Předmět: {email_row.get('subject') or 'Bez předmětu'}. UID {email_row.get('uid')}. Text: {body}",
-                        f"E-mail od {email_row.get('from')}. Temat: {email_row.get('subject') or 'Bez tematu'}. UID {email_row.get('uid')}. Treść: {body}"
-                    )}
-                except Exception as e:
-                    return {"reply_cs": tr(
-                        f"Email reading is not available: {e}",
-                        f"Čtení e-mailů není dostupné: {e}",
-                        f"Czytanie e-maili nie jest dostępne: {e}"
-                    )}
-
-            if action == "REPLY_EMAIL":
-                try:
-                    body = str(args.get("body") or "").strip()
-                    if not body:
-                        return {"reply_cs": tr("What should I write?", "Co mám napsat?", "Co mam napisać?"), "is_question": True}
-                    uid = str(args.get("uid") or "").strip()
-                    original = fetch_mail_by_uid(uid) if uid else None
-                    if not original:
-                        emails = search_mail_messages(
-                            query=str(args.get("query") or "").strip(),
-                            sender=str(args.get("sender") or "").strip(),
-                            unread_only=False,
-                            limit=1,
-                        )
-                        original = emails[0] if emails else None
-                    if not original:
-                        return {"reply_cs": tr(
-                            "I could not find the email to reply to.",
-                            "Nenašla jsem e-mail, na který mám odpovědět.",
-                            "Nie znalazłam e-maila, na który mam odpowiedzieć."
-                        )}
-                    sent = send_mail_reply(original, body)
-                    return {"reply_cs": tr(
-                        f"Reply sent to {sent.get('to')}. Subject: {sent.get('subject')}.",
-                        f"Odpověď odeslána na {sent.get('to')}. Předmět: {sent.get('subject')}.",
-                        f"Odpowiedź wysłana do {sent.get('to')}. Temat: {sent.get('subject')}."
-                    )}
-                except Exception as e:
-                    return {"reply_cs": tr(
-                        f"Email reply is not available: {e}",
-                        f"Odpověď na e-mail není dostupná: {e}",
-                        f"Odpowiedź na e-mail nie jest dostępna: {e}"
-                    )}
 
             if action == "GET_WEATHER":
                 try:
-                    import urllib.request, urllib.parse, urllib.error
-                    loc = str(args.get("location") or _ts.get("default_location","") or "London").strip() or "London"
-                    try:
-                        days = int(float(args.get("days", 3)))
-                    except Exception:
-                        days = 3
-                    days = max(1, min(days, 7))
-                    cache_key = f"{loc.lower()}::{days}"
-                    cached_entry = WEATHER_CACHE.get(cache_key)
-                    now_ts = datetime.utcnow().timestamp()
-                    if cached_entry and (now_ts - cached_entry.get("ts", 0)) < WEATHER_CACHE_TTL_SECONDS:
-                        return {"reply_cs": cached_entry["reply"]}
+                    import urllib.request, urllib.parse
+                    loc = args.get("location","Didcot")
+                    days = min(args.get("days",3), 7)
                     # Geocode location
                     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(loc)}&count=1&language=en"
                     with urllib.request.urlopen(geo_url, timeout=5) as r:
                         geo = json.loads(r.read())
                     if not geo.get("results"):
-                        return {"reply_cs": tr(
-                            f"I couldn't find location '{loc}'. Try a different city name.",
-                            f"Lokalitu '{loc}' jsem nenašel. Zkus jiný název města.",
-                            f"Nie znalazłam lokalizacji '{loc}'. Spróbuj innej nazwy miasta."
-                        )}
+                        return {"reply_cs": f"Lokalitu '{loc}' jsem nenašel. Zkus jiný název města."}
                     place = geo["results"][0]
                     lat, lon, name = place["latitude"], place["longitude"], place.get("name", loc)
                     # Fetch weather
@@ -5808,9 +647,6 @@ RULES:
                         f"&timezone=Europe/London&forecast_days={days}")
                     with urllib.request.urlopen(wx_url, timeout=8) as r:
                         wx = json.loads(r.read())
-                    if wx.get("error") or not wx.get("daily"):
-                        reason = wx.get("reason") or wx.get("error") or "unknown weather service error"
-                        raise RuntimeError(reason)
                     # Format daily summary
                     wmo = {0:"☀️ Jasno",1:"🌤 Polojasno",2:"⛅ Oblačno",3:"☁️ Zataženo",45:"🌫 Mlha",48:"🌫 Námraza",
                            51:"🌧 Mrholení",53:"🌧 Mrholení",55:"🌧 Mrholení",56:"🌧 Mrz. mrholení",57:"🌧 Mrz. mrholení",
@@ -5820,200 +656,72 @@ RULES:
                            85:"🌨 Sněh. přeháňky",86:"🌨 Sněh. přeháňky",
                            95:"⛈ Bouřka",96:"⛈ Bouřka s kroupami",99:"⛈ Silná bouřka"}
                     daily = wx.get("daily",{})
-                    lines = [tr(
-                        f"📍 Weather — {name} ({days} days):",
-                        f"📍 Počasí — {name} ({days} dní):",
-                        f"📍 Pogoda — {name} ({days} dni):"
-                    )]
-                    daily_codes = daily.get("weathercode") or daily.get("weather_code") or []
-                    daily_tmax = daily.get("temperature_2m_max") or []
-                    daily_tmin = daily.get("temperature_2m_min") or []
-                    daily_rain = daily.get("precipitation_sum") or []
-                    daily_rain_prob = daily.get("precipitation_probability_max") or []
-                    daily_wind = daily.get("windspeed_10m_max") or daily.get("wind_speed_10m_max") or []
+                    lines = [f"📍 Počasí — {name} ({days} dní):"]
                     for i, d in enumerate(daily.get("time",[])):
-                        code = daily_codes[i] if i < len(daily_codes) else 0
-                        tmax = daily_tmax[i] if i < len(daily_tmax) else None
-                        tmin = daily_tmin[i] if i < len(daily_tmin) else None
-                        rain = daily_rain[i] if i < len(daily_rain) else None
-                        rain_prob = daily_rain_prob[i] if i < len(daily_rain_prob) else None
-                        wind = daily_wind[i] if i < len(daily_wind) else None
+                        code = daily["weathercode"][i] if daily.get("weathercode") else 0
+                        tmax = daily.get("temperature_2m_max",[None])[i]
+                        tmin = daily.get("temperature_2m_min",[None])[i]
+                        rain = daily.get("precipitation_sum",[None])[i]
+                        rain_prob = daily.get("precipitation_probability_max",[None])[i]
+                        wind = daily.get("windspeed_10m_max",[None])[i]
                         desc = wmo.get(code, f"Kód {code}")
-                        if tmin is not None and tmax is not None:
-                            line = f"\n{d}: {desc}, {tmin:.0f}–{tmax:.0f}°C"
-                        elif tmax is not None:
-                            line = f"\n{d}: {desc}, {tmax:.0f}°C"
-                        else:
-                            line = f"\n{d}: {desc}"
-                        if rain is not None and rain > 0:
-                            line += tr(f", rain {rain:.1f}mm", f", déšť {rain:.1f}mm", f", deszcz {rain:.1f}mm")
-                        if rain_prob is not None:
-                            line += f" ({rain_prob:.0f}%)"
-                        if wind is not None:
-                            line += tr(f", wind {wind:.0f} km/h", f", vítr {wind:.0f} km/h", f", wiatr {wind:.0f} km/h")
+                        line = f"\n{d}: {desc}, {tmin:.0f}–{tmax:.0f}°C"
+                        if rain and rain > 0: line += f", déšť {rain:.1f}mm"
+                        if rain_prob: line += f" ({rain_prob}%)"
+                        if wind: line += f", vítr {wind:.0f} km/h"
                         lines.append(line)
                     # Add hourly for today
                     hourly = wx.get("hourly",{})
                     h_times = hourly.get("time",[])
                     h_temps = hourly.get("temperature_2m",[])
                     h_rain = hourly.get("precipitation_probability",[])
-                    h_codes = hourly.get("weathercode") or hourly.get("weather_code") or []
+                    h_codes = hourly.get("weathercode",[])
                     if h_times:
-                        lines.append(tr("\n⏰ Hourly forecast today:", "\n⏰ Hodinová předpověď dnes:", "\n⏰ Prognoza godzinowa na dziś:"))
+                        lines.append("\n⏰ Hodinová předpověď dnes:")
                         today_str = daily.get("time",[""])[0]
                         for j, ht in enumerate(h_times[:24]):
                             if today_str in ht:
                                 hour = ht.split("T")[1][:5]
                                 if hour in ["06:00","09:00","12:00","15:00","18:00","21:00"]:
-                                    t = h_temps[j] if j < len(h_temps) else None
+                                    t = h_temps[j] if j < len(h_temps) else "?"
                                     rp = h_rain[j] if j < len(h_rain) else 0
                                     cd = h_codes[j] if j < len(h_codes) else 0
                                     emoji = wmo.get(cd,"")[:2]
-                                    lines.append(tr(
-                                        f"  {hour} {emoji} {f'{t:.0f}°C' if t is not None else '?'} , rain {rp:.0f}%",
-                                        f"  {hour} {emoji} {f'{t:.0f}°C' if t is not None else '?'} , déšť {rp:.0f}%",
-                                        f"  {hour} {emoji} {f'{t:.0f}°C' if t is not None else '?'} , deszcz {rp:.0f}%"
-                                    ))
+                                    lines.append(f"  {hour} {emoji} {t:.0f}°C, déšť {rp}%")
                     reply = "\n".join(lines)
-                    WEATHER_CACHE[cache_key] = {"reply": reply, "ts": now_ts}
                     return {"reply_cs": reply}
-                except urllib.error.HTTPError as e:
-                    if e.code == 429:
-                        cached_entry = WEATHER_CACHE.get(cache_key)
-                        if cached_entry:
-                            return {"reply_cs": cached_entry["reply"] + tr(
-                                "\n\nℹ️ Using the last saved weather because the weather service is busy.",
-                                "\n\nℹ️ Používám poslední uložené počasí, protože weather služba je teď přetížená.",
-                                "\n\nℹ️ Używam ostatnio zapisanej prognozy, ponieważ usługa pogody jest teraz przeciążona."
-                            )}
-                        return {"reply_cs": tr(
-                            "Weather service is temporarily busy. Try again in a minute.",
-                            "Služba počasí je dočasně přetížená. Zkus to znovu za chvíli.",
-                            "Usługa pogody jest chwilowo przeciążona. Spróbuj ponownie za chwilę."
-                        )}
-                    raise
                 except Exception as e:
-                    return {"reply_cs": tr(
-                        f"Failed to load weather: {e}",
-                        f"Nepodařilo se načíst počasí: {e}",
-                        f"Nie udało się pobrać pogody: {e}"
-                    )}
+                    return {"reply_cs": f"Nepodařilo se načíst počasí: {e}"}
 
             if action == "SEND_WHATSAPP":
-                client_name = args.get("client_name") or args.get("contact_name") or args.get("name") or ""
-                original_message = args.get("message") or ""
-                phone = args.get("phone") or ""
-                resolved_client_id = None
-                if phone or client_name:
-                    conn = get_db_conn()
-                    try:
-                        with conn.cursor() as cur:
-                            if phone:
-                                matched = find_client_by_communication_phone(cur, tenant_id, phone)
-                                if matched:
-                                    resolved_client_id = matched.get("id")
-                                    client_name = matched.get("display_name") or client_name
-                                    phone = matched.get("phone_primary") or matched.get("phone_secondary") or phone
-                            if not phone and client_name:
-                                matched = find_client_by_voice_name(cur, tenant_id, client_name)
-                                if matched:
-                                    resolved_client_id = matched.get("id")
-                                    client_name = matched.get("display_name") or client_name
-                                    phone = matched.get("phone_primary") or matched.get("phone_secondary") or phone
-                    finally:
+                client_name = args.get("client_name","")
+                message = args.get("message","")
+                conn = get_db_conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id,display_name,phone_primary FROM clients WHERE display_name ILIKE %s AND deleted_at IS NULL LIMIT 1", (f"%{client_name}%",))
+                        client = cur.fetchone()
+                    if not client:
                         release_conn(conn)
-                outgoing_language = (
-                    get_customer_output_language(resolved_client_id, tenant_id)
-                    if resolved_client_id
-                    else DEFAULT_CUSTOMER_LANG
-                )
-                translated_message = translate_customer_message(original_message, outgoing_language)
-                return {
-                    "reply_cs": tr(
-                        f"Opening WhatsApp for {client_name or phone}.",
-                        f"Otevírám WhatsApp pro {client_name or phone}.",
-                        f"Otwieram WhatsApp dla {client_name or phone}.",
-                    ),
-                    "action_type": "SEND_WHATSAPP",
-                    "action_data": {
-                        "client_id": resolved_client_id,
-                        "client_name": client_name,
-                        "contact_name": args.get("contact_name") or client_name,
-                        "phone": phone,
-                        "message": translated_message,
-                        "original_message": original_message,
-                        "language": outgoing_language,
-                    },
-                }
-
-            if action == "START_NAVIGATION":
-                target = (
-                    args.get("address")
-                    or args.get("target")
-                    or args.get("client_name")
-                    or args.get("contact_name")
-                    or args.get("name")
-                    or ""
-                )
-                if not target:
-                    return {"reply_cs": tr(
-                        "Where should I navigate?",
-                        "Kam mám spustit navigaci?",
-                        "Dokąd mam uruchomić nawigację?",
-                    )}
-                return {
-                    "reply_cs": tr(
-                        f"Opening navigation to {target}.",
-                        f"Spouštím navigaci na {target}.",
-                        f"Uruchamiam nawigację do {target}.",
-                    ),
-                    "action_type": "START_NAVIGATION",
-                    "action_data": {
-                        "target": target,
-                        "address": args.get("address") or "",
-                        "client_name": args.get("client_name") or "",
-                        "contact_name": args.get("contact_name") or "",
-                    },
-                }
-
-            if action == "REMEMBER_MEMORY":
-                content = args.get("content", "").strip()
-                memory_type = args.get("memory_type", "long")
-                if not content:
-                    return {"reply_cs": tr("What should I remember?", "Co si mám zapamatovat?", "Co mam zapamiętać?")}
-                conn = get_db_conn()
-                try:
-                    remembered = remember_assistant_memory(conn, tenant_id, current_user_id, content, memory_type)
+                        return {"reply_cs": f"Klienta '{client_name}' jsem nenašel v CRM."}
+                    phone = client["phone_primary"]
+                    if not phone:
+                        release_conn(conn)
+                        return {"reply_cs": f"Klient {client['display_name']} nemá telefonní číslo."}
+                    result = wa_send_message(phone, message)
+                    if "error" in result:
+                        release_conn(conn)
+                        return {"reply_cs": f"WhatsApp se nepodařilo odeslat: {result.get('error','')}"}
+                    with conn.cursor() as cur:
+                        cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                            VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
+                            (client["id"], message[:500], f"To: {phone}"))
+                    log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {client['display_name']}: {message[:100]}")
                     conn.commit()
-                    return {"reply_cs": tr(
-                        f"I will remember: {content}",
-                        f"Zapamatovala jsem si: {content}",
-                        f"Zapamiętałam: {content}",
-                    ), "action_type": "MEMORY_REMEMBERED", "action_data": remembered}
+                    return {"reply_cs": f"✅ WhatsApp zpráva odeslána klientovi {client['display_name']} na {phone}.", "action_type":"WHATSAPP_SENT","action_data":{"client_name":client["display_name"],"phone":phone}}
                 except Exception as e:
-                    conn.rollback()
-                    return error_reply(e)
-                finally:
-                    release_conn(conn)
-
-            if action == "FORGET_MEMORY":
-                query = args.get("query", "").strip()
-                if not query:
-                    return {"reply_cs": tr("What should I forget?", "Co mám zapomenout?", "Co mam zapomnieć?")}
-                conn = get_db_conn()
-                try:
-                    forgotten = forget_assistant_memory(conn, tenant_id, current_user_id, query)
-                    conn.commit()
-                    return {"reply_cs": tr(
-                        f"I forgot {forgotten['count']} matching memory item(s).",
-                        f"Zapomněla jsem {forgotten['count']} odpovídající položek paměti.",
-                        f"Zapomniałam {forgotten['count']} pasujących pozycji pamięci.",
-                    ), "action_type": "MEMORY_FORGOTTEN", "action_data": forgotten}
-                except Exception as e:
-                    conn.rollback()
-                    return error_reply(e)
-                finally:
-                    release_conn(conn)
+                    return {"reply_cs": f"Chyba při odesílání WhatsApp: {e}"}
+                finally: release_conn(conn)
 
             if action == "QUERY_CLIENTS":
                 question = args.get("question", "")
@@ -6024,52 +732,40 @@ RULES:
                         cur.execute("ALTER TABLE clients ADD COLUMN IF NOT EXISTS source TEXT")
                         conn.commit()
                         stats = {}
-                        cur.execute("SELECT COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=tenant_id")
+                        cur.execute("SELECT COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1")
                         stats["total_clients"] = cur.fetchone()["cnt"]
-                        cur.execute("SELECT status, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=tenant_id GROUP BY status")
+                        cur.execute("SELECT status, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY status")
                         stats["by_status"] = {r["status"]: r["cnt"] for r in cur.fetchall()}
-                        cur.execute("SELECT COALESCE(source,'unknown') as src, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=tenant_id GROUP BY COALESCE(source,'unknown')")
+                        cur.execute("SELECT COALESCE(source,'unknown') as src, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY COALESCE(source,'unknown')")
                         stats["by_source"] = {r["src"]: r["cnt"] for r in cur.fetchall()}
-                        cur.execute("SELECT client_type, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=tenant_id GROUP BY client_type")
+                        cur.execute("SELECT client_type, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY client_type")
                         stats["by_type"] = {r["client_type"]: r["cnt"] for r in cur.fetchall()}
-                        cur.execute("SELECT is_commercial, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=tenant_id GROUP BY is_commercial")
+                        cur.execute("SELECT is_commercial, COUNT(*) as cnt FROM clients WHERE deleted_at IS NULL AND tenant_id=1 GROUP BY is_commercial")
                         stats["commercial"] = {str(r["is_commercial"]): r["cnt"] for r in cur.fetchall()}
-                        cur.execute("SELECT display_name, phone_primary, email_primary, COALESCE(source,'?') as source, created_at::text FROM clients WHERE deleted_at IS NULL AND tenant_id=tenant_id ORDER BY created_at DESC LIMIT 5")
+                        cur.execute("SELECT display_name, phone_primary, email_primary, COALESCE(source,'?') as source, created_at::text FROM clients WHERE deleted_at IS NULL AND tenant_id=1 ORDER BY created_at DESC LIMIT 5")
                         stats["recent_5"] = [dict(r) for r in cur.fetchall()]
                         cur.execute("SELECT COUNT(*) as cnt FROM jobs WHERE deleted_at IS NULL")
                         stats["total_jobs"] = cur.fetchone()["cnt"]
-                        cur.execute("SELECT COUNT(*) as cnt FROM leads WHERE tenant_id=tenant_id")
+                        cur.execute("SELECT COUNT(*) as cnt FROM leads WHERE tenant_id=1")
                         stats["total_leads"] = cur.fetchone()["cnt"]
-                        cur.execute("SELECT COUNT(*) as cnt FROM invoices WHERE tenant_id=tenant_id")
+                        cur.execute("SELECT COUNT(*) as cnt FROM invoices WHERE tenant_id=1")
                         stats["total_invoices"] = cur.fetchone()["cnt"]
-                        cur.execute("SELECT COUNT(*) as cnt FROM tasks WHERE tenant_id=tenant_id")
+                        cur.execute("SELECT COUNT(*) as cnt FROM tasks WHERE tenant_id=1")
                         stats["total_tasks"] = cur.fetchone()["cnt"]
                     # Build human-readable answer
-                    lines = [tr("📊 CRM database:", "📊 Databáze CRM:", "📊 Baza CRM:")]
-                    lines.append(tr(
-                        f"Total clients: {stats['total_clients']}",
-                        f"Klientů celkem: {stats['total_clients']}",
-                        f"Łącznie klientów: {stats['total_clients']}"
-                    ))
-                    if stats["by_status"]: lines.append(tr(f"By status: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}", f"Podle stavu: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}", f"Według statusu: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}"))
-                    if stats["by_source"]: lines.append(tr(f"By source: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}", f"Podle zdroje: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}", f"Według źródła: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}"))
-                    if stats["by_type"]: lines.append(tr(f"By type: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}", f"Podle typu: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}", f"Według typu: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}"))
-                    lines.append(tr(
-                        f"Jobs: {stats['total_jobs']}, Leads: {stats['total_leads']}, Invoices: {stats['total_invoices']}, Tasks: {stats['total_tasks']}",
-                        f"Zakázek: {stats['total_jobs']}, Leadů: {stats['total_leads']}, Faktur: {stats['total_invoices']}, Úkolů: {stats['total_tasks']}",
-                        f"Zleceń: {stats['total_jobs']}, Leadów: {stats['total_leads']}, Faktur: {stats['total_invoices']}, Zadań: {stats['total_tasks']}"
-                    ))
+                    lines = [f"📊 Databáze CRM:"]
+                    lines.append(f"Klientů celkem: {stats['total_clients']}")
+                    if stats["by_status"]: lines.append(f"Podle stavu: {', '.join(f'{k}={v}' for k,v in stats['by_status'].items())}")
+                    if stats["by_source"]: lines.append(f"Podle zdroje: {', '.join(f'{k}={v}' for k,v in stats['by_source'].items())}")
+                    if stats["by_type"]: lines.append(f"Podle typu: {', '.join(f'{k}={v}' for k,v in stats['by_type'].items())}")
+                    lines.append(f"Zakázek: {stats['total_jobs']}, Leadů: {stats['total_leads']}, Faktur: {stats['total_invoices']}, Úkolů: {stats['total_tasks']}")
                     if stats["recent_5"]:
-                        lines.append(tr("Last 5 clients:", "Posledních 5 klientů:", "Ostatnich 5 klientów:"))
+                        lines.append("Posledních 5 klientů:")
                         for c in stats["recent_5"]:
                             lines.append(f"  - {c['display_name']} ({c.get('source','?')}) {c.get('phone_primary','')}")
                     return {"reply_cs": "\n".join(lines)}
                 except Exception as e:
-                    return {"reply_cs": tr(
-                        f"Database query error: {e}",
-                        f"Chyba při dotazu na databázi: {e}",
-                        f"Błąd zapytania do bazy danych: {e}"
-                    )}
+                    return {"reply_cs": f"Chyba při dotazu na databázi: {e}"}
                 finally: release_conn(conn)
 
             if action == "ADD_NOTE":
@@ -6085,7 +781,7 @@ RULES:
                             if row:
                                 cur.execute("INSERT INTO client_notes (client_id,note) VALUES (%s,%s)",(row['id'],note))
                                 log_activity(conn,"client",row['id'],"note",f"Poznamka: {note[:50]}")
-                            else: return {"reply_cs":tr(f"Client '{ename}' not found.", f"Klient '{ename}' nenalezen.", f"Nie znaleziono klienta '{ename}'.")}
+                            else: return {"reply_cs":f"Klient '{ename}' nenalezen."}
                         elif etype == "job":
                             ename = args.get("entity_name","")
                             cur.execute("SELECT id FROM jobs WHERE job_title ILIKE %s AND deleted_at IS NULL LIMIT 1",(f"%{ename}%",))
@@ -6093,105 +789,50 @@ RULES:
                             if row:
                                 cur.execute("INSERT INTO job_notes (job_id,note) VALUES (%s,%s)",(row['id'],note))
                                 log_activity(conn,"job",row['id'],"note",f"Poznamka: {note[:50]}")
-                            else: return {"reply_cs":tr(f"Job '{ename}' not found.", f"Zakazka '{ename}' nenalezena.", f"Nie znaleziono zlecenia '{ename}'.")}
+                            else: return {"reply_cs":f"Zakazka '{ename}' nenalezena."}
                         conn.commit()
-                    return {"reply_cs":tr("Note added.", "Poznámka přidána.", "Notatka została dodana."),"action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return error_reply(e)
+                    return {"reply_cs":f"Poznámka přidána.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
             if action == "UPDATE_TASK":
                 title_q = args.get("title","")
                 conn = get_db_conn()
                 try:
-                    tenant_id = get_request_tenant_id(request)
                     with conn.cursor() as cur:
-                        cur.execute("""SELECT id,title FROM tasks
-                            WHERE tenant_id=%s AND title ILIKE %s AND is_completed=FALSE
-                            ORDER BY created_at DESC LIMIT 1""",(tenant_id, f"%{title_q}%",))
+                        cur.execute("SELECT id,title FROM tasks WHERE title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
                         row = cur.fetchone()
-                        if not row: return {"reply_cs":tr(f"Task '{title_q}' not found.", f"Úkol '{title_q}' nenalezen.", f"Nie znaleziono zadania '{title_q}'.")}
-                        task_links = get_task_next_action_links(conn, tenant_id, row["id"])
-                        requested_status = args.get("status")
-                        if task_links and requested_status in ("hotovo", "zruseno"):
-                            return {"reply_cs": tr(
-                                "This task is the current next step. Choose or create the replacement task first.",
-                                "Tento úkol je aktuální další krok. Nejprve vyber nebo vytvoř náhradní úkol.",
-                                "To zadanie jest bieżącym kolejnym krokiem. Najpierw wybierz lub utwórz zadanie zastępcze."
-                            )}
+                        if not row: return {"reply_cs":f"Úkol '{title_q}' nenalezen."}
                         sets = []; vals = []
                         if "status" in args: sets.append("status=%s"); vals.append(args["status"])
                         if "priority" in args: sets.append("priority=%s"); vals.append(args["priority"])
                         if "result" in args: sets.append("result=%s"); vals.append(args["result"])
-                        if "assigned_to" in args:
-                            assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
-                            sets.append("assigned_to=%s"); vals.append(assigned_to)
-                            sets.append("assigned_user_id=%s"); vals.append(assigned_user_id)
-                            sets.append("delegated_by=%s"); vals.append(get_user_display_name(conn, tenant_id, request.state.user.get("user_id")))
-                        if "planning_note" in args:
-                            sets.append("planning_note=%s"); vals.append(args["planning_note"])
-                        if "planned_date" in args:
-                            sets.append("planned_date=%s"); vals.append(args["planned_date"])
-                        if "planned_start_at" in args or "planned_end_at" in args or "planned_date" in args:
-                            planning_start, planning_end = planning_window_from_values(
-                                args.get("planned_start_at"), args.get("planned_end_at"), args.get("planned_date")
-                            )
-                            sets.append("planned_start_at=%s"); vals.append(planning_start)
-                            sets.append("planned_end_at=%s"); vals.append(planning_end)
                         if sets:
                             sets.append("updated_at=now()"); vals.append(row['id'])
                             cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=%s",vals)
                             log_activity(conn,"task",row['id'],"update",f"Ukol '{row['title']}' upraven")
                             conn.commit()
                         changes = ", ".join([f"{k}={v}" for k,v in args.items() if k != "title"])
-                    return {"reply_cs":tr(
-                        f"Task '{row['title']}' updated: {changes}.",
-                        f"Úkol '{row['title']}' upraven: {changes}.",
-                        f"Zadanie '{row['title']}' zaktualizowano: {changes}."
-                    ),"action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return error_reply(e)
+                    return {"reply_cs":f"Úkol '{row['title']}' upraven: {changes}.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
             if action == "UPDATE_JOB":
                 title_q = args.get("title","")
                 conn = get_db_conn()
                 try:
-                    tenant_id = get_request_tenant_id(request)
                     with conn.cursor() as cur:
-                        cur.execute("""SELECT id,job_title,job_status FROM jobs
-                            WHERE tenant_id=%s AND job_title ILIKE %s AND deleted_at IS NULL
-                            ORDER BY created_at DESC LIMIT 1""",(tenant_id, f"%{title_q}%",))
+                        cur.execute("SELECT id,job_title,job_status FROM jobs WHERE job_title ILIKE %s AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
                         row = cur.fetchone()
-                        if not row: return {"reply_cs":tr(f"Job '{title_q}' not found.", f"Zakázka '{title_q}' nenalezena.", f"Nie znaleziono zlecenia '{title_q}'.")}
+                        if not row: return {"reply_cs":f"Zakázka '{title_q}' nenalezena."}
                         new_status = args.get("status",row['job_status'])
                         err = validate_state_transition(row['job_status'], new_status, JOB_TRANSITIONS, "Job")
-                        if err: return {"reply_cs":tr(f"Invalid transition: {err}", f"Neplatný přechod: {err}", f"Nieprawidłowe przejście: {err}")}
-                        sets = ["job_status=%s"]
-                        vals = [new_status]
-                        if "assigned_to" in args:
-                            assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, None, args.get("assigned_to"))
-                            sets.extend(["assigned_to=%s", "assigned_user_id=%s"])
-                            vals.extend([assigned_to, assigned_user_id])
-                            sets.extend(["handed_over_by=%s", "handed_over_at=%s"])
-                            vals.extend([get_user_display_name(conn, tenant_id, request.state.user.get("user_id")), datetime.utcnow()])
-                        if "handover_note" in args:
-                            sets.append("handover_note=%s"); vals.append(args.get("handover_note"))
-                            sets.extend(["handed_over_by=%s", "handed_over_at=%s"])
-                            vals.extend([get_user_display_name(conn, tenant_id, request.state.user.get("user_id")), datetime.utcnow()])
-                        if "planned_start_at" in args or "planned_end_at" in args:
-                            planning_start, planning_end = planning_window_from_values(args.get("planned_start_at"), args.get("planned_end_at"))
-                            sets.extend(["planned_start_at=%s", "planned_end_at=%s"])
-                            vals.extend([planning_start, planning_end])
-                        sets.append("updated_at=now()")
-                        vals.append(row['id'])
-                        cur.execute(f"UPDATE jobs SET {','.join(sets)} WHERE id=%s", vals)
+                        if err: return {"reply_cs":f"Neplatný přechod: {err}"}
+                        cur.execute("UPDATE jobs SET job_status=%s,updated_at=now() WHERE id=%s",(new_status,row['id']))
                         log_activity(conn,"job",row['id'],"status_change",f"Zakazka '{row['job_title']}': {row['job_status']} -> {new_status}")
                         conn.commit()
-                    return {"reply_cs":tr(
-                        f"Job '{row['job_title']}' changed to: {new_status}.",
-                        f"Zakázka '{row['job_title']}' změněna na: {new_status}.",
-                        f"Zlecenie '{row['job_title']}' zmieniono na: {new_status}."
-                    ),"action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return error_reply(e)
+                    return {"reply_cs":f"Zakázka '{row['job_title']}' změněna na: {new_status}.","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
             if action == "LIST_TASKS":
@@ -6206,93 +847,41 @@ RULES:
                         sql += " ORDER BY CASE priority WHEN 'kriticka' THEN 1 WHEN 'urgentni' THEN 2 WHEN 'vysoka' THEN 3 ELSE 4 END LIMIT 15"
                         cur.execute(sql,params)
                         rows = cur.fetchall()
-                    if not rows: return {"reply_cs":tr("You have no active tasks.", "Nemáš žádné aktivní úkoly.", "Nie masz żadnych aktywnych zadań.")}
-                    items = [
-                        f"- {r['title']} ({r['priority']}, {r['status']})"
-                        + (tr(" client: ", " klient: ", " klient: ") + str(r['client_name']) if r.get('client_name') else "")
-                        + (tr(" due: ", " DL: ", " termin: ") + str(r['deadline']) if r.get('deadline') else "")
-                        for r in rows
-                    ]
-                    return {"reply_cs":tr(
-                        f"You have {len(rows)} tasks:\n" + "\n".join(items),
-                        f"Máš {len(rows)} úkolů:\n" + "\n".join(items),
-                        f"Masz {len(rows)} zadań:\n" + "\n".join(items)
-                    ),"action_type":"LIST_TASKS"}
+                    if not rows: return {"reply_cs":"Nemáš žádné aktivní úkoly."}
+                    items = [f"- {r['title']} ({r['priority']}, {r['status']})" + (f" klient: {r['client_name']}" if r.get('client_name') else "") + (f" DL: {r['deadline']}" if r.get('deadline') else "") for r in rows]
+                    return {"reply_cs":f"Máš {len(rows)} úkolů:\n" + "\n".join(items),"action_type":"LIST_TASKS"}
                 finally: release_conn(conn)
 
             if action == "COMPLETE_TASK":
                 title_q = args.get("title","")
                 conn = get_db_conn()
                 try:
-                    tenant_id = get_request_tenant_id(request)
                     with conn.cursor() as cur:
-                        cur.execute("SELECT id,title FROM tasks WHERE tenant_id=%s AND title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(tenant_id, f"%{title_q}%",))
+                        cur.execute("SELECT id,title FROM tasks WHERE title ILIKE %s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 1",(f"%{title_q}%",))
                         row = cur.fetchone()
-                        if not row: return {"reply_cs":tr(f"Task '{title_q}' not found or is already done.", f"Úkol '{title_q}' nenalezen nebo už je hotový.", f"Zadanie '{title_q}' nie zostało znalezione albo jest już ukończone.")}
-                        if get_task_next_action_links(conn, tenant_id, row["id"]):
-                            return {"reply_cs": tr(
-                                "This task is the current next step. Create or choose the replacement task before completing it.",
-                                "Tento úkol je aktuální další krok. Před dokončením nejdřív vytvoř nebo vyber náhradní úkol.",
-                                "To zadanie jest bieżącym kolejnym krokiem. Przed ukończeniem najpierw utwórz lub wybierz zadanie zastępcze."
-                            )}
-                        result = args.get("result", tr("Completed", "Dokončeno", "Ukończono"))
+                        if not row: return {"reply_cs":f"Úkol '{title_q}' nenalezen nebo už je hotový."}
+                        result = args.get("result","Dokončeno")
                         cur.execute("UPDATE tasks SET status='hotovo',is_completed=TRUE,result=%s,updated_at=now() WHERE id=%s",(result,row['id']))
                         log_activity(conn,"task",row['id'],"complete",f"Ukol '{row['title']}' dokoncen: {result}")
                         conn.commit()
-                    return {"reply_cs":tr(
-                        f"Task '{row['title']}' completed. Result: {result}",
-                        f"Úkol '{row['title']}' dokončen. Výsledek: {result}",
-                        f"Zadanie '{row['title']}' ukończone. Wynik: {result}"
-                    ),"action_type":"REFRESH"}
-                except Exception as e: conn.rollback(); return error_reply(e)
+                    return {"reply_cs":f"Úkol '{row['title']}' dokončen. Výsledek: {result}","action_type":"REFRESH"}
+                except Exception as e: conn.rollback(); return {"reply_cs":f"Chyba: {e}"}
                 finally: release_conn(conn)
 
             # === CLIENT-SIDE ACTIONS (passthrough to Android) ===
             human = {
-                "ADD_CALENDAR_EVENT": tr(f"Adding {args.get('title','')} to the calendar.", f"Zapisuji {args.get('title','')} do kalendáře.", f"Dodaję {args.get('title','')} do kalendarza."),
-                "MODIFY_CALENDAR_EVENT": tr(f"Updating event {args.get('event_title','')}.", f"Měním událost {args.get('event_title','')}.", f"Zmieniam wydarzenie {args.get('event_title','')}."),
-                "DELETE_CALENDAR_EVENT": tr(f"Deleting event {args.get('event_title','')}.", f"Mažu událost {args.get('event_title','')}.", f"Usuwam wydarzenie {args.get('event_title','')}."),
-                "LIST_CALENDAR_EVENTS": tr("I'll check the calendar.", "Podívám se do kalendáře.", "Sprawdzę kalendarz."),
-                "CALL_CONTACT": tr(
-                    f"Dialing {args.get('contact_name') or args.get('client_name') or args.get('phone','')}.",
-                    f"Vytáčím {args.get('contact_name') or args.get('client_name') or args.get('phone','')}.",
-                    f"Wybieram {args.get('contact_name') or args.get('client_name') or args.get('phone','')}."
-                ),
-                "SEND_EMAIL": tr(f"Sending email to {args.get('to','')}.", f"Posílám email na {args.get('to','')}.", f"Wysyłam email na {args.get('to','')}."),
+                "ADD_CALENDAR_EVENT": f"Zapisuji {args.get('title','')} do kalendáře.",
+                "MODIFY_CALENDAR_EVENT": f"Měním událost {args.get('event_title','')}.",
+                "DELETE_CALENDAR_EVENT": f"Mažu událost {args.get('event_title','')}.",
+                "LIST_CALENDAR_EVENTS": "Podívám se do kalendáře.",
+                "CALL_CONTACT": f"Vytáčím {args.get('phone','')}.",
+                "SEND_EMAIL": f"Posílám email na {args.get('to','')}.",
             }
-            reply = ai_msg.content or human.get(action, tr("Done.", "Hotovo.", "Gotowe."))
-            # Validate reply language only when the LLM wrote the text itself
-            if ai_msg.content:
-                _expected_short = normalize_language_short(external_lang, "en")
-                _detected_short = detect_reply_language_short(ai_msg.content, _expected_short)
-                if _detected_short != _expected_short:
-                    log_language_mismatch(
-                        tenant_id=tenant_id,
-                        user_id=current_user_id,
-                        customer_id=msg.customer_id,
-                        expected_lang_short=_expected_short,
-                        detected_lang_short=_detected_short,
-                        reply_excerpt=ai_msg.content,
-                        source="process_action",
-                    )
+            reply = ai_msg.content or human.get(action, f"Hotovo.")
             return {"reply_cs":reply,"action_type":action,"action_data":args}
 
         # No tool call — plain text reply
-        reply = ai_msg.content or tr("Understood.", "Rozumím.", "Rozumiem.")
-        # Validate reply language only when the LLM wrote the text itself
-        if ai_msg.content:
-            _expected_short = normalize_language_short(external_lang, "en")
-            _detected_short = detect_reply_language_short(ai_msg.content, _expected_short)
-            if _detected_short != _expected_short:
-                log_language_mismatch(
-                    tenant_id=tenant_id,
-                    user_id=current_user_id,
-                    customer_id=msg.customer_id,
-                    expected_lang_short=_expected_short,
-                    detected_lang_short=_detected_short,
-                    reply_excerpt=ai_msg.content,
-                    source="process_plain",
-                )
+        reply = ai_msg.content or "Rozumím."
         # Fallback: if reply mentions work report but GPT didn't call tool, force it
         wr_kw = ["work report","výkaz","vykaz","nahlášení práce","nahlaseni prace","zapsat práci","zapsat praci","raport pracy","zahajuji proces"]
         if any(kw in (reply + " " + msg.text).lower() for kw in wr_kw):
@@ -6300,7 +889,7 @@ RULES:
         return {"reply_cs":reply,"is_question":"?" in reply}
     except Exception as e:
         import traceback; traceback.print_exc()
-        return {"reply_cs":f"Error: {type(e).__name__}: {str(e)}"}
+        return {"reply_cs":f"Chyba: {type(e).__name__}: {str(e)}"}
 
 # ========== REST API: CLIENTS ==========
 @app.get("/crm/clients")
@@ -6324,38 +913,25 @@ async def search_clients(q: str = Query(..., min_length=1)):
     finally: release_conn(conn)
 
 @app.get("/crm/clients/{client_id}")
-async def get_client_detail(client_id: int, request: Request):
-    tid = get_request_tenant_id(request)
+async def get_client_detail(client_id: int):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL",(client_id, tid))
+            cur.execute("SELECT * FROM clients WHERE id=%s AND deleted_at IS NULL",(client_id,))
             cl = cur.fetchone()
             if not cl: raise HTTPException(404,"Klient nenalezen")
             cur.execute("SELECT * FROM properties WHERE client_id=%s AND deleted_at IS NULL",(client_id,))
             props = cur.fetchall()
             cur.execute("SELECT j.*,j.start_date_planned::text as start_date_planned FROM jobs j WHERE j.client_id=%s AND j.deleted_at IS NULL ORDER BY j.created_at DESC LIMIT 10",(client_id,))
             jobs = cur.fetchall()
-            cur.execute("""
-                SELECT id,client_id,job_id,comm_type,COALESCE(source, comm_type) AS source,
-                       external_message_id,source_phone,target_phone,conversation_key,
-                       subject,message_summary,sent_at::text,direction,notes,created_at::text,imported_at::text
-                FROM communications
-                WHERE client_id=%s AND tenant_id=%s
-                ORDER BY COALESCE(sent_at, created_at) DESC, id DESC
-                LIMIT 500
-            """,(client_id, tid))
+            cur.execute("SELECT id,client_id,job_id,comm_type,subject,message_summary,sent_at::text,direction,notes,created_at::text FROM communications WHERE client_id=%s ORDER BY created_at DESC LIMIT 10",(client_id,))
             comms = cur.fetchall()
             cur.execute("SELECT * FROM tasks WHERE client_id=%s AND is_completed=FALSE ORDER BY created_at DESC LIMIT 10",(client_id,))
             tasks = cur.fetchall()
             cur.execute("SELECT id,note,created_by,created_at::text FROM client_notes WHERE client_id=%s ORDER BY created_at DESC LIMIT 20",(client_id,))
             notes = cur.fetchall()
-            service_rate_overrides = get_client_service_rate_overrides(conn, tid, client_id)
             return {"client":dict(cl),"properties":[dict(p) for p in props],"recent_jobs":[dict(j) for j in jobs],
-                    "communications":[dict(c) for c in comms],"tasks":[dict(t) for t in tasks],"notes":[dict(n) for n in notes],
-                    "service_rates": get_client_service_rates(conn, tid, client_id),
-                    "service_rate_overrides": {k: v for k, v in service_rate_overrides.items() if k in VISIBLE_CLIENT_SERVICE_RATE_KEYS},
-                    "has_individual_service_rates": bool(service_rate_overrides)}
+                    "communications":[dict(c) for c in comms],"tasks":[dict(t) for t in tasks],"notes":[dict(n) for n in notes]}
     finally: release_conn(conn)
 
 @app.post("/crm/clients")
@@ -6364,157 +940,49 @@ async def api_create_client(data: dict, request: Request):
     conn = get_db_conn()
     try:
         ok, msg = check_subscription_limit(conn, tid, "clients")
-        if not ok:
-            raise HTTPException(429, msg)
-        owner_user_id = data.get("owner_user_id")
-        first_action = data.get("first_action")
-        actor_user_id = request.state.user.get("user_id")
-        actor_name = get_user_display_name(conn, tid, actor_user_id) or "system"
-        owner = validate_active_user(conn, tid, owner_user_id, "client owner")
-        if not isinstance(first_action, dict):
-            raise HTTPException(422, "Client must include first_action")
-        display_name = clean_contact_display_name(data.get("name") or data.get("display_name"))
-        if not display_name:
-            raise HTTPException(400, "display_name required")
+        if not ok: raise HTTPException(429, msg)
         code = f"CL-{uuid.uuid4().hex[:6].upper()}"
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO clients (client_code,client_type,title,first_name,last_name,display_name,
                 company_name,company_registration_no,vat_no,email_primary,email_secondary,
                 phone_primary,phone_secondary,website,preferred_contact_method,
                 billing_address_line1,billing_city,billing_postcode,billing_country,
-                status,is_commercial,tenant_id,owner_user_id,hierarchy_status)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,%s,'pending') RETURNING id,display_name""",
+                status,is_commercial,tenant_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s) RETURNING id""",
                 (code,data.get("type",data.get("client_type","domestic")),
                  data.get("title"),data.get("first_name"),data.get("last_name"),
-                 display_name,
+                 data.get("name",data.get("display_name","")),
                  data.get("company_name"),data.get("company_registration_no"),data.get("vat_no"),
                  data.get("email",data.get("email_primary")),data.get("email_secondary"),
                  data.get("phone",data.get("phone_primary")),data.get("phone_secondary"),
                  data.get("website"),data.get("preferred_contact_method","email"),
                  data.get("billing_address_line1"),data.get("billing_city"),
                  data.get("billing_postcode"),data.get("billing_country","GB"),
-                 data.get("is_commercial",False),tid,int(owner["id"])))
-            client_row = dict(cur.fetchone())
-            cid = client_row["id"]
-            next_action = create_workflow_task(
-                conn,
-                tid,
-                first_action,
-                actor_name=actor_name,
-                default_client_id=cid,
-                default_client_name=client_row.get("display_name") or display_name,
-                source="client_first_action",
-            )
-            set_client_next_action(conn, tid, cid, str(next_action["id"]))
-            validation = validate_client_hierarchy(conn, tid, cid)
-            if not validation["valid"]:
-                raise HTTPException(422, f"Client hierarchy invalid: {', '.join(validation['issues'])}")
-            log_activity(
-                conn,
-                "client",
-                cid,
-                "create",
-                f"Klient {display_name} vytvoren",
-                tenant_id=tid,
-                user_id=actor_user_id,
-                source_channel="crm",
-                details={
-                    "owner_user_id": int(owner["id"]),
-                    "next_action_task_id": str(next_action["id"]),
-                },
-            )
+                 data.get("is_commercial",False),tid))
+            cid = cur.fetchone()['id']
+            log_activity(conn,"client",cid,"create",f"Klient {data.get('name',data.get('display_name',''))} vytvoren")
             conn.commit()
-        # Auto-sync to crm.contacts + generate voice aliases (non-critical)
-        _upsert_contact_for_client(conn, tid, cid, data)
-        return {
-            "id": cid,
-            "client_code": code,
-            "status": "success",
-            "owner_user_id": int(owner["id"]),
-            "next_action_task_id": str(next_action["id"]),
-        }
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500,str(e))
-    finally:
-        release_conn(conn)
+        return {"id":cid,"client_code":code,"status":"success"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
 
 @app.put("/crm/clients/{client_id}")
-async def update_client(client_id: int, data: dict, request: Request):
+async def update_client(client_id: int, data: dict):
     conn = get_db_conn()
     try:
-        tid = get_request_tenant_id(request)
-        actor_user_id = request.state.user.get("user_id")
         sets = []; vals = []
-        if "owner_user_id" in data:
-            if data.get("owner_user_id") in (None, "", 0, "0"):
-                raise HTTPException(422, "Client owner cannot be empty")
-            owner = validate_active_user(conn, tid, data.get("owner_user_id"), "client owner")
-            sets.append("owner_user_id=%s"); vals.append(int(owner["id"]))
-        if "next_action_task_id" in data:
-            if not data.get("next_action_task_id"):
-                raise HTTPException(422, "Client next_action_task_id cannot be empty")
-            candidate = get_valid_client_next_action_task(conn, tid, client_id, str(data["next_action_task_id"]))
-            if not candidate:
-                raise HTTPException(422, "Client next action must point to an open planned client task")
-            sets.append("next_action_task_id=%s"); vals.append(str(data["next_action_task_id"]))
         for k in ["display_name","first_name","last_name","title","client_type","company_name","company_registration_no","vat_no","email_primary","email_secondary","phone_primary","phone_secondary","website","preferred_contact_method","billing_address_line1","billing_city","billing_postcode","billing_country","status","is_commercial"]:
-            if k in data:
-                sets.append(f"{k}=%s")
-                vals.append(clean_contact_display_name(data[k]) if k == "display_name" else data[k])
-        if not sets:
-            raise HTTPException(400,"Zadna data")
-        sets.append("updated_at=now()"); vals.extend([tid, client_id])
+            if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
+        if not sets: raise HTTPException(400,"Zadna data")
+        sets.append("updated_at=now()"); vals.append(client_id)
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE clients SET {','.join(sets)} WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL",vals)
-            if cur.rowcount == 0:
-                raise HTTPException(404, "Client not found")
-            validation = validate_client_hierarchy(conn, tid, client_id)
-            if not validation["valid"]:
-                raise HTTPException(422, f"Client hierarchy invalid: {', '.join(validation['issues'])}")
-            cur.execute("""
-                UPDATE clients
-                SET hierarchy_status='valid', updated_at=now()
-                WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
-            """, (tid, client_id))
-            log_activity(
-                conn,
-                "client",
-                client_id,
-                "update",
-                f"Klient upraven: {list(data.keys())}",
-                tenant_id=tid,
-                user_id=actor_user_id,
-                source_channel="crm",
-            )
+            cur.execute(f"UPDATE clients SET {','.join(sets)} WHERE id=%s AND deleted_at IS NULL",vals)
+            log_activity(conn,"client",client_id,"update",f"Klient upraven: {list(data.keys())}")
             conn.commit()
-        # Sync contact fields to crm.contacts if any voice-relevant field changed
-        _CONTACT_SYNC_FIELDS = {"display_name","first_name","last_name","company_name",
-                                 "phone_primary","email_primary","is_commercial"}
-        if any(k in data for k in _CONTACT_SYNC_FIELDS):
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT * FROM clients WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL",
-                        (tid, client_id)
-                    )
-                    client_row = cur.fetchone()
-                if client_row:
-                    _upsert_contact_for_client(conn, tid, client_id, dict(client_row))
-            except Exception as _e:
-                print(f"[update_client] contact sync error (non-critical): {_e}")
         return {"status":"updated"}
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500,str(e))
-    finally:
-        release_conn(conn)
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
 
 @app.delete("/crm/clients/{client_id}")
 async def archive_client(client_id: int):
@@ -6528,137 +996,70 @@ async def archive_client(client_id: int):
     finally: release_conn(conn)
 
 @app.post("/crm/clients/sync-contacts")
-async def sync_contacts(data: dict, request: Request):
-    """Store imported contacts per user and decide which of them should exist as shared server clients."""
-    tenant_id = get_request_tenant_id(request)
-    user_id = request.state.user.get("user_id")
-    filter_uk = bool(data.get("filter_uk", False))
+async def sync_contacts(data: dict):
+    """Sync phone contacts to CRM. Filters UK numbers if requested."""
+    filter_uk = data.get("filter_uk", False)
     contacts = data.get("contacts", [])
-    if not user_id:
-        raise HTTPException(401, "Authenticated user is required")
-    if not contacts:
-        raise HTTPException(400, "No contacts provided")
+    if not contacts: raise HTTPException(400, "No contacts provided")
 
     def is_uk_number(phone: str) -> bool:
-        clean = normalize_contact_phone(phone)
+        # Standard UK mobile: 07xxx, or +447xxx
+        # Standard UK landline: 01xxx, 02xxx, or +441xxx, +442xxx
+        clean = phone.replace("+", "").replace(" ", "").replace("-", "")
+        # Remove leading '44' if present and starts with 447, 441, 442
+        if clean.startswith("44"):
+            clean = "0" + clean[2:]
         return clean.startswith(("07", "01", "02"))
 
     conn = get_db_conn()
-    errors = []
+    created = 0; skipped = 0; errors = []
     try:
-        with conn.cursor() as cur:
-            seen_keys = set()
-            for contact in contacts:
-                name = clean_contact_display_name(contact.get("name") or contact.get("display_name"))
-                phone = (contact.get("phone") or "").strip()
-                email = (contact.get("email") or "").strip()
-                if not name and not phone and not email:
-                    continue
-                if filter_uk and phone and not is_uk_number(phone):
-                    continue
-                contact_key = contact.get("contact_key") or build_contact_key(name, phone, email)
-                if not contact_key or contact_key in seen_keys:
-                    continue
-                seen_keys.add(contact_key)
-                selected_flag = contact.get("selected_as_client")
-                address_fields = extract_contact_address_fields(contact)
-                cur.execute("""INSERT INTO user_contact_sync
-                    (
-                        tenant_id, user_id, contact_key, display_name, phone_primary, email_primary,
-                        address, address_line1, city, postcode, country,
-                        normalized_phone, normalized_email, is_client, last_seen_at, updated_at
-                    )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s, FALSE),now(),now())
-                    ON CONFLICT (tenant_id, user_id, contact_key) DO UPDATE SET
-                        display_name=EXCLUDED.display_name,
-                        phone_primary=EXCLUDED.phone_primary,
-                        email_primary=EXCLUDED.email_primary,
-                        address=EXCLUDED.address,
-                        address_line1=EXCLUDED.address_line1,
-                        city=EXCLUDED.city,
-                        postcode=EXCLUDED.postcode,
-                        country=EXCLUDED.country,
-                        normalized_phone=EXCLUDED.normalized_phone,
-                        normalized_email=EXCLUDED.normalized_email,
-                        is_client=CASE WHEN %s IS NULL THEN user_contact_sync.is_client ELSE %s END,
-                        last_seen_at=now(),
-                        updated_at=now()""",
-                    (
-                        tenant_id,
-                        user_id,
-                        contact_key,
-                        name or phone or email or "Contact",
-                        phone or None,
-                        email or None,
-                        address_fields.get("address"),
-                        address_fields.get("address_line1"),
-                        address_fields.get("city"),
-                        address_fields.get("postcode"),
-                        address_fields.get("country"),
-                        normalize_contact_phone(phone) or None,
-                        normalize_email(email) or None,
-                        selected_flag,
-                        selected_flag,
-                        selected_flag,
-                    ))
-            conn.commit()
-
-        with conn.cursor() as cur:
-            cur.execute("""SELECT contact_key FROM user_contact_sync
-                WHERE tenant_id=%s AND user_id=%s""", (tenant_id, user_id))
-            contact_keys = [row["contact_key"] for row in cur.fetchall()]
-
-        for contact_key in contact_keys:
+        batch_size = 50
+        for i in range(0, len(contacts), batch_size):
+            batch = contacts[i:i+batch_size]
             try:
-                reconcile_contact_selection(conn, tenant_id, user_id, contact_key)
-            except Exception as reconcile_error:
-                errors.append(f"{contact_key}: {reconcile_error}")
-        conn.commit()
+                with conn.cursor() as cur:
+                    for c in batch:
+                        try:
+                            cur.execute("SAVEPOINT contact_sync")
+                            name = c.get("name","").strip()
+                            phone = c.get("phone","").strip()
+                            email = c.get("email","")
+                            if not name or not phone: continue
 
-        with conn.cursor() as cur:
-            cur.execute("""SELECT ucs.contact_key, ucs.display_name, ucs.phone_primary, ucs.email_primary,
-                                  ucs.address, ucs.address_line1, ucs.city, ucs.postcode, ucs.country,
-                                  ucs.is_client, ucs.linked_client_id, c.display_name AS linked_client_name
-                FROM user_contact_sync ucs
-                LEFT JOIN clients c ON c.id = ucs.linked_client_id AND c.deleted_at IS NULL
-                WHERE ucs.tenant_id=%s AND ucs.user_id=%s
-                ORDER BY LOWER(ucs.display_name), LOWER(COALESCE(ucs.email_primary,'')), LOWER(COALESCE(ucs.phone_primary,''))""",
-                (tenant_id, user_id))
-            rows = [dict(row) for row in cur.fetchall()]
+                            # Apply UK filter if requested
+                            if filter_uk and not is_uk_number(phone):
+                                skipped += 1; cur.execute("RELEASE SAVEPOINT contact_sync"); continue
 
-        return {
-            "total_contacts": len(rows),
-            "selected_clients": sum(1 for row in rows if row.get("is_client")),
-            "contacts": [
-                {
-                    "contact_key": row["contact_key"],
-                    "name": row["display_name"],
-                    "phone": row.get("phone_primary"),
-                    "email": row.get("email_primary"),
-                    "address": row.get("address"),
-                    "address_line1": row.get("address_line1"),
-                    "city": row.get("city"),
-                    "postcode": row.get("postcode"),
-                    "country": row.get("country"),
-                    "billing_address_line1": row.get("address_line1") or row.get("address"),
-                    "billing_city": row.get("city"),
-                    "billing_postcode": row.get("postcode"),
-                    "billing_country": row.get("country"),
-                    "selected_as_client": bool(row.get("is_client")),
-                    "linked_client_id": row.get("linked_client_id"),
-                    "linked_client_name": row.get("linked_client_name"),
-                }
-                for row in rows
-            ],
-            "errors": errors,
-        }
-    except HTTPException:
-        raise
+                            clean = phone.replace("+","").replace(" ","").replace("-","")
+                            cur.execute("SELECT id FROM clients WHERE REPLACE(REPLACE(REPLACE(phone_primary,'+',''),' ',''),'-','') = %s AND deleted_at IS NULL LIMIT 1", (clean,))
+                            if cur.fetchone():
+                                cur.execute("RELEASE SAVEPOINT contact_sync")
+                                skipped += 1; continue
+                            code = f"CL-PH-{clean[-6:]}"
+                            cur.execute("""INSERT INTO clients (client_code,client_type,display_name,phone_primary,email_primary,status,tenant_id)
+                                VALUES (%s,'individual',%s,%s,%s,'active',1)
+                                RETURNING id""",
+                                (code, name, phone, email if email else None))
+                            row = cur.fetchone()
+                            if row:
+                                created += 1
+                                log_activity(conn,"client",row["id"],"sync",f"Kontakt importovan z telefonu: {name}")
+                                cur.execute("RELEASE SAVEPOINT contact_sync")
+                            else:
+                                cur.execute("ROLLBACK TO SAVEPOINT contact_sync")
+                                skipped += 1
+                        except Exception as e:
+                            cur.execute("ROLLBACK TO SAVEPOINT contact_sync")
+                            errors.append(f"{c.get('name', 'Unknown')}: {str(e)}")
+                    conn.commit()
+            except Exception as e:
+                conn.rollback()
+                errors.append(f"Batch error: {str(e)}")
+        return {"created": created, "skipped": skipped, "errors": errors, "total": len(contacts)}
     except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
+        conn.rollback(); raise HTTPException(500, str(e))
+    finally: release_conn(conn)
 
 @app.post("/crm/clients/{client_id}/notes")
 async def add_client_note(client_id: int, data: dict):
@@ -6666,7 +1067,7 @@ async def add_client_note(client_id: int, data: dict):
     try:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO client_notes (client_id,note,created_by) VALUES (%s,%s,%s) RETURNING id,note,created_by,created_at::text",
-                (client_id,data.get("note",""),data.get("created_by","system")))
+                (client_id,data.get("note",""),data.get("created_by","Marek")))
             note = dict(cur.fetchone())
             log_activity(conn,"client",client_id,"note",f"Poznamka: {data.get('note','')[:50]}")
             conn.commit()
@@ -6681,15 +1082,7 @@ async def get_jobs(request: Request, client_id: Optional[int] = None, status: Op
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = """SELECT j.id,j.job_number,j.job_title,j.job_status,j.client_id,j.property_id,j.quote_id,
-                j.start_date_planned::text,j.planned_start_at::text,j.planned_end_at::text,
-                j.assigned_user_id,j.assigned_to,j.next_action_task_id,j.hierarchy_status,
-                j.handover_note,j.handed_over_by,j.handed_over_at::text,
-                COALESCE(j.calendar_sync_enabled, TRUE) AS calendar_sync_enabled,
-                j.created_at::text,j.updated_at::text,c.display_name as client_name
-                FROM jobs j
-                LEFT JOIN clients c ON j.client_id=c.id
-                WHERE j.deleted_at IS NULL AND j.tenant_id=%s"""
+            sql = "SELECT j.id,j.job_number,j.job_title,j.job_status,j.client_id,j.property_id,j.quote_id,j.start_date_planned::text,j.created_at::text,j.updated_at::text,c.display_name as client_name FROM jobs j LEFT JOIN clients c ON j.client_id=c.id WHERE j.deleted_at IS NULL AND j.tenant_id=%s"
             params = [tid]
             if client_id: sql += " AND j.client_id=%s"; params.append(client_id)
             if status: sql += " AND j.job_status=%s"; params.append(status)
@@ -6698,39 +1091,18 @@ async def get_jobs(request: Request, client_id: Optional[int] = None, status: Op
     finally: release_conn(conn)
 
 @app.get("/crm/jobs/{job_id}")
-async def get_job_detail(job_id: int, request: Request):
-    tid = get_request_tenant_id(request)
+async def get_job_detail(job_id: int):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""SELECT *
-                FROM jobs WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""",(job_id, tid))
+            cur.execute("SELECT * FROM jobs WHERE id=%s AND deleted_at IS NULL",(job_id,))
             job = cur.fetchone()
             if not job: raise HTTPException(404)
-            cur.execute("""SELECT *
-                FROM tasks WHERE job_id=%s AND tenant_id=%s ORDER BY created_at DESC""",(job_id, tid))
+            cur.execute("SELECT * FROM tasks WHERE job_id=%s ORDER BY created_at DESC",(job_id,))
             tasks = cur.fetchall()
-            cur.execute("""SELECT id,job_id,note,note_type,created_by,created_at::text,updated_at::text
-                FROM job_notes WHERE job_id=%s AND tenant_id=%s ORDER BY created_at DESC""",(job_id, tid))
+            cur.execute("SELECT id,note,created_by,created_at::text FROM job_notes WHERE job_id=%s ORDER BY created_at DESC",(job_id,))
             notes = cur.fetchall()
-            cur.execute("""SELECT id,entity_type,entity_id,filename,description,photo_type,file_path,thumbnail_base64,
-                    created_by,created_at::text
-                FROM photos
-                WHERE tenant_id=%s AND entity_type='job' AND entity_id=%s
-                ORDER BY created_at DESC""", (tid, str(job_id)))
-            photos = [map_photo_row_to_job_photo(dict(r)) for r in cur.fetchall()]
-            cur.execute("""SELECT id,entity_id,action,description,user_name,created_at::text
-                FROM activity_timeline
-                WHERE tenant_id=%s AND entity_type='job' AND entity_id=%s
-                ORDER BY created_at DESC""", (tid, str(job_id)))
-            audit_rows = [map_audit_row_to_job_audit(dict(r)) for r in cur.fetchall()]
-            return {
-                "job":dict(job),
-                "tasks":[dict(t) for t in tasks],
-                "notes":[dict(n) for n in notes],
-                "photos": photos,
-                "audit_log": audit_rows,
-            }
+            return {"job":dict(job),"tasks":[dict(t) for t in tasks],"notes":[dict(n) for n in notes]}
     finally: release_conn(conn)
 
 @app.post("/crm/jobs")
@@ -6739,172 +1111,42 @@ async def create_job(data: dict, request: Request):
     conn = get_db_conn()
     try:
         ok, msg = check_subscription_limit(conn, tid, "jobs")
-        if not ok:
-            raise HTTPException(429, msg)
+        if not ok: raise HTTPException(429, msg)
         code = f"JOB-{uuid.uuid4().hex[:6].upper()}"
-        first_action = data.get("first_action")
-        if not isinstance(first_action, dict):
-            raise HTTPException(422, "Job must include first_action")
-        actor_user_id = request.state.user.get("user_id")
-        actor_name = get_user_display_name(conn, tid, actor_user_id) or "system"
-        assigned_user_id, assigned_to = resolve_assigned_user(conn, tid, data.get("assigned_user_id"), data.get("assigned_to"))
-        owner = validate_active_user(conn, tid, assigned_user_id, "job owner")
-        planning_start, planning_end = planning_window_from_values(
-            data.get("planned_start_at"), data.get("planned_end_at"), data.get("start_date")
-        )
-        handover_note = (data.get("handover_note") or "").strip() or None
-        handover_by = actor_name
-        handover_at = datetime.utcnow() if (handover_note or assigned_to) else None
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO jobs (
-                    tenant_id, job_number, client_id, property_id, job_title, job_status,
-                    start_date_planned, planned_start_at, planned_end_at,
-                    assigned_user_id, assigned_to, next_action_task_id, hierarchy_status,
-                    handover_note, handed_over_by, handed_over_at, calendar_sync_enabled
-                ) VALUES (%s,%s,%s,%s,%s,'nova',%s,%s,%s,%s,%s,NULL,'pending',%s,%s,%s,%s) RETURNING id""",
-                (
-                    tid,
-                    code,
-                    data.get("client_id"),
-                    data.get("property_id",data.get("client_id")),
-                    data.get("title","Zakazka"),
-                    data.get("start_date"),
-                    planning_start,
-                    planning_end,
-                    int(owner["id"]),
-                    assigned_to or owner["display_name"],
-                    handover_note,
-                    handover_by,
-                    handover_at,
-                    data.get("calendar_sync_enabled", True),
-                ))
+            cur.execute("INSERT INTO jobs (job_number,client_id,property_id,job_title,job_status,start_date_planned) VALUES (%s,%s,%s,%s,'nova',%s) RETURNING id",
+                (code,data.get("client_id"),data.get("property_id",data.get("client_id")),data.get("title","Zakazka"),data.get("start_date")))
             jid = cur.fetchone()['id']
-            next_action = create_workflow_task(
-                conn,
-                tid,
-                first_action,
-                actor_name=actor_name,
-                default_client_id=data.get("client_id"),
-                default_client_name=data.get("client_name"),
-                default_job_id=jid,
-                default_property_id=data.get("property_id", data.get("client_id")),
-                default_property_address=data.get("property_address"),
-                source="job_first_action",
-            )
-            set_job_next_action(conn, tid, jid, str(next_action["id"]))
-            validation = validate_job_hierarchy(conn, tid, jid)
-            if not validation["valid"]:
-                raise HTTPException(422, f"Job hierarchy invalid: {', '.join(validation['issues'])}")
-            log_activity(
-                conn,
-                "job",
-                jid,
-                "create",
-                f"Zakazka {code} vytvorena",
-                tenant_id=tid,
-                user_id=actor_user_id,
-                source_channel="crm",
-                details={
-                    "assigned_user_id": int(owner["id"]),
-                    "next_action_task_id": str(next_action["id"]),
-                },
-            )
+            log_activity(conn,"job",jid,"create",f"Zakazka {code} vytvorena")
             conn.commit()
-        return {
-            "id": jid,
-            "job_number": code,
-            "status": "created",
-            "assigned_user_id": int(owner["id"]),
-            "next_action_task_id": str(next_action["id"]),
-        }
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500,str(e))
-    finally:
-        release_conn(conn)
+        return {"id":jid,"job_number":code,"status":"created"}
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
 
 @app.put("/crm/jobs/{job_id}")
-async def update_job(job_id: int, data: dict, request: Request):
+async def update_job(job_id: int, data: dict):
     conn = get_db_conn()
     try:
-        tid = get_request_tenant_id(request)
-        actor_user_id = request.state.user.get("user_id")
         with conn.cursor() as cur:
             # Validate state transition if status is being changed
             if "job_status" in data:
-                cur.execute("SELECT job_status FROM jobs WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL",(tid, job_id))
+                cur.execute("SELECT job_status FROM jobs WHERE id=%s AND deleted_at IS NULL",(job_id,))
                 row = cur.fetchone()
-                if not row:
-                    raise HTTPException(404,"Job not found")
+                if not row: raise HTTPException(404,"Job not found")
                 err = validate_state_transition(row["job_status"], data["job_status"], JOB_TRANSITIONS, "Job")
-                if err:
-                    raise HTTPException(422, err)
+                if err: raise HTTPException(422, err)
             sets = []; vals = []
-            if "assigned_user_id" in data or "assigned_to" in data:
-                assigned_user_id, assigned_to = resolve_assigned_user(conn, tid, data.get("assigned_user_id"), data.get("assigned_to"))
-                owner = validate_active_user(conn, tid, assigned_user_id, "job owner")
-                sets.append("assigned_user_id=%s"); vals.append(int(owner["id"]))
-                sets.append("assigned_to=%s"); vals.append(assigned_to or owner["display_name"])
-                sets.append("handed_over_by=%s"); vals.append(get_user_display_name(conn, tid, actor_user_id))
-                sets.append("handed_over_at=%s"); vals.append(datetime.utcnow())
-            if "next_action_task_id" in data:
-                if not data.get("next_action_task_id"):
-                    raise HTTPException(422, "Job next_action_task_id cannot be empty")
-                candidate = get_valid_job_next_action_task(conn, tid, job_id, str(data["next_action_task_id"]))
-                if not candidate:
-                    raise HTTPException(422, "Job next action must point to an open planned job task")
-                sets.append("next_action_task_id=%s"); vals.append(str(data["next_action_task_id"]))
-            if "handover_note" in data:
-                sets.append("handover_note=%s"); vals.append((data.get("handover_note") or "").strip() or None)
-                sets.append("handed_over_by=%s"); vals.append(get_user_display_name(conn, tid, actor_user_id))
-                sets.append("handed_over_at=%s"); vals.append(datetime.utcnow())
-            if "planned_start_at" in data or "planned_end_at" in data or "start_date_planned" in data:
-                planning_start, planning_end = planning_window_from_values(
-                    data.get("planned_start_at"), data.get("planned_end_at"), data.get("start_date_planned")
-                )
-                if "planned_start_at" in data or "start_date_planned" in data:
-                    sets.append("planned_start_at=%s"); vals.append(planning_start)
-                if "planned_end_at" in data or "planned_start_at" in data:
-                    sets.append("planned_end_at=%s"); vals.append(planning_end)
-            for k in ["job_title","job_status","start_date_planned","calendar_sync_enabled"]:
+            for k in ["job_title","job_status","start_date_planned"]:
                 if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
-            if not sets:
-                raise HTTPException(400)
-            sets.append("updated_at=now()"); vals.extend([tid, job_id])
-            cur.execute(f"UPDATE jobs SET {','.join(sets)} WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL",vals)
-            if cur.rowcount == 0:
-                raise HTTPException(404, "Job not found")
-            validation = validate_job_hierarchy(conn, tid, job_id)
-            if not validation["valid"]:
-                raise HTTPException(422, f"Job hierarchy invalid: {', '.join(validation['issues'])}")
-            cur.execute("""
-                UPDATE jobs
-                SET hierarchy_status='valid', updated_at=now()
-                WHERE tenant_id=%s AND id=%s AND deleted_at IS NULL
-            """, (tid, job_id))
-            log_activity(
-                conn,
-                "job",
-                job_id,
-                "update",
-                f"Zakazka upravena: {list(data.keys())}",
-                tenant_id=tid,
-                user_id=actor_user_id,
-                source_channel="crm",
-            )
+            if not sets: raise HTTPException(400)
+            sets.append("updated_at=now()"); vals.append(job_id)
+            cur.execute(f"UPDATE jobs SET {','.join(sets)} WHERE id=%s AND deleted_at IS NULL",vals)
+            log_activity(conn,"job",job_id,"update",f"Zakazka upravena: {list(data.keys())}")
             conn.commit()
         return {"status":"updated"}
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500,str(e))
-    finally:
-        release_conn(conn)
+    except HTTPException: raise
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
 
 # ========== REST API: TASKS ==========
 @app.get("/crm/tasks")
@@ -6913,7 +1155,7 @@ async def get_tasks(request: Request, status: Optional[str]=None, client_id: Opt
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = """SELECT * FROM tasks WHERE tenant_id=%s"""; params = [tid]
+            sql = "SELECT * FROM tasks WHERE tenant_id=%s"; params = [tid]
             if status: sql += " AND status=%s"; params.append(status)
             if client_id: sql += " AND client_id=%s"; params.append(client_id)
             if job_id: sql += " AND job_id=%s"; params.append(job_id)
@@ -6923,232 +1165,57 @@ async def get_tasks(request: Request, status: Optional[str]=None, client_id: Opt
     finally: release_conn(conn)
 
 @app.post("/crm/tasks")
-async def api_create_task(data: dict, request: Request):
+async def api_create_task(data: dict):
     conn = get_db_conn()
     try:
-        tenant_id = get_request_tenant_id(request)
-        actor_user_id = request.state.user.get("user_id")
-        actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
-        task = create_workflow_task(
-            conn,
-            tenant_id,
-            data,
-            actor_name=actor_name,
-            default_client_id=data.get("client_id"),
-            default_client_name=data.get("client_name"),
-            default_job_id=data.get("job_id"),
-            default_property_id=data.get("property_id"),
-            default_property_address=data.get("property_address"),
-            source=data.get("source") or "manualne",
-        )
-        if data.get("set_as_next_action") is True:
-            if task.get("job_id"):
-                set_job_next_action(conn, tenant_id, int(task["job_id"]), str(task["id"]))
-            elif task.get("client_id"):
-                set_client_next_action(conn, tenant_id, int(task["client_id"]), str(task["id"]))
-            else:
-                raise HTTPException(422, "set_as_next_action requires client_id or job_id")
+        tid = data.get("id",str(uuid.uuid4()))
         with conn.cursor() as cur:
-            if task.get("job_id"):
-                validation = validate_job_hierarchy(conn, tenant_id, int(task["job_id"]))
-                if not validation["valid"] and data.get("set_as_next_action") is True:
-                    raise HTTPException(422, f"Job hierarchy invalid: {', '.join(validation['issues'])}")
-            elif task.get("client_id"):
-                validation = validate_client_hierarchy(conn, tenant_id, int(task["client_id"]))
-                if not validation["valid"] and data.get("set_as_next_action") is True:
-                    raise HTTPException(422, f"Client hierarchy invalid: {', '.join(validation['issues'])}")
-            log_activity(
-                conn,
-                "task",
-                task["id"],
-                "create",
-                f"Ukol '{data.get('title','')}' vytvoren",
-                tenant_id=tenant_id,
-                user_id=actor_user_id,
-                source_channel="crm",
-            )
+            cur.execute("""INSERT INTO tasks (id,title,description,task_type,status,priority,deadline,planned_date,
+                estimated_minutes,created_by,assigned_to,client_id,client_name,job_id,property_id,property_address,
+                is_recurring,recurrence_rule,communication_method,source,is_billable,has_cost,checklist)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                (tid,data.get("title",""),data.get("description"),data.get("task_type","interni_poznamka"),
+                 data.get("status","novy"),data.get("priority","bezna"),data.get("deadline"),data.get("planned_date"),
+                 data.get("estimated_minutes"),data.get("created_by","Marek"),data.get("assigned_to"),
+                 data.get("client_id"),data.get("client_name"),data.get("job_id"),data.get("property_id"),
+                 data.get("property_address"),data.get("is_recurring",False),data.get("recurrence_rule"),
+                 data.get("communication_method"),data.get("source","manualne"),
+                 data.get("is_billable",False),data.get("has_cost",False),json.dumps(data.get("checklist",[]))))
+            task = dict(cur.fetchone())
+            log_activity(conn,"task",tid,"create",f"Ukol '{data.get('title','')}' vytvoren")
             conn.commit()
         return task
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500,str(e))
-    finally:
-        release_conn(conn)
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
 
 @app.put("/crm/tasks/{task_id}")
-async def update_task(task_id: str, data: dict, request: Request):
+async def update_task(task_id: str, data: dict):
     conn = get_db_conn()
     try:
         sets = []; vals = []
-        tenant_id = get_request_tenant_id(request)
-        actor_user_id = request.state.user.get("user_id")
-        actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or "system"
-        current_task = get_task_row(conn, tenant_id, task_id)
-        if not current_task:
-            raise HTTPException(404, "Task not found")
-        new_assigned_user_id = current_task.get("assigned_user_id")
-        new_assigned_to = current_task.get("assigned_to")
-        if "assigned_user_id" in data or "assigned_to" in data:
-            assigned_user_id, assigned_to = resolve_assigned_user(conn, tenant_id, data.get("assigned_user_id"), data.get("assigned_to"))
-            assignee = validate_active_user(conn, tenant_id, assigned_user_id, "task assignee")
-            sets.append("assigned_to=%s"); vals.append(assigned_to)
-            sets.append("assigned_user_id=%s"); vals.append(int(assignee["id"]))
-            sets.append("delegated_by=%s"); vals.append(actor_name)
-            new_assigned_user_id = int(assignee["id"])
-            new_assigned_to = assigned_to
-        else:
-            validate_active_user(conn, tenant_id, current_task.get("assigned_user_id"), "task assignee")
-        merged_planning_payload = {
-            "planned_start_at": data.get("planned_start_at", current_task.get("planned_start_at")),
-            "planned_end_at": data.get("planned_end_at", current_task.get("planned_end_at")),
-            "planned_date": data.get("planned_date", current_task.get("planned_date")),
-            "deadline": data.get("deadline", current_task.get("deadline")),
-        }
-        planning_start, planning_end, deadline = validate_task_planning(merged_planning_payload)
-        if "planned_start_at" in data or "planned_end_at" in data or "planned_date" in data or "deadline" in data:
-            if "planned_start_at" in data or "planned_date" in data or "deadline" in data:
-                sets.append("planned_start_at=%s"); vals.append(planning_start)
-            if "planned_end_at" in data or "planned_start_at" in data:
-                sets.append("planned_end_at=%s"); vals.append(planning_end)
-            if "deadline" in data:
-                sets.append("deadline=%s"); vals.append(deadline)
-        for k in ["title","description","task_type","status","priority","deadline","result","is_completed","actual_minutes","planned_date","planning_note","reminder_for_assignee_only","calendar_sync_enabled"]:
-            if k in data and not (k == "deadline" and ("planned_start_at" in data or "planned_end_at" in data or "planned_date" in data or "deadline" in data)):
-                sets.append(f"{k}=%s"); vals.append(data[k])
-        if "notes" in data:
-            sets.append("notes=%s"); vals.append(json.dumps(data["notes"]))
-        if "checklist" in data:
-            sets.append("checklist=%s"); vals.append(json.dumps(data["checklist"]))
-        will_close = bool(data.get("is_completed") is True or data.get("status") in ("hotovo", "zruseno"))
-        links = get_task_next_action_links(conn, tenant_id, task_id)
-        if will_close and links:
-            replace_next_action_links(
-                conn,
-                tenant_id,
-                current_task,
-                replacement_task_id=data.get("replacement_task_id"),
-                replacement_task_payload=data.get("replacement_task_payload"),
-                actor_user_id=actor_user_id,
-                actor_name=actor_name,
-            )
-        if not sets:
-            raise HTTPException(400, "No changes provided")
-        sets.append("updated_at=now()"); vals.extend([tenant_id, task_id])
+        for k in ["title","description","task_type","status","priority","deadline","assigned_to","result","is_completed","actual_minutes","planned_date"]:
+            if k in data: sets.append(f"{k}=%s"); vals.append(data[k])
+        if "notes" in data: sets.append("notes=%s"); vals.append(json.dumps(data["notes"]))
+        if "checklist" in data: sets.append("checklist=%s"); vals.append(json.dumps(data["checklist"]))
+        sets.append("updated_at=now()"); vals.append(task_id)
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE tenant_id=%s AND id=%s",vals)
-            if cur.rowcount == 0:
-                raise HTTPException(404, "Task not found")
-            for link in links:
-                validation = (
-                    validate_client_hierarchy(conn, tenant_id, int(link["entity_id"]))
-                    if link["entity_type"] == "client"
-                    else validate_job_hierarchy(conn, tenant_id, int(link["entity_id"]))
-                )
-                if not validation["valid"]:
-                    raise HTTPException(422, f"{link['entity_type'].capitalize()} hierarchy invalid: {', '.join(validation['issues'])}")
-            log_activity(
-                conn,
-                "task",
-                task_id,
-                "update",
-                f"Ukol upraven: {list(data.keys())}",
-                tenant_id=tenant_id,
-                user_id=actor_user_id,
-                source_channel="crm",
-            )
+            cur.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=%s",vals)
+            log_activity(conn,"task",task_id,"update",f"Ukol upraven: {list(data.keys())}")
             conn.commit()
         return {"status":"updated"}
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500,str(e))
-    finally:
-        release_conn(conn)
-
-@app.get("/crm/calendar-feed")
-async def get_calendar_feed(request: Request, days: int = 30):
-    user = ensure_request_permissions(request, "calendar_read")
-    tenant_id = user["tenant_id"]
-    current_user_id = user.get("user_id")
-    conn = get_db_conn()
-    try:
-        entries = []
-        cutoff = datetime.utcnow() - timedelta(days=1)
-        with conn.cursor() as cur:
-            cur.execute("""SELECT j.id, j.job_title, j.job_status, j.client_id, c.display_name AS client_name,
-                    j.start_date_planned::text, j.planned_start_at::text, j.planned_end_at::text,
-                    j.assigned_user_id, j.assigned_to, j.handover_note, COALESCE(j.calendar_sync_enabled, TRUE) AS calendar_sync_enabled
-                FROM jobs j
-                LEFT JOIN clients c ON c.id = j.client_id
-                WHERE j.tenant_id=%s AND j.deleted_at IS NULL
-                ORDER BY COALESCE(j.planned_start_at, j.created_at) DESC""", (tenant_id,))
-            for row in cur.fetchall():
-                entry = build_calendar_entry("job", dict(row), current_user_id)
-                if not entry:
-                    continue
-                start_dt = parse_planning_datetime(entry.get("planned_start_at"))
-                if start_dt and start_dt >= cutoff and start_dt <= datetime.utcnow() + timedelta(days=days):
-                    entries.append(entry)
-
-            cur.execute("""SELECT t.id, t.title, t.status, t.client_id, t.client_name, t.job_id,
-                    j.job_title, t.deadline, t.planned_date, t.planned_start_at::text, t.planned_end_at::text,
-                    t.assigned_user_id, t.assigned_to, t.planning_note,
-                    COALESCE(t.reminder_for_assignee_only, TRUE) AS reminder_for_assignee_only,
-                    COALESCE(t.calendar_sync_enabled, TRUE) AS calendar_sync_enabled
-                FROM tasks t
-                LEFT JOIN jobs j ON j.id = t.job_id
-                WHERE t.tenant_id=%s AND COALESCE(t.is_completed, FALSE)=FALSE
-                ORDER BY COALESCE(t.planned_start_at, t.created_at) DESC""", (tenant_id,))
-            for row in cur.fetchall():
-                entry = build_calendar_entry("task", dict(row), current_user_id, row.get("job_title"))
-                if not entry:
-                    continue
-                start_dt = parse_planning_datetime(entry.get("planned_start_at"))
-                if start_dt and start_dt >= cutoff and start_dt <= datetime.utcnow() + timedelta(days=days):
-                    entries.append(entry)
-
-        entries.sort(key=lambda item: item.get("planned_start_at") or "")
-        return entries
-    finally:
-        release_conn(conn)
+    except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
+    finally: release_conn(conn)
 
 @app.delete("/crm/tasks/{task_id}")
-async def delete_task(task_id: str, request: Request):
+async def delete_task(task_id: str):
     conn = get_db_conn()
     try:
-        tenant_id = get_request_tenant_id(request)
-        actor_user_id = request.state.user.get("user_id")
-        if get_task_next_action_links(conn, tenant_id, task_id):
-            raise HTTPException(422, "Current next action task cannot be deleted")
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM tasks WHERE tenant_id=%s AND id=%s",(tenant_id, task_id))
-            if cur.rowcount == 0:
-                raise HTTPException(404, "Task not found")
-            log_activity(
-                conn,
-                "task",
-                task_id,
-                "delete",
-                "Ukol smazan",
-                tenant_id=tenant_id,
-                user_id=actor_user_id,
-                source_channel="crm",
-            )
+            cur.execute("DELETE FROM tasks WHERE id=%s",(task_id,))
+            log_activity(conn,"task",task_id,"delete","Ukol smazan")
             conn.commit()
         return {"status":"deleted"}
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
+    finally: release_conn(conn)
 
 # ========== REST API: LEADS ==========
 @app.get("/crm/leads")
@@ -7223,7 +1290,7 @@ async def convert_lead_to_client(lead_id: int, data: dict):
             cur.execute("SELECT * FROM leads WHERE id=%s",(lead_id,))
             lead = cur.fetchone()
             if not lead: raise HTTPException(404,"Lead nenalezen")
-            name = clean_contact_display_name(data.get("name") or lead.get("contact_name")) or "Nový klient"
+            name = data.get("name",lead.get("contact_name","Nový klient"))
             email = data.get("email",lead.get("contact_email"))
             phone = data.get("phone",lead.get("contact_phone"))
             code = f"CL-{uuid.uuid4().hex[:6].upper()}"
@@ -7288,876 +1355,6 @@ async def create_invoice(data: dict):
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
-@app.get("/crm/contact-sections")
-async def get_contact_sections(request: Request):
-    user = ensure_request_permissions(request, "contacts_read")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""SELECT section_code, display_name, is_default, sort_order
-                FROM contact_sections
-                WHERE tenant_id=%s AND is_active=TRUE
-                ORDER BY sort_order, LOWER(display_name)""", (user["tenant_id"],))
-            return [dict(row) for row in cur.fetchall()]
-    finally:
-        release_conn(conn)
-
-@app.post("/crm/contact-sections")
-async def create_contact_section(data: dict, request: Request):
-    user = ensure_request_permissions(request, "contacts_write")
-    tenant_id = user["tenant_id"]
-    display_name = clean_contact_display_name(data.get("display_name"))
-    if not display_name:
-        raise HTTPException(400, "display_name required")
-    section_code = normalize_section_code(data.get("section_code") or display_name)
-    if not section_code:
-        raise HTTPException(400, "section_code required")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_sort FROM contact_sections WHERE tenant_id=%s", (tenant_id,))
-            max_sort = int((cur.fetchone() or {}).get("max_sort") or 0)
-            explicit_sort = data.get("sort_order")
-            sort_val = int(explicit_sort) if explicit_sort is not None else (max_sort + 10)
-            cur.execute("""INSERT INTO contact_sections (tenant_id, section_code, display_name, is_default, sort_order, is_active, updated_at)
-                VALUES (%s,%s,%s,FALSE,%s,TRUE,now())
-                ON CONFLICT (tenant_id, section_code) DO UPDATE SET
-                    display_name=EXCLUDED.display_name,
-                    sort_order=EXCLUDED.sort_order,
-                    is_active=TRUE,
-                    updated_at=now()
-                RETURNING section_code, display_name, is_default, sort_order""",
-                (tenant_id, section_code, display_name, sort_val))
-            row = dict(cur.fetchone())
-            conn.commit()
-            return row
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-@app.get("/crm/contacts")
-async def get_shared_contacts(request: Request):
-    user = ensure_request_permissions(request, "contacts_read")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""SELECT c.id, c.section_code, s.display_name AS section_name, c.display_name, c.company_name,
-                                  c.phone_primary, c.email_primary, c.address, c.address_line1, c.city, c.postcode,
-                                  c.country, c.notes, c.source, c.created_at::text, c.updated_at::text
-                FROM shared_contacts c
-                LEFT JOIN contact_sections s ON s.tenant_id=c.tenant_id AND s.section_code=c.section_code
-                WHERE c.tenant_id=%s AND c.deleted_at IS NULL
-                  AND (c.section_code NOT IN ('private','other')
-                       OR c.owner_user_id IS NULL
-                       OR c.owner_user_id=%s)
-                ORDER BY s.sort_order, LOWER(c.display_name), c.id""", (user["tenant_id"], user.get("user_id")))
-            return [dict(row) for row in cur.fetchall()]
-    finally:
-        release_conn(conn)
-
-@app.post("/crm/contacts")
-async def create_shared_contact(data: dict, request: Request):
-    user = ensure_request_permissions(request, "contacts_write")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            row, created = merge_shared_contact(cur, user["tenant_id"], user["user_id"], data, source=data.get("source") or "manual")
-            log_activity(conn, "shared_contact", row["id"], "create" if created else "merge", f"Contact {row['display_name']} saved", tenant_id=user["tenant_id"], user_id=user["user_id"])
-            conn.commit()
-            return row
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-@app.put("/crm/contacts/{contact_id}")
-async def update_shared_contact(contact_id: int, data: dict, request: Request):
-    user = ensure_request_permissions(request, "contacts_write")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM shared_contacts WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (contact_id, user["tenant_id"]))
-            existing = cur.fetchone()
-            if not existing:
-                raise HTTPException(404, "Contact not found")
-            existing = dict(existing)
-            section_code = normalize_section_code(data.get("section_code") or existing.get("section_code"))
-            ensure_contact_section(cur, user["tenant_id"], section_code)
-            display_name = clean_contact_display_name(data.get("display_name") or existing.get("display_name"))
-            if not display_name:
-                raise HTTPException(400, "display_name required")
-            phone_primary = (data.get("phone_primary") or existing.get("phone_primary") or "").strip() or None
-            email_primary = (data.get("email_primary") or existing.get("email_primary") or "").strip() or None
-            address_fields = extract_contact_address_fields({**existing, **data})
-            cur.execute("""UPDATE shared_contacts
-                SET section_code=%s,
-                    display_name=%s,
-                    company_name=%s,
-                    phone_primary=%s,
-                    email_primary=%s,
-                    address=%s,
-                    address_line1=%s,
-                    city=%s,
-                    postcode=%s,
-                    country=%s,
-                    notes=%s,
-                    normalized_phone=%s,
-                    normalized_email=%s,
-                    updated_by=%s,
-                    updated_at=now()
-                WHERE id=%s AND tenant_id=%s
-                RETURNING *""",
-                (
-                    section_code,
-                    display_name,
-                    (data.get("company_name") if "company_name" in data else existing.get("company_name")) or None,
-                    phone_primary,
-                    email_primary,
-                    address_fields.get("address"),
-                    address_fields.get("address_line1"),
-                    address_fields.get("city"),
-                    address_fields.get("postcode"),
-                    address_fields.get("country"),
-                    (data.get("notes") if "notes" in data else existing.get("notes")) or None,
-                    normalize_phone(phone_primary) or None,
-                    normalize_email(email_primary) or None,
-                    user["user_id"],
-                    contact_id,
-                    user["tenant_id"],
-                ))
-            row = dict(cur.fetchone())
-            log_activity(conn, "shared_contact", row["id"], "update", f"Contact {row['display_name']} updated", tenant_id=user["tenant_id"], user_id=user["user_id"])
-            conn.commit()
-            return row
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-@app.delete("/crm/contacts/{contact_id}")
-async def delete_shared_contact(contact_id: int, request: Request):
-    user = ensure_request_permissions(request, "contacts_write")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""UPDATE shared_contacts
-                SET deleted_at=now(), updated_at=now(), updated_by=%s
-                WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL
-                RETURNING id, display_name""", (user["user_id"], contact_id, user["tenant_id"]))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Contact not found")
-            log_activity(conn, "shared_contact", row["id"], "archive", f"Contact {row['display_name']} archived", tenant_id=user["tenant_id"], user_id=user["user_id"])
-            conn.commit()
-            return {"status": "archived", "id": row["id"]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-# ===== CONTACT VOICE ALIAS SYNC =====
-
-def _upsert_contact_for_client(conn, tenant_id: int, client_id: int, client_data: dict):
-    """Upsert crm.contacts entry for a client and regenerate voice aliases.
-    Called after POST/PUT /crm/clients. Never raises — all errors are logged only.
-    Uses SELECT+INSERT/UPDATE pattern to avoid needing a UNIQUE constraint."""
-    import re as _re
-
-    def _norm_phone(v):
-        if not v:
-            return None
-        stripped = _re.sub(r'\D', '', str(v))
-        return stripped or None
-
-    def _norm_email(v):
-        if not v:
-            return None
-        return str(v).strip().lower() or None
-
-    display_name  = client_data.get("display_name") or client_data.get("company_name") or ""
-    first_name    = client_data.get("first_name")
-    last_name     = client_data.get("last_name")
-    company_name  = client_data.get("company_name")
-    phone_primary = client_data.get("phone_primary")
-    email_primary = client_data.get("email_primary")
-    is_company    = bool(client_data.get("is_commercial", False))
-    norm_phone    = _norm_phone(phone_primary)
-    norm_email    = _norm_email(email_primary)
-
-    try:
-        contact_uuid = None
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM crm.contacts WHERE tenant_id=%s AND source_client_id=%s",
-                (tenant_id, client_id)
-            )
-            row = cur.fetchone()
-            if row:
-                contact_uuid = row["id"]
-                cur.execute("""
-                    UPDATE crm.contacts
-                    SET display_name=%s, first_name=%s, last_name=%s,
-                        company_name=%s, phone_primary=%s, email_primary=%s,
-                        is_company=%s, normalized_phone=%s, normalized_email=%s,
-                        updated_at=now()
-                    WHERE id=%s
-                """, (
-                    display_name, first_name, last_name,
-                    company_name, phone_primary, email_primary,
-                    is_company, norm_phone, norm_email,
-                    contact_uuid
-                ))
-            else:
-                cur.execute("""
-                    INSERT INTO crm.contacts
-                        (tenant_id, source_client_id, display_name, first_name, last_name,
-                         company_name, phone_primary, email_primary, is_company,
-                         contact_role, normalized_phone, normalized_email)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'client', %s, %s)
-                    RETURNING id
-                """, (
-                    tenant_id, client_id,
-                    display_name, first_name, last_name,
-                    company_name, phone_primary, email_primary, is_company,
-                    norm_phone, norm_email
-                ))
-                contact_uuid = cur.fetchone()["id"]
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT crm.generate_contact_aliases(%s, %s)",
-                (tenant_id, contact_uuid)
-            )
-        conn.commit()
-    except Exception as e:
-        print(f"[_upsert_contact_for_client] error (non-critical): {e}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-
-# ===== CONTACTS TABLE MIGRATION =====
-
-@app.post("/crm/contacts/migrate-from-clients")
-async def migrate_clients_to_contacts(request: Request):
-    """
-    ONE-TIME MIGRATION: Copy all records from clients table into new contacts table.
-    - Default role: unclassified
-    - If client has jobs/invoices/quotes: role = client
-    - Original clients table is NOT modified
-    - Returns audit report
-    """
-    user = ensure_request_permissions(request, "manage_users")  # admin only
-    tenant_id = user.get("tenant_id", 1)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            # 1. Create contacts table if not exists
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS crm.contacts (
-                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    tenant_id INT NOT NULL DEFAULT 1,
-                    source_client_id BIGINT,          -- original clients.id reference
-                    contact_role TEXT NOT NULL DEFAULT 'unclassified',
-                    -- Copy of key clients fields
-                    client_code TEXT,
-                    display_name TEXT NOT NULL,
-                    first_name TEXT,
-                    last_name TEXT,
-                    company_name TEXT,
-                    company_registration_no TEXT,
-                    vat_no TEXT,
-                    email_primary TEXT,
-                    email_secondary TEXT,
-                    phone_primary TEXT,
-                    phone_secondary TEXT,
-                    website TEXT,
-                    billing_address_line1 TEXT,
-                    billing_city TEXT,
-                    billing_postcode TEXT,
-                    billing_country TEXT,
-                    notes TEXT,
-                    status TEXT DEFAULT 'active',
-                    is_commercial BOOLEAN DEFAULT FALSE,
-                    owner_user_id BIGINT,
-                    normalized_phone TEXT,
-                    normalized_email TEXT,
-                    migrated_at TIMESTAMPTZ DEFAULT now(),
-                    created_at TIMESTAMPTZ DEFAULT now(),
-                    updated_at TIMESTAMPTZ DEFAULT now(),
-                    deleted_at TIMESTAMPTZ,
-                    CONSTRAINT uq_contacts_source UNIQUE (tenant_id, source_client_id)
-                )
-            """)
-
-            # 2. Find clients that have jobs, invoices or quotes (= real clients)
-            cur.execute("""
-                SELECT DISTINCT c.id
-                FROM crm.clients c
-                WHERE c.tenant_id = %s AND c.deleted_at IS NULL
-                  AND (
-                    EXISTS (SELECT 1 FROM crm.jobs j WHERE j.client_id = c.id AND j.tenant_id = %s)
-                    OR EXISTS (SELECT 1 FROM crm.invoices i WHERE i.client_id = c.id AND i.tenant_id = %s)
-                    OR EXISTS (SELECT 1 FROM crm.quotes q WHERE q.client_id = c.id AND q.tenant_id = %s)
-                  )
-            """, (tenant_id, tenant_id, tenant_id, tenant_id))
-            confirmed_client_ids = {row["id"] for row in cur.fetchall()}
-
-            # 3. Migrate all clients into contacts
-            cur.execute("""
-                SELECT id, client_code, display_name, first_name, last_name,
-                       company_name, company_registration_no, vat_no,
-                       email_primary, email_secondary, phone_primary, phone_secondary,
-                       website, billing_address_line1, billing_city, billing_postcode,
-                       billing_country, status, is_commercial, owner_user_id, deleted_at
-                FROM crm.clients
-                WHERE tenant_id = %s
-                ORDER BY id
-            """, (tenant_id,))
-            all_clients = cur.fetchall()
-
-            migrated = 0
-            skipped_existing = 0
-            errors = 0
-
-            for row in all_clients:
-                client_id = row["id"]
-                role = 'client' if client_id in confirmed_client_ids else 'unclassified'
-                raw_phone = (row.get("phone_primary") or '')
-                import re as _re
-                norm_phone = _re.sub(r'[^\d+]', '', raw_phone)
-                if norm_phone.startswith('0') and len(norm_phone) >= 10:
-                    norm_phone = '+44' + norm_phone[1:]
-                norm_phone = norm_phone if norm_phone else None
-                raw_email = (row.get("email_primary") or '')
-                norm_email = raw_email.strip().lower() if raw_email else None
-                try:
-                    cur.execute("""
-                        INSERT INTO crm.contacts (
-                            tenant_id, source_client_id, contact_role,
-                            client_code, display_name, first_name, last_name,
-                            company_name, company_registration_no, vat_no,
-                            email_primary, email_secondary, phone_primary, phone_secondary,
-                            website, billing_address_line1, billing_city, billing_postcode,
-                            billing_country, status, is_commercial, owner_user_id,
-                            normalized_phone, normalized_email, deleted_at
-                        ) VALUES (
-                            %s, %s, %s,
-                            %s, %s, %s, %s,
-                            %s, %s, %s,
-                            %s, %s, %s, %s,
-                            %s, %s, %s, %s,
-                            %s, %s, %s, %s,
-                            %s, %s, %s
-                        )
-                        ON CONFLICT (tenant_id, source_client_id) DO NOTHING
-                    """, (
-                        tenant_id, client_id, role,
-                        row.get("client_code"), row.get("display_name"), row.get("first_name"), row.get("last_name"),
-                        row.get("company_name"), row.get("company_registration_no"), row.get("vat_no"),
-                        row.get("email_primary"), row.get("email_secondary"), row.get("phone_primary"), row.get("phone_secondary"),
-                        row.get("website"), row.get("billing_address_line1"), row.get("billing_city"), row.get("billing_postcode"),
-                        row.get("billing_country"), row.get("status"), row.get("is_commercial"), row.get("owner_user_id"),
-                        norm_phone, norm_email, row.get("deleted_at")
-                    ))
-                    if cur.rowcount > 0:
-                        migrated += 1
-                    else:
-                        skipped_existing += 1
-                except Exception as e:
-                    errors += 1
-                    print(f"Migration error for client {client_id}: {e}")
-
-            # 4. Audit counts
-            cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s", (tenant_id,))
-            total_contacts = list(cur.fetchone().values())[0]
-
-            cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND contact_role='client'", (tenant_id,))
-            total_clients = list(cur.fetchone().values())[0]
-
-            cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND contact_role='unclassified'", (tenant_id,))
-            total_unclassified = list(cur.fetchone().values())[0]
-
-            cur.execute("""
-                SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s
-                AND (phone_primary IS NULL OR phone_primary='')
-                AND (email_primary IS NULL OR email_primary='')
-            """, (tenant_id,))
-            total_no_contact = list(cur.fetchone().values())[0]
-
-            # Duplicates by phone
-            cur.execute("""
-                SELECT COUNT(*) FROM (
-                    SELECT normalized_phone FROM crm.contacts
-                    WHERE tenant_id=%s AND normalized_phone IS NOT NULL AND normalized_phone != ''
-                    GROUP BY normalized_phone HAVING COUNT(*) > 1
-                ) dupes
-            """, (tenant_id,))
-            total_phone_dupes = list(cur.fetchone().values())[0]
-
-            # Duplicates by name
-            cur.execute("""
-                SELECT COUNT(*) FROM (
-                    SELECT lower(display_name) FROM crm.contacts
-                    WHERE tenant_id=%s AND deleted_at IS NULL
-                    GROUP BY lower(display_name) HAVING COUNT(*) > 1
-                ) dupes
-            """, (tenant_id,))
-            total_name_dupes = list(cur.fetchone().values())[0]
-
-            conn.commit()
-
-            return {
-                "status": "completed",
-                "audit": {
-                    "total_in_contacts_table": total_contacts,
-                    "migrated_this_run": migrated,
-                    "skipped_already_existed": skipped_existing,
-                    "errors": errors,
-                    "role_client": total_clients,
-                    "role_unclassified": total_unclassified,
-                    "no_phone_no_email": total_no_contact,
-                    "duplicate_phones": total_phone_dupes,
-                    "duplicate_names": total_name_dupes,
-                    "confirmed_client_ids_count": len(confirmed_client_ids)
-                },
-                "note": "Original clients table NOT modified. contacts table created/updated."
-            }
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        err_msg = f"{type(e).__name__}: {getattr(e, 'pgerror', None) or getattr(e, 'args', [str(e)])[0]}: {tb[-400:]}"
-        raise HTTPException(500, err_msg)
-    finally:
-        release_conn(conn)
-
-
-@app.get("/crm/contacts/audit")
-async def contacts_audit(request: Request):
-    """Get audit report for contacts table."""
-    user = ensure_request_permissions(request, "contacts_read")
-    tenant_id = user.get("tenant_id", 1)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            # Check if table exists
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables
-                    WHERE table_schema='crm' AND table_name='contacts'
-                )
-            """)
-            table_exists = list(cur.fetchone().values())[0]
-            if not table_exists:
-                return {"status": "not_migrated", "message": "contacts table does not exist yet"}
-
-            cur.execute("SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s", (tenant_id,))
-            total = list(cur.fetchone().values())[0]
-
-            cur.execute("""
-                SELECT contact_role, COUNT(*) as cnt
-                FROM crm.contacts WHERE tenant_id=%s AND deleted_at IS NULL
-                GROUP BY contact_role ORDER BY cnt DESC
-            """, (tenant_id,))
-            by_role = {row["contact_role"]: row["cnt"] for row in cur.fetchall()}
-
-            cur.execute("""
-                SELECT COUNT(*) FROM crm.contacts WHERE tenant_id=%s AND deleted_at IS NULL
-                AND (phone_primary IS NULL OR phone_primary='')
-                AND (email_primary IS NULL OR email_primary='')
-            """, (tenant_id,))
-            no_contact = list(cur.fetchone().values())[0]
-
-            cur.execute("""
-                SELECT COUNT(*) FROM (
-                    SELECT normalized_phone FROM crm.contacts
-                    WHERE tenant_id=%s AND normalized_phone IS NOT NULL AND normalized_phone != ''
-                    AND deleted_at IS NULL
-                    GROUP BY normalized_phone HAVING COUNT(*) > 1
-                ) d
-            """, (tenant_id,))
-            phone_dupes = list(cur.fetchone().values())[0]
-
-            return {
-                "status": "ok",
-                "total_contacts": total,
-                "by_role": by_role,
-                "no_phone_no_email": no_contact,
-                "duplicate_phones": phone_dupes
-            }
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        raise HTTPException(500, f"{type(e).__name__}: {e}\n{tb[-500:]}")
-    finally:
-        release_conn(conn)
-
-
-@app.get("/crm/contacts/duplicates")
-async def find_contact_duplicates(request: Request):
-    """Find duplicate contacts in shared_contacts (same phone or similar name)."""
-    user = ensure_request_permissions(request, "contacts_read")
-    tenant_id = user.get("tenant_id", 1)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            # Find same normalized_phone
-            cur.execute("""
-                SELECT a.id as id1, a.display_name as name1, a.phone_primary as phone1,
-                       a.section_code as section1,
-                       b.id as id2, b.display_name as name2, b.phone_primary as phone2,
-                       b.section_code as section2,
-                       'same_phone' as reason
-                FROM shared_contacts a
-                JOIN shared_contacts b ON b.normalized_phone = a.normalized_phone
-                    AND b.id > a.id
-                    AND b.tenant_id = a.tenant_id
-                WHERE a.tenant_id=%s AND a.deleted_at IS NULL AND b.deleted_at IS NULL
-                  AND a.normalized_phone IS NOT NULL AND a.normalized_phone != ''
-                LIMIT 50
-            """, (tenant_id,))
-            phone_dupes = [dict(r) for r in cur.fetchall()]
-
-            # Find similar names (same first token, length similar)
-            cur.execute("""
-                SELECT a.id as id1, a.display_name as name1, a.phone_primary as phone1,
-                       a.section_code as section1,
-                       b.id as id2, b.display_name as name2, b.phone_primary as phone2,
-                       b.section_code as section2,
-                       'similar_name' as reason
-                FROM shared_contacts a
-                JOIN shared_contacts b ON b.id > a.id AND b.tenant_id = a.tenant_id
-                WHERE a.tenant_id=%s AND a.deleted_at IS NULL AND b.deleted_at IS NULL
-                  AND a.normalized_phone IS DISTINCT FROM b.normalized_phone
-                  AND lower(split_part(a.display_name,' ',1)) = lower(split_part(b.display_name,' ',1))
-                  AND abs(length(a.display_name) - length(b.display_name)) < 8
-                  AND similarity(lower(a.display_name), lower(b.display_name)) > 0.6
-                LIMIT 50
-            """, (tenant_id,))
-            name_dupes = [dict(r) for r in cur.fetchall()]
-
-        all_dupes = phone_dupes + name_dupes
-        return {"duplicates": all_dupes, "count": len(all_dupes)}
-    except Exception as e:
-        conn.rollback()
-        # similarity() requires pg_trgm extension - fallback without it
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT a.id as id1, a.display_name as name1, a.phone_primary as phone1,
-                           a.section_code as section1,
-                           b.id as id2, b.display_name as name2, b.phone_primary as phone2,
-                           b.section_code as section2,
-                           'same_phone' as reason
-                    FROM shared_contacts a
-                    JOIN shared_contacts b ON b.normalized_phone = a.normalized_phone
-                        AND b.id > a.id AND b.tenant_id = a.tenant_id
-                    WHERE a.tenant_id=%s AND a.deleted_at IS NULL AND b.deleted_at IS NULL
-                      AND a.normalized_phone IS NOT NULL AND a.normalized_phone != ''
-                    LIMIT 50
-                """, (tenant_id,))
-                phone_dupes = [dict(r) for r in cur.fetchall()]
-            return {"duplicates": phone_dupes, "count": len(phone_dupes)}
-        except Exception as e2:
-            raise HTTPException(500, str(e2))
-    finally:
-        release_conn(conn)
-
-
-@app.get("/crm/contacts/sort-session")
-async def get_contacts_for_sorting(
-    request: Request,
-    sort_by: str = "name",
-    phone_prefix: str = "+44",
-    filter_role: str = "unclassified",
-    limit: int = 500
-):
-    """Return contacts from crm.contacts table for voice sorting session.
-    By default returns unclassified contacts that need to be categorized."""
-    user = ensure_request_permissions(request, "contacts_manage")
-    tenant_id = user.get("tenant_id", 1)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            # Check if contacts table exists
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables
-                    WHERE table_schema='crm' AND table_name='contacts'
-                )
-            """)
-            table_exists = list(cur.fetchone().values())[0]
-
-            if not table_exists:
-                return {
-                    "sort_by": sort_by,
-                    "contacts": [],
-                    "total": 0,
-                    "sections": [[code, name, order] for code, name, order in DEFAULT_CONTACT_SECTIONS],
-                    "error": "contacts table not migrated yet - run /crm/contacts/migrate-from-clients first"
-                }
-
-            # Build query based on sort_by
-            if sort_by == "phone_prefix":
-                where_extra = """
-                    AND phone_primary IS NOT NULL
-                    AND (
-                        phone_primary LIKE %(prefix)s
-                        OR (phone_primary LIKE '0%%' AND LENGTH(REGEXP_REPLACE(phone_primary, '[^0-9]', '', 'g')) >= 10)
-                    )
-                """
-            else:
-                where_extra = ""
-
-            role_filter = "AND contact_role = %(role)s" if filter_role != "all" else ""
-
-            cur.execute(f"""
-                SELECT id, source_client_id, contact_role,
-                       display_name, first_name, last_name,
-                       company_name, phone_primary, email_primary,
-                       billing_city, billing_postcode, normalized_phone
-                FROM crm.contacts
-                WHERE tenant_id = %(tenant_id)s
-                  AND deleted_at IS NULL
-                  {role_filter}
-                  {where_extra}
-                ORDER BY {'phone_primary' if sort_by == 'phone_prefix' else 'lower(display_name)'}
-                LIMIT %(limit)s
-            """, {
-                "tenant_id": tenant_id,
-                "role": filter_role,
-                "prefix": f"{phone_prefix}%",
-                "limit": limit
-            })
-            contacts = [dict(r) for r in cur.fetchall()]
-
-            # Count by role for info
-            cur.execute("""
-                SELECT contact_role, COUNT(*) as cnt
-                FROM crm.contacts WHERE tenant_id=%s AND deleted_at IS NULL
-                GROUP BY contact_role
-            """, (tenant_id,))
-            role_counts = {r["contact_role"]: r["cnt"] for r in cur.fetchall()}
-
-        return {
-            "sort_by": sort_by,
-            "filter_role": filter_role,
-            "contacts": contacts,
-            "total": len(contacts),
-            "role_counts": role_counts,
-            "sections": [[code, name, order] for code, name, order in DEFAULT_CONTACT_SECTIONS]
-        }
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
-@app.post("/crm/contacts/assign-section")
-async def assign_contact_section(data: dict, request: Request):
-    """Assign a contact to a role/category in crm.contacts table.
-    Also mirrors to shared_contacts for the contact directory."""
-    user = ensure_request_permissions(request, "contacts_manage")
-    tenant_id = user.get("tenant_id", 1)
-    user_id = user.get("user_id")
-    conn = get_db_conn()
-    try:
-        contact_id = data.get("contact_id")        # crm.contacts.id
-        section_code = (data.get("section_code") or "other").strip()
-        display_name = (data.get("display_name") or "").strip()
-        phone = (data.get("phone") or "").strip()
-
-        if not contact_id and not display_name:
-            raise HTTPException(400, "contact_id or display_name required")
-
-        import re as _re
-        norm_phone = _re.sub(r'[^\d+]', '', phone) if phone else None
-        if norm_phone and norm_phone.startswith('0') and len(norm_phone) >= 10:
-            norm_phone = '+44' + norm_phone[1:]
-
-        with conn.cursor() as cur:
-            if contact_id:
-                # Update existing contact in crm.contacts
-                cur.execute("""
-                    UPDATE crm.contacts
-                    SET contact_role=%s, updated_at=now()
-                    WHERE id=%s AND tenant_id=%s
-                    RETURNING id, contact_role, display_name, phone_primary
-                """, (section_code, contact_id, tenant_id))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(404, "Contact not found")
-                result = dict(row)
-                if not display_name:
-                    display_name = result.get("display_name", "")
-                if not phone:
-                    phone = result.get("phone_primary", "")
-            else:
-                result = {"contact_role": section_code, "display_name": display_name}
-
-            # Mirror to shared_contacts for the directory view
-            if section_code not in ('unclassified', 'unknown'):
-                owner_id = user_id if section_code in ('private', 'other') else None
-                cur.execute("""
-                    INSERT INTO shared_contacts
-                    (tenant_id, section_code, display_name, phone_primary, normalized_phone,
-                     source, owner_user_id, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, 'contact_sort', %s, now(), now())
-                    ON CONFLICT (tenant_id, normalized_phone) WHERE normalized_phone IS NOT NULL
-                    DO UPDATE SET section_code=EXCLUDED.section_code, updated_at=now()
-                    RETURNING id
-                """, (tenant_id, section_code, display_name, phone or None,
-                      norm_phone, owner_id))
-
-            # Audit
-            try:
-                cur.execute("""
-                    INSERT INTO audit_log (tenant_id, user_id, action, entity_type, new_values, created_at)
-                    VALUES (%s,%s,'assign_contact_role','contact',%s::jsonb,now())
-                """, (tenant_id, user_id, json.dumps({"display_name": display_name, "section_code": section_code})))
-            except Exception:
-                pass
-
-            conn.commit()
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
-@app.post("/crm/contacts/merge")
-async def merge_shared_contacts(data: dict, request: Request):
-    """Merge two shared contacts — keep primary, delete secondary, transfer section."""
-    user = ensure_request_permissions(request, "contacts_manage")
-    tenant_id = user.get("tenant_id", 1)
-    user_id = user.get("user_id")
-    conn = get_db_conn()
-    try:
-        primary_id = data.get("primary_id")
-        secondary_id = data.get("secondary_id")
-        if not primary_id or not secondary_id:
-            raise HTTPException(400, "primary_id and secondary_id required")
-
-        with conn.cursor() as cur:
-            # Load both
-            cur.execute(
-                "SELECT * FROM shared_contacts WHERE id IN (%s,%s) AND tenant_id=%s",
-                (primary_id, secondary_id, tenant_id)
-            )
-            rows = {r["id"]: dict(r) for r in cur.fetchall()}
-            if len(rows) < 2:
-                raise HTTPException(404, "One or both contacts not found")
-
-            primary = rows[primary_id]
-            secondary = rows[secondary_id]
-
-            # Merge: fill missing fields from secondary into primary
-            merge_fields = ["phone_primary", "email_primary", "address", "company_name", "notes", "normalized_phone"]
-            updates = {}
-            for field in merge_fields:
-                if not primary.get(field) and secondary.get(field):
-                    updates[field] = secondary[field]
-
-            if updates:
-                set_clause = ", ".join(f"{k}=%s" for k in updates)
-                cur.execute(
-                    f"UPDATE shared_contacts SET {set_clause}, updated_at=now() WHERE id=%s AND tenant_id=%s",
-                    list(updates.values()) + [primary_id, tenant_id]
-                )
-
-            # Soft delete secondary
-            cur.execute(
-                "UPDATE shared_contacts SET deleted_at=now() WHERE id=%s AND tenant_id=%s",
-                (secondary_id, tenant_id)
-            )
-
-            # Audit
-            try:
-                cur.execute(
-                    """INSERT INTO audit_log (tenant_id, user_id, action, entity_type, new_values, created_at)
-                       VALUES (%s,%s,'merge_contacts','shared_contact',%s::jsonb,now())""",
-                    (tenant_id, user_id, json.dumps({
-                        "merged": secondary.get("display_name"),
-                        "into": primary.get("display_name")
-                    }))
-                )
-            except Exception:
-                pass
-            conn.commit()
-
-        return {"merged": True, "primary_id": primary_id, "deleted_id": secondary_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
-@app.post("/crm/contacts/import")
-async def import_shared_contacts(data: dict, request: Request):
-    user = ensure_request_permissions(request, "contacts_write")
-    contacts = data.get("contacts", [])
-    if not contacts:
-        raise HTTPException(400, "No contacts provided")
-    conn = get_db_conn()
-    imported = 0
-    merged = 0
-    errors = []
-    try:
-        with conn.cursor() as cur:
-            for contact in contacts:
-                if not contact.get("selected"):
-                    continue
-                try:
-                    row, created = merge_shared_contact(cur, user["tenant_id"], user["user_id"], contact, source="phone_import")
-                    if created:
-                        imported += 1
-                    else:
-                        merged += 1
-                except Exception as row_error:
-                    errors.append(str(row_error))
-            conn.commit()
-        return {"imported": imported, "merged": merged, "errors": errors}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-def map_work_entry_type_to_service_rate(entry_type):
-    low = str(entry_type or "").strip().lower().replace(" ", "_")
-    if low in ("pruning", "hedge_trimming", "hedge", "trimming", "trim"):
-        return "hedge_trimming"
-    if low in ("arborist", "arborist_works", "tree", "tree_surgeon", "tree-surgeon", "tree_surgery"):
-        return "arborist_works"
-    if low in ("waste", "garden_waste_bulkbag", "bulkbag"):
-        return "garden_waste_bulkbag"
-    return "garden_maintenance" if low in ("maintenance", "garden_maintenance", "") else "hourly_rate"
-
 @app.post("/crm/invoices/from-work-report")
 async def create_invoice_from_work_report(data: dict, request: Request):
     """Create an invoice from a work report. Calculates profit using worker costs."""
@@ -8180,6 +1377,10 @@ async def create_invoice_from_work_report(data: dict, request: Request):
             # Get workers with costs
             cur.execute("SELECT w.*, u.hourly_cost FROM work_report_workers w LEFT JOIN users u ON LOWER(u.display_name)=LOWER(w.worker_name) AND u.tenant_id=%s WHERE w.work_report_id=%s", (tid, wr_id))
             workers = cur.fetchall()
+            # Get client default rate
+            cur.execute("SELECT default_hourly_rate FROM clients WHERE id=%s AND tenant_id=%s", (wr["client_id"], tid))
+            cl = cur.fetchone()
+            client_rate = float(cl["default_hourly_rate"] or 0) if cl else 0
             # Create invoice
             code = f"INV-{uuid.uuid4().hex[:6].upper()}"
             due_date = data.get("due_date")
@@ -8197,9 +1398,7 @@ async def create_invoice_from_work_report(data: dict, request: Request):
             for i, e in enumerate(entries):
                 hrs = float(e.get("hours",0) or 0)
                 rate = float(e.get("unit_rate",0) or 0)
-                if rate == 0:
-                    rate_type = map_work_entry_type_to_service_rate(e.get("type"))
-                    rate = get_effective_rate(conn, tid, client_id=wr.get("client_id"), rate_type=rate_type)
+                if rate == 0 and client_rate > 0: rate = client_rate
                 item_total = float(e.get("total_price",0) or hrs * rate)
                 cur.execute("""INSERT INTO invoice_items (invoice_id,description,quantity,unit_price,total,sort_order,tenant_id)
                     VALUES (%s,%s,%s,%s,%s,%s,%s)""",
@@ -8260,90 +1459,13 @@ async def update_client_rate(client_id: int, data: dict, request: Request):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            hourly_rate = float(data.get("default_hourly_rate", 0) or 0)
             cur.execute("UPDATE clients SET default_hourly_rate=%s, updated_at=now() WHERE id=%s AND tenant_id=%s RETURNING id,display_name,default_hourly_rate",
-                (hourly_rate, client_id, tid))
+                (data.get("default_hourly_rate",0), client_id, tid))
             c = cur.fetchone()
             if not c: raise HTTPException(404, "Client not found")
-            cur.execute("""DELETE FROM pricing_rules
-                WHERE tenant_id=%s AND scope='client' AND scope_id=%s
-                  AND rule_type='service_rate' AND rule_key IN ('hourly_rate','garden_maintenance')""",
-                (tid, client_id))
-            if hourly_rate > 0:
-                for rule_key in ("hourly_rate", "garden_maintenance"):
-                    cur.execute("""INSERT INTO pricing_rules (tenant_id, scope, scope_id, rule_type, rule_key, rate)
-                        VALUES (%s,'client',%s,'service_rate',%s,%s)""",
-                        (tid, client_id, rule_key, hourly_rate))
             log_activity(conn, "client", client_id, "update_rate", f"Default rate: {c['default_hourly_rate']} GBP/h")
             conn.commit()
         return dict(c)
-    except HTTPException: raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: release_conn(conn)
-
-@app.get("/crm/clients/{client_id}/service-rates")
-async def get_client_service_rates_api(client_id: int, request: Request):
-    tid = get_request_tenant_id(request)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (client_id, tid))
-            if not cur.fetchone(): raise HTTPException(404, "Client not found")
-        overrides = get_client_service_rate_overrides(conn, tid, client_id)
-        return {
-            "client_id": client_id,
-            "service_rates": get_client_service_rates(conn, tid, client_id),
-            "service_rate_overrides": {k: v for k, v in overrides.items() if k in VISIBLE_CLIENT_SERVICE_RATE_KEYS},
-            "has_individual_service_rates": bool(overrides),
-        }
-    finally: release_conn(conn)
-
-@app.put("/crm/clients/{client_id}/service-rates")
-async def update_client_service_rates(client_id: int, data: dict, request: Request):
-    tid = get_request_tenant_id(request)
-    conn = get_db_conn()
-    try:
-        normalized = {}
-        for key, value in (data or {}).items():
-            if key not in CLIENT_SERVICE_RATE_KEYS:
-                continue
-            try:
-                rate = float(value)
-            except (TypeError, ValueError):
-                continue
-            if rate > 0:
-                normalized[key] = rate
-        if "garden_maintenance" in normalized and "hourly_rate" not in normalized:
-            normalized["hourly_rate"] = normalized["garden_maintenance"]
-        if "hourly_rate" in normalized and "garden_maintenance" not in normalized:
-            normalized["garden_maintenance"] = normalized["hourly_rate"]
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, display_name FROM clients WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL", (client_id, tid))
-            client = cur.fetchone()
-            if not client: raise HTTPException(404, "Client not found")
-            cur.execute("""DELETE FROM pricing_rules
-                WHERE tenant_id=%s AND scope='client' AND scope_id=%s
-                  AND rule_type='service_rate' AND rule_key = ANY(%s)""",
-                (tid, client_id, CLIENT_SERVICE_RATE_KEYS))
-            for rule_key, rate in normalized.items():
-                cur.execute("""INSERT INTO pricing_rules (tenant_id, scope, scope_id, rule_type, rule_key, rate)
-                    VALUES (%s,'client',%s,'service_rate',%s,%s)""",
-                    (tid, client_id, rule_key, rate))
-            legacy_hourly = normalized.get("hourly_rate") or normalized.get("garden_maintenance") or 0
-            cur.execute("UPDATE clients SET default_hourly_rate=%s, updated_at=now() WHERE id=%s AND tenant_id=%s",
-                (legacy_hourly, client_id, tid))
-            if normalized:
-                log_activity(conn, "client", client_id, "update_service_rates", f"Individual service rates updated for {client['display_name']}")
-            else:
-                log_activity(conn, "client", client_id, "reset_service_rates", f"Individual service rates cleared for {client['display_name']}")
-            conn.commit()
-        overrides = get_client_service_rate_overrides(conn, tid, client_id)
-        return {
-            "client_id": client_id,
-            "service_rates": get_client_service_rates(conn, tid, client_id),
-            "service_rate_overrides": {k: v for k, v in overrides.items() if k in VISIBLE_CLIENT_SERVICE_RATE_KEYS},
-            "has_individual_service_rates": bool(overrides),
-        }
     except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
@@ -8355,142 +1477,28 @@ async def get_default_rates(tenant_id: int, request: Request):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT rate_type, rate, currency, description, is_builtin, sort_order FROM tenant_default_rates WHERE tenant_id=%s ORDER BY sort_order, id",
-                (tid,)
-            )
+            cur.execute("SELECT rate_type, rate, currency, description FROM tenant_default_rates WHERE tenant_id=%s ORDER BY id", (tid,))
             rows = cur.fetchall()
-        if not rows:
-            seed_builtin_rates_if_empty(conn, tid)
-            conn.commit()
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT rate_type, rate, currency, description, is_builtin, sort_order FROM tenant_default_rates WHERE tenant_id=%s ORDER BY sort_order, id",
-                    (tid,)
-                )
-                rows = cur.fetchall()
-        return [
-            {
-                "rate_type": r["rate_type"],
-                "rate": float(r["rate"]),
-                "currency": r["currency"],
-                "description": r["description"],
-                "is_builtin": bool(r["is_builtin"]),
-                "sort_order": r["sort_order"],
-            }
-            for r in rows
-        ]
+            return {r["rate_type"]: {"rate": float(r["rate"]), "currency": r["currency"], "description": r["description"]} for r in rows}
     finally: release_conn(conn)
 
 @app.put("/tenant/default-rates/{tenant_id}")
 async def update_default_rates(tenant_id: int, data: dict, request: Request):
-    """Update rate values for existing rate types. {rate_type: rate_value | {rate, description}}"""
     tid = get_request_tenant_id(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             for rate_type, value in data.items():
-                if isinstance(value, dict):
-                    rate_val = float(value.get("rate", 0))
-                    desc = value.get("description")
-                    if desc is not None:
-                        cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, description, updated_at)
-                            VALUES (%s,%s,%s,%s,now()) ON CONFLICT (tenant_id, rate_type)
-                            DO UPDATE SET rate=%s, description=%s, updated_at=now()""",
-                            (tid, rate_type, rate_val, desc, rate_val, desc))
-                    else:
-                        cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, updated_at)
-                            VALUES (%s,%s,%s,now()) ON CONFLICT (tenant_id, rate_type)
-                            DO UPDATE SET rate=%s, updated_at=now()""",
-                            (tid, rate_type, rate_val, rate_val))
-                else:
-                    rate_val = float(value)
-                    cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, updated_at)
-                        VALUES (%s,%s,%s,now()) ON CONFLICT (tenant_id, rate_type)
-                        DO UPDATE SET rate=%s, updated_at=now()""",
-                        (tid, rate_type, rate_val, rate_val))
+                rate_val = value if isinstance(value, (int, float)) else value.get("rate", 0)
+                cur.execute("""INSERT INTO tenant_default_rates (tenant_id, rate_type, rate, updated_at)
+                    VALUES (%s, %s, %s, now()) ON CONFLICT (tenant_id, rate_type)
+                    DO UPDATE SET rate=%s, updated_at=now()""", (tid, rate_type, rate_val, rate_val))
             log_activity(conn, "tenant", tid, "update_rates", f"Updated {len(data)} default rates")
             conn.commit()
-            cur.execute("SELECT rate_type, rate, currency, description, is_builtin, sort_order FROM tenant_default_rates WHERE tenant_id=%s ORDER BY sort_order, id", (tid,))
-            rows = cur.fetchall()
-        return [{"rate_type": r["rate_type"], "rate": float(r["rate"]), "currency": r["currency"],
-                 "description": r["description"], "is_builtin": bool(r["is_builtin"]), "sort_order": r["sort_order"]} for r in rows]
+            cur.execute("SELECT rate_type, rate, currency FROM tenant_default_rates WHERE tenant_id=%s", (tid,))
+            return {r["rate_type"]: float(r["rate"]) for r in cur.fetchall()}
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
-
-@app.post("/tenant/service-rate-types/{tenant_id}")
-async def add_service_rate_type(tenant_id: int, data: dict, request: Request):
-    """Add a new custom service rate type. {rate_type: str, description: str, rate: float, currency: str}"""
-    tid = get_request_tenant_id(request)
-    rate_type = (data.get("rate_type") or "").strip().lower().replace(" ", "_")
-    description = (data.get("description") or data.get("display_name") or rate_type).strip()
-    rate_val = float(data.get("rate", 0))
-    currency = data.get("currency", "GBP")
-    if not rate_type:
-        raise HTTPException(422, "rate_type required")
-    if not re.match(r'^[a-z][a-z0-9_]{0,49}$', rate_type):
-        raise HTTPException(422, "rate_type must be lowercase letters, digits, underscores (max 50 chars)")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            # Get next sort_order
-            cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS next_order FROM tenant_default_rates WHERE tenant_id=%s", (tid,))
-            next_order = cur.fetchone()["next_order"]
-            cur.execute("""INSERT INTO tenant_default_rates
-                (tenant_id, rate_type, rate, currency, description, is_builtin, sort_order)
-                VALUES (%s,%s,%s,%s,%s,false,%s)
-                ON CONFLICT (tenant_id, rate_type) DO NOTHING
-                RETURNING id""",
-                (tid, rate_type, rate_val, currency, description, next_order))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(409, f"Rate type '{rate_type}' already exists")
-            log_activity(conn, "tenant", tid, "add_rate_type", f"Added rate type: {rate_type} ({description})")
-            conn.commit()
-        return {"ok": True, "rate_type": rate_type, "description": description, "rate": rate_val}
-    except HTTPException: raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: release_conn(conn)
-
-@app.delete("/tenant/service-rate-types/{tenant_id}/{rate_type}")
-async def delete_service_rate_type(tenant_id: int, rate_type: str, request: Request):
-    """Delete a custom rate type. Built-in types cannot be deleted."""
-    tid = get_request_tenant_id(request)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT is_builtin FROM tenant_default_rates WHERE tenant_id=%s AND rate_type=%s", (tid, rate_type))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, f"Rate type '{rate_type}' not found")
-            if row["is_builtin"]:
-                raise HTTPException(403, f"Built-in rate type '{rate_type}' cannot be deleted")
-            cur.execute("DELETE FROM tenant_default_rates WHERE tenant_id=%s AND rate_type=%s", (tid, rate_type))
-            # Also remove any client overrides for this rate type
-            cur.execute("DELETE FROM pricing_rules WHERE tenant_id=%s AND rule_type='service_rate' AND rule_key=%s", (tid, rate_type))
-            log_activity(conn, "tenant", tid, "delete_rate_type", f"Deleted rate type: {rate_type}")
-            conn.commit()
-        return {"ok": True, "deleted": rate_type}
-    except HTTPException: raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: release_conn(conn)
-
-def get_client_service_rate_overrides(conn, tid, client_id):
-    rate_keys = get_tenant_rate_types(conn, tid) or list(SERVICE_RATE_DEFAULTS.keys())
-    with conn.cursor() as cur:
-        cur.execute("""SELECT rule_key, rate
-            FROM pricing_rules
-            WHERE tenant_id=%s AND scope='client' AND scope_id=%s
-              AND rule_type='service_rate' AND rule_key = ANY(%s)""",
-            (tid, client_id, rate_keys))
-        return {row["rule_key"]: float(row["rate"]) for row in cur.fetchall() if row.get("rule_key")}
-
-def get_client_service_rates(conn, tid, client_id):
-    rate_keys = get_tenant_rate_types(conn, tid) or list(SERVICE_RATE_DEFAULTS.keys())
-    return {
-        key: get_effective_rate(conn, tid, client_id=client_id, rate_type=key)
-        for key in rate_keys
-    }
 
 def get_effective_rate(conn, tid, user_id=None, client_id=None, rate_type="hourly_rate"):
     """Get rate with fallback: user > client > tenant default."""
@@ -8499,22 +1507,13 @@ def get_effective_rate(conn, tid, user_id=None, client_id=None, rate_type="hourl
             cur.execute(f"SELECT {rate_type} FROM users WHERE id=%s AND tenant_id=%s", (user_id, tid))
             r = cur.fetchone()
             if r and float(r[rate_type] or 0) > 0: return float(r[rate_type])
-        if client_id:
-            cur.execute("""SELECT rate
-                FROM pricing_rules
-                WHERE tenant_id=%s AND scope='client' AND scope_id=%s
-                  AND rule_type='service_rate' AND rule_key=%s
-                ORDER BY created_at DESC LIMIT 1""", (tid, client_id, rate_type))
-            r = cur.fetchone()
-            if r and float(r["rate"] or 0) > 0: return float(r["rate"])
         if client_id and rate_type == "hourly_rate":
             cur.execute("SELECT default_hourly_rate FROM clients WHERE id=%s AND tenant_id=%s", (client_id, tid))
             r = cur.fetchone()
             if r and float(r["default_hourly_rate"] or 0) > 0: return float(r["default_hourly_rate"])
         cur.execute("SELECT rate FROM tenant_default_rates WHERE tenant_id=%s AND rate_type=%s", (tid, rate_type))
         r = cur.fetchone()
-        if r and float(r["rate"] or 0) > 0: return float(r["rate"])
-    return SERVICE_RATE_DEFAULTS.get(rate_type, 0.0)
+        return float(r["rate"]) if r else 0
 
 # === BATCH INVOICE FROM WORK REPORTS ===
 @app.post("/crm/invoices/batch-from-work-reports")
@@ -8542,10 +1541,8 @@ async def get_communications(request: Request, client_id: Optional[int]=None, jo
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            sql = """SELECT c.id, c.client_id, c.job_id, c.comm_type, COALESCE(c.source, c.comm_type) AS source,
-                     c.external_message_id, c.source_phone, c.target_phone, c.conversation_key,
-                     c.subject, c.message_summary, c.sent_at::text, c.direction, c.notes,
-                     c.created_at::text, c.imported_at::text,
+            sql = """SELECT c.id, c.client_id, c.job_id, c.comm_type, c.subject, c.message_summary,
+                     c.sent_at::text, c.direction, c.notes, c.created_at::text,
                      cl.display_name as client_name, j.job_title as job_title
                      FROM communications c
                      LEFT JOIN clients cl ON c.client_id = cl.id
@@ -8555,7 +1552,7 @@ async def get_communications(request: Request, client_id: Optional[int]=None, jo
             if client_id: sql += " AND c.client_id=%s"; params.append(client_id)
             if job_id: sql += " AND c.job_id=%s"; params.append(job_id)
             if comm_type: sql += " AND c.comm_type=%s"; params.append(comm_type)
-            sql += " ORDER BY COALESCE(c.sent_at, c.created_at) DESC, c.id DESC LIMIT 1000"
+            sql += " ORDER BY c.created_at DESC LIMIT 100"
             cur.execute(sql, params); return cur.fetchall()
     finally: release_conn(conn)
 
@@ -8565,260 +1562,18 @@ async def log_communication(request: Request, data: dict):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            comm = upsert_communication_message(cur, tid, {
-                **data,
-                "source": data.get("source") or data.get("comm_type", "manual"),
-                "message": data.get("message", data.get("message_summary", "")),
-            })
+            cur.execute("""INSERT INTO communications (tenant_id,client_id,job_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now()) RETURNING id,comm_type,subject,direction""",
+                (tid, data.get("client_id"),data.get("job_id"),data.get("comm_type","telefon"),
+                 data.get("subject"),data.get("message",data.get("message_summary","")),
+                 data.get("direction","outbound"),data.get("notes")))
+            comm = dict(cur.fetchone())
             if data.get("client_id"):
-                log_activity(conn,"client",data["client_id"],"communication",f"{data.get('comm_type','')}: {data.get('subject','')}")
+                log_activity(conn,"client",data["client_id"],"communication",f"{comm.get('comm_type','')}: {comm.get('subject','')}")
             conn.commit()
         return comm
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
-
-@app.post("/crm/communications/import")
-async def import_communications(request: Request, data: dict):
-    user = ensure_request_permissions(request, "crm_write")
-    tenant_id = user["tenant_id"]
-    source = normalize_communication_source(data.get("source") or data.get("comm_type") or "sms")
-    messages = data.get("messages") or []
-    if not isinstance(messages, list):
-        raise HTTPException(422, "messages must be a list")
-    messages = messages[:10000]
-    conn = get_db_conn()
-    imported = updated = matched = unmatched = 0
-    try:
-        with conn.cursor() as cur:
-            for item in messages:
-                if not isinstance(item, dict):
-                    continue
-                result = upsert_communication_message(cur, tenant_id, {**item, "source": item.get("source") or source})
-                if result.get("created"):
-                    imported += 1
-                else:
-                    updated += 1
-                if result.get("matched"):
-                    matched += 1
-                else:
-                    unmatched += 1
-            log_activity(conn, "communication", 0, "import", f"Import {source}: {imported} new, {updated} updated", tenant_id=tenant_id, user_id=user.get("user_id"))
-            conn.commit()
-        return {"status": "ok", "summary": {"source": source, "scanned": len(messages), "imported": imported, "updated": updated, "matched": matched, "unmatched": unmatched}}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-@app.post("/crm/communications/provider-history-import")
-async def import_provider_communication_history(request: Request, data: dict):
-    user = ensure_request_permissions(request, "crm_write")
-    tenant_id = user["tenant_id"]
-    provider = get_whatsapp_provider()
-    if provider != "twilio":
-        return {"status": "ok", "summary": {"provider": provider, "scanned": 0, "imported": 0, "updated": 0, "matched": 0, "unmatched": 0, "message": "Server history import is available only for Twilio history. Meta WhatsApp cannot fetch old phone chat history."}}
-    try:
-        limit = max(1, min(int(data.get("limit", 1000)), 5000))
-    except Exception:
-        limit = 1000
-    messages = []
-    next_url = f"{get_twilio_messages_api_url()}?{urlencode({'PageSize': min(limit, 1000)})}"
-    auth = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")).decode("ascii")
-    while next_url and len(messages) < limit:
-        req = urllib.request.Request(next_url, headers={"Authorization": f"Basic {auth}"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            page = json.loads(resp.read().decode("utf-8"))
-        for msg in page.get("messages", []):
-            from_raw = (msg.get("from") or "").replace("whatsapp:", "")
-            to_raw = (msg.get("to") or "").replace("whatsapp:", "")
-            is_whatsapp = str(msg.get("from", "")).startswith("whatsapp:") or str(msg.get("to", "")).startswith("whatsapp:")
-            direction = "outbound" if str(msg.get("direction", "")).startswith("outbound") else "inbound"
-            messages.append({
-                "source": "whatsapp" if is_whatsapp else "sms",
-                "external_message_id": msg.get("sid"),
-                "source_phone": from_raw,
-                "target_phone": to_raw,
-                "phone": from_raw if direction == "inbound" else to_raw,
-                "direction": direction,
-                "message": msg.get("body") or "",
-                "sent_at": msg.get("date_sent") or msg.get("date_created"),
-            })
-            if len(messages) >= limit:
-                break
-        uri = page.get("next_page_uri")
-        next_url = f"https://api.twilio.com{uri}" if uri and len(messages) < limit else None
-    conn = get_db_conn()
-    imported = updated = matched = unmatched = 0
-    try:
-        with conn.cursor() as cur:
-            for item in messages:
-                result = upsert_communication_message(cur, tenant_id, item)
-                imported += 1 if result.get("created") else 0
-                updated += 0 if result.get("created") else 1
-                matched += 1 if result.get("matched") else 0
-                unmatched += 0 if result.get("matched") else 1
-            log_activity(conn, "communication", 0, "provider_import", f"Twilio import: {imported} new, {updated} updated", tenant_id=tenant_id, user_id=user.get("user_id"))
-            conn.commit()
-        return {"status": "ok", "summary": {"provider": provider, "scanned": len(messages), "imported": imported, "updated": updated, "matched": matched, "unmatched": unmatched}}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-@app.post("/crm/communications/whatsapp-address-sync")
-async def sync_whatsapp_addresses(request: Request, data: dict):
-    user = ensure_request_permissions(request, "crm_write")
-    tenant_id = user["tenant_id"]
-    actor_user_id = user.get("user_id")
-    apply_changes = bool(data.get("apply", False))
-    overwrite = bool(data.get("overwrite", False))
-    try:
-        limit = int(data.get("limit", 2000))
-    except Exception:
-        limit = 2000
-    limit = max(1, min(limit, 10000))
-    conn = get_db_conn()
-    results = []
-    scanned = 0
-    candidates = 0
-    updated = 0
-    skipped = 0
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT c.id, c.client_id, c.job_id, c.comm_type, c.subject, c.message_summary,
-                       c.direction, c.notes, c.sent_at::text, c.created_at::text,
-                       cl.display_name AS client_name,
-                       cl.billing_address_line1, cl.billing_city, cl.billing_postcode, cl.billing_country
-                FROM communications c
-                LEFT JOIN clients cl ON cl.id=c.client_id AND cl.tenant_id=c.tenant_id AND cl.deleted_at IS NULL
-                WHERE c.tenant_id=%s
-                  AND (
-                    LOWER(COALESCE(c.comm_type,'')) IN ('whatsapp', 'wa')
-                    OR COALESCE(c.subject,'') ILIKE '%%whatsapp%%'
-                    OR COALESCE(c.subject,'') ILIKE '%%wa %%'
-                    OR COALESCE(c.notes,'') ILIKE '%%whatsapp%%'
-                  )
-                ORDER BY COALESCE(c.sent_at, c.created_at) DESC NULLS LAST, c.id DESC
-                LIMIT %s
-            """, (tenant_id, limit))
-            rows = [dict(row) for row in cur.fetchall()]
-            scanned = len(rows)
-            for row in rows:
-                text = "\n".join(
-                    part for part in [
-                        row.get("subject"),
-                        row.get("message_summary"),
-                        row.get("notes"),
-                    ]
-                    if part
-                )
-                address = extract_address_from_text(text)
-                if not address:
-                    continue
-                candidates += 1
-                client = None
-                if row.get("client_id") and row.get("client_name"):
-                    client = {
-                        "id": row.get("client_id"),
-                        "display_name": row.get("client_name"),
-                        "billing_address_line1": row.get("billing_address_line1"),
-                        "billing_city": row.get("billing_city"),
-                        "billing_postcode": row.get("billing_postcode"),
-                        "billing_country": row.get("billing_country"),
-                    }
-                if not client:
-                    phone = extract_whatsapp_phone_from_text(row.get("subject"), row.get("notes"), row.get("message_summary"))
-                    client = find_client_by_whatsapp_phone(cur, tenant_id, phone)
-                result = {
-                    "communication_id": row.get("id"),
-                    "client_id": client.get("id") if client else None,
-                    "client_name": client.get("display_name") if client else None,
-                    "address": address,
-                    "action": "preview",
-                    "reason": None,
-                }
-                if not client:
-                    result["action"] = "skipped"
-                    result["reason"] = "no_client_match"
-                    skipped += 1
-                    results.append(result)
-                    continue
-                existing_address = any(
-                    client.get(key)
-                    for key in ["billing_address_line1", "billing_city", "billing_postcode"]
-                )
-                if existing_address and not overwrite:
-                    result["action"] = "skipped"
-                    result["reason"] = "client_already_has_address"
-                    skipped += 1
-                    results.append(result)
-                    continue
-                new_line1 = address.get("address_line1") if overwrite or not client.get("billing_address_line1") else client.get("billing_address_line1")
-                new_city = address.get("city") if overwrite or not client.get("billing_city") else client.get("billing_city")
-                new_postcode = address.get("postcode") if overwrite or not client.get("billing_postcode") else client.get("billing_postcode")
-                new_country = address.get("country") if overwrite or not client.get("billing_country") else client.get("billing_country")
-                result["action"] = "updated" if apply_changes else "would_update"
-                result["new_values"] = {
-                    "billing_address_line1": new_line1,
-                    "billing_city": new_city,
-                    "billing_postcode": new_postcode,
-                    "billing_country": new_country,
-                }
-                if apply_changes:
-                    cur.execute("""UPDATE clients
-                        SET billing_address_line1=%s,
-                            billing_city=%s,
-                            billing_postcode=%s,
-                            billing_country=%s,
-                            updated_at=now()
-                        WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL""",
-                        (new_line1, new_city, new_postcode, new_country, client["id"], tenant_id))
-                    note = (
-                        f"Address imported from WhatsApp communication #{row.get('id')}: "
-                        f"{address.get('address')} (confidence {address.get('confidence')})"
-                    )
-                    cur.execute(
-                        "INSERT INTO client_notes (client_id,note,created_by) VALUES (%s,%s,%s)",
-                        (client["id"], note[:1000], get_user_display_name(conn, tenant_id, actor_user_id) or "system")
-                    )
-                    log_activity(
-                        conn,
-                        "client",
-                        client["id"],
-                        "whatsapp_address_import",
-                        f"Address imported from WhatsApp: {address.get('address')}",
-                        tenant_id=tenant_id,
-                        user_id=actor_user_id,
-                        details={"communication_id": row.get("id"), "address": address, "overwrite": overwrite},
-                        source_channel="whatsapp",
-                    )
-                    updated += 1
-                results.append(result)
-            if apply_changes:
-                conn.commit()
-        return {
-            "apply": apply_changes,
-            "overwrite": overwrite,
-            "summary": {
-                "scanned": scanned,
-                "address_candidates": candidates,
-                "updated": updated,
-                "skipped": skipped,
-                "would_update": sum(1 for item in results if item.get("action") == "would_update"),
-            },
-            "results": results[:300],
-        }
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
 
 # ========== REST API: PHOTOS ==========
 @app.get("/crm/photos")
@@ -8843,7 +1598,7 @@ async def add_photo(data: dict):
             cur.execute("""INSERT INTO photos (entity_type,entity_id,filename,description,file_path,thumbnail_base64,created_by,tenant_id)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,1) RETURNING id,filename,created_at::text""",
                 (data.get("entity_type","job"),data.get("entity_id","0"),data.get("filename","photo.jpg"),
-                 data.get("description"),data.get("file_path"),data.get("thumbnail_base64"),data.get("created_by","system")))
+                 data.get("description"),data.get("file_path"),data.get("thumbnail_base64"),data.get("created_by","Marek")))
             photo = dict(cur.fetchone())
             log_activity(conn,data.get("entity_type","job"),str(data.get("entity_id","0")),"photo",f"Foto: {data.get('filename','')}")
             conn.commit()
@@ -8898,7 +1653,7 @@ async def import_data(data: dict):
                     if table == "clients":
                         code = f"CL-{uuid.uuid4().hex[:6].upper()}"
                         cur.execute("INSERT INTO clients (client_code,client_type,display_name,email_primary,phone_primary,status) VALUES (%s,%s,%s,%s,%s,'active')",
-                            (code,row.get("type","domestic"),clean_contact_display_name(row.get("name") or row.get("display_name")) or row.get("phone", row.get("phone_primary")) or "Client",row.get("email",row.get("email_primary")),row.get("phone",row.get("phone_primary"))))
+                            (code,row.get("type","domestic"),row.get("name",row.get("display_name","")),row.get("email",row.get("email_primary")),row.get("phone",row.get("phone_primary"))))
                     imported += 1
                 except Exception as e: errors.append(f"Row {i+1}: {e}")
         conn.commit()
@@ -8922,7 +1677,7 @@ async def export_csv():
 
 # ========== SYSTEM ==========
 @app.get("/system/settings")
-async def get_settings(tenant_id: int = Query(default=1)):
+async def get_settings():
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -8931,23 +1686,23 @@ async def get_settings(tenant_id: int = Query(default=1)):
             cur.execute("SELECT COUNT(*) as cnt FROM tasks"); tc = cur.fetchone()['cnt']
             cur.execute("SELECT COUNT(*) as cnt FROM leads"); lc = cur.fetchone()['cnt']
             cur.execute("SELECT COUNT(*) as cnt FROM users WHERE deleted_at IS NULL"); uc = cur.fetchone()['cnt']
-            cur.execute("SELECT workspace_mode, max_active_users FROM tenant_operating_profile WHERE tenant_id=%s", (tenant_id,))
+            cur.execute("SELECT workspace_mode, max_active_users FROM tenant_operating_profile WHERE tenant_id=1")
             op = cur.fetchone() or {}
-            cur.execute("SELECT max_users FROM subscription_limits WHERE tenant_id=%s", (tenant_id,))
+            cur.execute("SELECT max_users FROM subscription_limits WHERE tenant_id=1")
             sl = cur.fetchone() or {}
-            ts = _get_tenant_settings(conn, tenant_id)
-            return {"company_name": ts.get("company_name","Secretary CRM"), "version": ts.get("app_version","1.0.0"), "database":"PostgreSQL",
+            return {"company_name":"DesignLeaf","version":"1.2a","database":"PostgreSQL",
                     "clients_count":cc,"jobs_count":jc,"tasks_count":tc,"leads_count":lc,
                     "users_count":uc,
                     "workspace_mode":op.get("workspace_mode","solo"),
                     "max_active_users":sl.get("max_users", op.get("max_active_users",1)),
                     "ai_configured":bool(OPENAI_API_KEY),"environment":os.getenv("RAILWAY_ENVIRONMENT","local")}
-    except Exception as e: return {"company_name":"Secretary CRM","version":"1.0.0","error":str(e)}
+    except Exception as e: return {"company_name":"DesignLeaf","version":"1.2a","error":str(e)}
     finally: release_conn(conn)
 
 
 @app.get("/debug/db-schema")
-async def db_schema():
+async def db_schema(request: Request):
+    require_debug_admin(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -8957,7 +1712,10 @@ async def db_schema():
 
 
 @app.post("/debug/repair-schema")
-async def repair_schema():
+async def repair_schema(request: Request):
+    require_debug_admin(request)
+    if os.getenv("ENABLE_SCHEMA_REPAIR_ENDPOINT", "").lower() != "true":
+        raise HTTPException(404, "Not found")
     conn = get_db_conn()
     results = []
     try:
@@ -8969,7 +1727,7 @@ async def repair_schema():
                 except Exception as e:
                     results.append({"sql": sql[:60], "ok": False, "err": str(e)})
                     conn.rollback()
-            for sql in ["CREATE TABLE IF NOT EXISTS roles (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, role_name TEXT NOT NULL UNIQUE, description TEXT, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS users (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, role_id BIGINT, first_name TEXT NOT NULL, last_name TEXT NOT NULL, display_name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, phone TEXT, status TEXT DEFAULT 'active', password_hash TEXT DEFAULT '', must_change_password BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ)","CREATE TABLE IF NOT EXISTS audit_log (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, user_id BIGINT, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT, old_values JSONB, new_values JSONB, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS quotes (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, quote_number TEXT UNIQUE, client_id BIGINT, status TEXT DEFAULT 'draft', total NUMERIC(12,2) DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS tenants (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, status TEXT DEFAULT 'active', created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS migration_log (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, filename TEXT NOT NULL UNIQUE, applied_at TIMESTAMPTZ DEFAULT now())"]:
+            for sql in ["CREATE TABLE IF NOT EXISTS roles (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, role_name TEXT NOT NULL UNIQUE, description TEXT, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS users (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, role_id BIGINT, first_name TEXT NOT NULL, last_name TEXT NOT NULL, display_name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, phone TEXT, status TEXT DEFAULT 'active', password_hash TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ)","CREATE TABLE IF NOT EXISTS audit_log (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, user_id BIGINT, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT, old_values JSONB, new_values JSONB, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS quotes (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant_id INT DEFAULT 1, quote_number TEXT UNIQUE, client_id BIGINT, status TEXT DEFAULT 'draft', total NUMERIC(12,2) DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS tenants (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, status TEXT DEFAULT 'active', created_at TIMESTAMPTZ DEFAULT now())","CREATE TABLE IF NOT EXISTS migration_log (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, filename TEXT NOT NULL UNIQUE, applied_at TIMESTAMPTZ DEFAULT now())"]:
                 try:
                     cur.execute(sql)
                     results.append({"sql": "CREATE TABLE OK", "ok": True})
@@ -8977,7 +1735,7 @@ async def repair_schema():
                     results.append({"sql": "CREATE TABLE FAIL", "ok": False, "err": str(e)})
                     conn.rollback()
             try:
-                cur.execute("INSERT INTO tenants (name,slug) VALUES ('New Company','new-company') ON CONFLICT (slug) DO NOTHING")
+                cur.execute("INSERT INTO tenants (name,slug) VALUES ('DesignLeaf','designleaf') ON CONFLICT (slug) DO NOTHING")
                 cur.execute("INSERT INTO roles (role_name,description) VALUES ('admin','Full access') ON CONFLICT (role_name) DO NOTHING")
                 cur.execute("INSERT INTO migration_log (filename) VALUES ('001_full_repair.sql') ON CONFLICT (filename) DO NOTHING")
                 results.append({"sql": "SEED data", "ok": True})
@@ -9003,7 +1761,8 @@ async def repair_schema():
 # /debug/seed-admin REMOVED — security risk (was public, no auth)
 
 @app.get("/debug/test-voice")
-async def test_voice():
+async def test_voice(request: Request):
+    require_debug_admin(request)
     """Test voice session input to see actual error"""
     conn = get_db_conn()
     try:
@@ -9031,7 +1790,8 @@ async def test_voice():
         except: pass
 
 # ========== QUOTES (Nabídky) ==========
-def ensure_quote_items_table():
+@app.on_event("startup")
+async def ensure_quote_items():
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -9047,78 +1807,6 @@ def ensure_quote_items_table():
             conn.commit()
     except: conn.rollback()
     finally: release_conn(conn)
-
-def ensure_hierarchy_workflow_schema():
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_user_id BIGINT;
-                ALTER TABLE clients ADD COLUMN IF NOT EXISTS next_action_task_id TEXT;
-                ALTER TABLE clients ADD COLUMN IF NOT EXISTS hierarchy_status TEXT NOT NULL DEFAULT 'valid';
-                ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_action_task_id TEXT;
-                ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hierarchy_status TEXT NOT NULL DEFAULT 'valid';
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_clients_tenant_owner ON clients (tenant_id, owner_user_id) WHERE deleted_at IS NULL")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_clients_tenant_next_action ON clients (tenant_id, next_action_task_id) WHERE deleted_at IS NULL")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_tenant_assigned_user ON jobs (tenant_id, assigned_user_id) WHERE deleted_at IS NULL")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_tenant_next_action ON jobs (tenant_id, next_action_task_id) WHERE deleted_at IS NULL")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant_assigned_user ON tasks (tenant_id, assigned_user_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant_client_open ON tasks (tenant_id, client_id, is_completed)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant_job_open ON tasks (tenant_id, job_id, is_completed)")
-            cur.execute("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_clients_owner_user'
-                    ) THEN
-                        ALTER TABLE clients
-                        ADD CONSTRAINT fk_clients_owner_user
-                        FOREIGN KEY (owner_user_id) REFERENCES users(id)
-                        ON DELETE RESTRICT;
-                    END IF;
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_clients_next_action_task'
-                    ) THEN
-                        ALTER TABLE clients
-                        ADD CONSTRAINT fk_clients_next_action_task
-                        FOREIGN KEY (next_action_task_id) REFERENCES tasks(id)
-                        ON DELETE RESTRICT;
-                    END IF;
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_jobs_next_action_task'
-                    ) THEN
-                        ALTER TABLE jobs
-                        ADD CONSTRAINT fk_jobs_next_action_task
-                        FOREIGN KEY (next_action_task_id) REFERENCES tasks(id)
-                        ON DELETE RESTRICT;
-                    END IF;
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_jobs_assigned_user'
-                    ) THEN
-                        ALTER TABLE jobs
-                        ADD CONSTRAINT fk_jobs_assigned_user
-                        FOREIGN KEY (assigned_user_id) REFERENCES users(id)
-                        ON DELETE RESTRICT;
-                    END IF;
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint WHERE conname = 'fk_tasks_assigned_user'
-                    ) THEN
-                        ALTER TABLE tasks
-                        ADD CONSTRAINT fk_tasks_assigned_user
-                        FOREIGN KEY (assigned_user_id) REFERENCES users(id)
-                        ON DELETE RESTRICT;
-                    END IF;
-                EXCEPTION WHEN OTHERS THEN
-                    NULL;
-                END $$;
-            """)
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
 
 @app.get("/crm/quotes")
 async def list_quotes(tenant_id: int=1, client_id: Optional[int]=None, status: Optional[str]=None):
@@ -9252,717 +1940,12 @@ async def add_job_note(job_id: int, data: dict, request: Request):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            note_type = (data.get("note_type") or "general").strip() or "general"
-            created_by = data.get("created_by") or get_user_display_name(conn, tid, request.state.user.get("user_id")) or "system"
-            cur.execute("""INSERT INTO job_notes (job_id,note,note_type,created_by,tenant_id)
-                VALUES (%s,%s,%s,%s,%s)
-                RETURNING id,job_id,note,note_type,created_by,created_at::text,updated_at::text""",
-                (job_id, data.get("note",""), note_type, created_by, tid))
-            note = dict(cur.fetchone())
-            log_activity(conn, "job", job_id, "note", f"{note_type}: {(data.get('note','') or '')[:120]}", tenant_id=tid, user_id=request.state.user.get("user_id"))
-            conn.commit()
-        return note
+            cur.execute("INSERT INTO job_notes (job_id,note,created_by,tenant_id) VALUES (%s,%s,%s,%s) RETURNING id",
+                (job_id, data.get("note",""), data.get("created_by","system"), tid))
+            nid = cur.fetchone()['id']; conn.commit()
+        return {"id":nid,"status":"created"}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
-
-@app.get("/crm/jobs/{job_id}/photos")
-async def get_job_photos(job_id: int, request: Request):
-    tid = get_request_tenant_id(request)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""SELECT id,entity_type,entity_id,filename,description,photo_type,file_path,thumbnail_base64,
-                    created_by,created_at::text
-                FROM photos
-                WHERE tenant_id=%s AND entity_type='job' AND entity_id=%s
-                ORDER BY created_at DESC""", (tid, str(job_id)))
-            return [map_photo_row_to_job_photo(dict(r)) for r in cur.fetchall()]
-    finally:
-        release_conn(conn)
-
-@app.post("/crm/jobs/{job_id}/photos")
-async def upload_job_photo(
-    job_id: int,
-    request: Request,
-    file: UploadFile = File(...),
-    description: Optional[str] = Form(None),
-    photo_type: Optional[str] = Form(None),
-):
-    tid = get_request_tenant_id(request)
-    conn = get_db_conn()
-    try:
-        content = await file.read()
-        if not content:
-            raise HTTPException(400, "Photo file is empty")
-        data_url = encode_photo_data_url(content, file.filename or "photo.jpg", file.content_type)
-        with conn.cursor() as cur:
-            cur.execute("""INSERT INTO photos
-                (entity_type,entity_id,filename,description,photo_type,file_path,thumbnail_base64,created_by,tenant_id)
-                VALUES ('job',%s,%s,%s,%s,%s,%s,%s,%s)
-                RETURNING id,entity_type,entity_id,filename,description,photo_type,file_path,thumbnail_base64,created_by,created_at::text""",
-                (
-                    str(job_id),
-                    file.filename or f"job_{job_id}_{uuid.uuid4().hex[:8]}.jpg",
-                    description,
-                    (photo_type or "general").strip() or "general",
-                    data_url,
-                    data_url,
-                    get_user_display_name(conn, tid, request.state.user.get("user_id")) or "system",
-                    tid,
-                ))
-            photo = map_photo_row_to_job_photo(dict(cur.fetchone()))
-            log_activity(conn, "job", job_id, "photo_upload", f"Photo uploaded: {photo['photo_type']}", tenant_id=tid, user_id=request.state.user.get("user_id"))
-            conn.commit()
-        return photo
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-@app.post("/plants/identify")
-async def identify_plant(
-    request: Request,
-    images: List[UploadFile] = File(...),
-    organs_json: Optional[str] = Form(None),
-    language: Optional[str] = Form("en"),
-    captured_at: Optional[str] = Form(None),
-    latitude: Optional[float] = Form(None),
-    longitude: Optional[float] = Form(None),
-    accuracy_meters: Optional[float] = Form(None),
-    location_source: Optional[str] = Form(None),
-):
-    user = ensure_request_permissions(request, "crm_read")
-    tenant_id = user["tenant_id"]
-    if not images:
-        raise HTTPException(400, tr_lang(
-            language,
-            "No plant images uploaded.",
-            "Nebyly nahrány žádné fotografie rostliny.",
-            "Nie przesłano żadnych zdjęć rośliny."
-        ))
-    if len(images) > 5:
-        raise HTTPException(400, tr_lang(
-            language,
-            "A maximum of 5 images is supported.",
-            "Podporováno je maximálně 5 fotografií.",
-            "Obsługiwanych jest maksymalnie 5 zdjęć."
-        ))
-    try:
-        raw_organs = json.loads(organs_json) if organs_json else []
-    except Exception:
-        raise HTTPException(400, tr_lang(
-            language,
-            "Invalid photo type payload.",
-            "Neplatná data typů fotografií.",
-            "Nieprawidłowe dane typów zdjęć."
-        ))
-    organs = []
-    for index in range(len(images)):
-        organ = (raw_organs[index] if index < len(raw_organs) else "auto") or "auto"
-        organs.append(str(organ).strip().lower() or "auto")
-    try:
-        plantnet_raw = await plantnet_identify(images, organs, language or "en")
-        result = map_plantnet_result(plantnet_raw, language or "en", organs)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Plant recognition response could not be processed: {exc}",
-            f"Odpověď rozpoznávání rostliny nešla zpracovat: {exc}",
-            f"Odpowiedź rozpoznawania rośliny nie mogła zostać przetworzona: {exc}"
-        ))
-
-    try:
-        history_photos = await build_history_photos(images, organs)
-        conn = get_db_conn()
-        try:
-            store_nature_history(
-                conn,
-                tenant_id,
-                user.get("user_id"),
-                "plant_identification",
-                language or "en",
-                result,
-                history_photos,
-                captured_at=captured_at,
-                latitude=latitude,
-                longitude=longitude,
-                accuracy_meters=accuracy_meters,
-                location_source=location_source,
-            )
-            log_activity(
-                conn,
-                "plant_identification",
-                uuid.uuid4().hex[:12],
-                "identify",
-                f"Plant identified as {result['scientific_name'] or result['display_name']}",
-                tenant_id=tenant_id,
-                user_id=user.get("user_id"),
-            )
-            conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            print(f"Plant recognition history/logging failed: {exc}")
-        finally:
-            release_conn(conn)
-    except Exception as exc:
-        print(f"Plant recognition post-processing failed: {exc}")
-    return result
-
-@app.post("/plants/health-assessment")
-async def assess_plant_health(
-    request: Request,
-    images: List[UploadFile] = File(...),
-    language: Optional[str] = Form("en"),
-    captured_at: Optional[str] = Form(None),
-    latitude: Optional[float] = Form(None),
-    longitude: Optional[float] = Form(None),
-    accuracy_meters: Optional[float] = Form(None),
-    location_source: Optional[str] = Form(None),
-):
-    user = ensure_request_permissions(request, "crm_read")
-    tenant_id = user["tenant_id"]
-    if not images:
-        raise HTTPException(400, tr_lang(
-            language,
-            "No plant images uploaded.",
-            "Nebyly nahrány žádné fotografie rostliny.",
-            "Nie przesłano żadnych zdjęć rośliny."
-        ))
-    if len(images) > 5:
-        raise HTTPException(400, tr_lang(
-            language,
-            "A maximum of 5 images is supported.",
-            "Podporováno je maximálně 5 fotografií.",
-            "Obsługiwanych jest maksymalnie 5 zdjęć."
-        ))
-    health_raw = await plant_health_assessment(images, language or "en")
-    result = map_plant_health_result(health_raw, language or "en")
-    history_photos = await build_history_photos(images)
-    conn = get_db_conn()
-    try:
-        store_nature_history(
-            conn,
-            tenant_id,
-            user.get("user_id"),
-            "plant_health_assessment",
-            language or "en",
-            result,
-            history_photos,
-            captured_at=captured_at,
-            latitude=latitude,
-            longitude=longitude,
-            accuracy_meters=accuracy_meters,
-            location_source=location_source,
-        )
-        log_activity(
-            conn,
-            "plant_health_assessment",
-            uuid.uuid4().hex[:12],
-            "assess",
-            f"Plant health assessed as {result.get('top_issue_name') or 'healthy'}",
-            tenant_id=tenant_id,
-            user_id=user.get("user_id"),
-        )
-        conn.commit()
-    finally:
-        release_conn(conn)
-    return result
-
-@app.post("/mushrooms/identify")
-async def identify_mushroom(
-    request: Request,
-    images: List[UploadFile] = File(...),
-    language: Optional[str] = Form("en"),
-    captured_at: Optional[str] = Form(None),
-    latitude: Optional[float] = Form(None),
-    longitude: Optional[float] = Form(None),
-    accuracy_meters: Optional[float] = Form(None),
-    location_source: Optional[str] = Form(None),
-):
-    user = ensure_request_permissions(request, "crm_read")
-    tenant_id = user["tenant_id"]
-    if not images:
-        raise HTTPException(400, tr_lang(
-            language,
-            "No mushroom images uploaded.",
-            "Nebyly nahrány žádné fotografie houby.",
-            "Nie przesłano żadnych zdjęć grzyba."
-        ))
-    if len(images) > 5:
-        raise HTTPException(400, tr_lang(
-            language,
-            "A maximum of 5 images is supported.",
-            "Podporováno je maximálně 5 fotografií.",
-            "Obsługiwanych jest maksymalnie 5 zdjęć."
-        ))
-    mushroom_raw = await mushroom_identify(images, language or "en")
-    try:
-        result = map_mushroom_result(mushroom_raw, language or "en")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(502, tr_lang(
-            language,
-            f"Mushroom recognition response could not be processed: {exc}",
-            f"Odpověď rozpoznávání houby nešla zpracovat: {exc}",
-            f"Nie udało się przetworzyć odpowiedzi rozpoznawania grzyba: {exc}"
-        ))
-    history_photos = await build_history_photos(images)
-    conn = get_db_conn()
-    try:
-        try:
-            store_nature_history(
-                conn,
-                tenant_id,
-                user.get("user_id"),
-                "mushroom_identification",
-                language or "en",
-                result,
-                history_photos,
-                captured_at=captured_at,
-                latitude=latitude,
-                longitude=longitude,
-                accuracy_meters=accuracy_meters,
-                location_source=location_source,
-            )
-            log_activity(
-                conn,
-                "mushroom_identification",
-                uuid.uuid4().hex[:12],
-                "identify",
-                f"Mushroom identified as {result['scientific_name'] or result['display_name']}",
-                tenant_id=tenant_id,
-                user_id=user.get("user_id"),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-    finally:
-        release_conn(conn)
-    return result
-
-@app.get("/nature/history")
-async def get_nature_history(
-    request: Request,
-    limit: int = 30,
-    recognition_type: Optional[str] = None,
-    language: Optional[str] = None,
-):
-    user = ensure_request_permissions(request, "crm_read")
-    tenant_id = user["tenant_id"]
-    conn = get_db_conn()
-    try:
-        permissions = get_effective_permissions(conn, tenant_id, user["user_id"], user.get("role"))
-        can_view_all = permissions.get("manage_users", False)
-        with conn.cursor() as cur:
-            sql = """SELECT h.id, h.recognition_type, h.display_name, h.scientific_name, h.confidence, h.guidance,
-                            h.database_name, h.result_json, h.photos_json, h.captured_at::text, h.created_at::text,
-                            h.latitude, h.longitude, h.accuracy_meters, h.location_source,
-                            h.user_id AS owner_user_id, COALESCE(u.display_name, '') AS owner_display_name,
-                            COALESCE(u.email, '') AS owner_email
-                     FROM nature_recognition_history h
-                     LEFT JOIN users u ON u.id = h.user_id AND u.tenant_id = h.tenant_id
-                     WHERE h.tenant_id=%s"""
-            params = [tenant_id]
-            if not can_view_all:
-                sql += " AND h.user_id=%s"
-                params.append(user["user_id"])
-            if recognition_type:
-                sql += " AND h.recognition_type=%s"
-                params.append(recognition_type)
-            sql += " ORDER BY COALESCE(h.captured_at, h.created_at) DESC LIMIT %s"
-            params.append(max(1, min(limit, 100)))
-            cur.execute(sql, params)
-            return [map_nature_history_entry(dict(row), language or "en") for row in cur.fetchall()]
-    finally:
-        release_conn(conn)
-
-@app.get("/nature/services/status")
-async def get_nature_services_status(request: Request):
-    ensure_request_permissions(request, "crm_read")
-    return get_nature_service_status()
-
-@app.get("/admin/hierarchy-integrity")
-async def get_admin_hierarchy_integrity(request: Request):
-    user = ensure_request_permissions(request, "manage_users")
-    conn = get_db_conn()
-    try:
-        return get_hierarchy_integrity_report(conn, user["tenant_id"])
-    finally:
-        release_conn(conn)
-
-@app.post("/admin/hierarchy-integrity/backfill")
-async def backfill_admin_hierarchy_integrity(request: Request, data: Optional[dict] = None):
-    user = ensure_request_permissions(request, "manage_users")
-    payload = data or {}
-    dry_run = not bool(payload.get("apply"))
-    conn = get_db_conn()
-    try:
-        result = run_hierarchy_backfill(conn, user["tenant_id"], actor_user_id=user.get("user_id"), dry_run=dry_run)
-        if not dry_run:
-            log_activity(
-                conn,
-                "hierarchy_integrity",
-                user["tenant_id"],
-                "backfill",
-                "Hierarchy backfill applied",
-                tenant_id=user["tenant_id"],
-                user_id=user.get("user_id"),
-                source_channel="admin",
-                details=result["summary"],
-            )
-            conn.commit()
-        else:
-            conn.rollback()
-        return result
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-@app.get("/admin/activity-log")
-async def get_admin_activity_log(
-    request: Request,
-    limit: int = 200,
-    actor_user_id: Optional[int] = None,
-):
-    ensure_request_permissions(request, "manage_users")
-    admin = request.state.user
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            sql = """SELECT a.id, a.entity_type, a.entity_id, a.action, a.description, a.user_name,
-                            a.source_channel, a.details_json, a.created_at::text,
-                            a.user_id_ref AS actor_user_id,
-                            COALESCE(u.display_name, a.user_name, '') AS actor_display_name,
-                            COALESCE(u.email, '') AS actor_email
-                     FROM activity_timeline a
-                     LEFT JOIN users u
-                       ON u.id::text = a.user_id_ref
-                      AND u.tenant_id = a.tenant_id
-                     WHERE a.tenant_id=%s"""
-            params = [admin["tenant_id"]]
-            if actor_user_id is not None:
-                sql += " AND a.user_id_ref=%s"
-                params.append(str(actor_user_id))
-            sql += " ORDER BY a.created_at DESC LIMIT %s"
-            params.append(max(1, min(limit, 1000)))
-            cur.execute(sql, params)
-            return [map_admin_activity_entry(dict(row)) for row in cur.fetchall()]
-    finally:
-        release_conn(conn)
-
-# ========== ADMIN: LANGUAGE SETTINGS ==========
-
-@app.get("/admin/clients/{client_id}/language")
-async def admin_get_client_language(client_id: int, request: Request):
-    """Return stored language preferences for a specific client."""
-    admin = ensure_request_permissions(request, "manage_users")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, display_name,
-                       preferred_language_code,
-                       preferred_language_name,
-                       language_source,
-                       language_confidence,
-                       language_updated_at::text
-                FROM clients
-                WHERE id = %s AND tenant_id = %s
-                """,
-                (client_id, admin["tenant_id"]),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Client not found")
-            return {
-                "client_id": row["id"],
-                "display_name": row["display_name"],
-                "preferred_language_code": row["preferred_language_code"] or DEFAULT_CUSTOMER_LANG,
-                "preferred_language_name": row["preferred_language_name"],
-                "language_source": row["language_source"],
-                "language_confidence": row["language_confidence"],
-                "language_updated_at": row["language_updated_at"],
-            }
-    finally:
-        release_conn(conn)
-
-
-@app.put("/admin/clients/{client_id}/language")
-async def admin_set_client_language(client_id: int, data: dict, request: Request):
-    """Set preferred language for a client.
-
-    Body: { "language_code": "cs-CZ", "source": "admin", "confidence": 1.0 }
-    """
-    admin = ensure_request_permissions(request, "manage_users")
-    language_code = data.get("language_code")
-    if not language_code:
-        raise HTTPException(400, "language_code is required")
-    source = data.get("source", "admin")
-    try:
-        confidence = float(data.get("confidence", 1.0))
-    except (TypeError, ValueError):
-        raise HTTPException(400, "confidence must be a number")
-
-    normalized = normalize_language_code(language_code, DEFAULT_CUSTOMER_LANG)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, display_name FROM clients WHERE id=%s AND tenant_id=%s",
-                        (client_id, admin["tenant_id"]))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Client not found")
-            prev_lang = None
-            cur.execute("SELECT preferred_language_code FROM clients WHERE id=%s", (client_id,))
-            prev_row = cur.fetchone()
-            if prev_row:
-                prev_lang = prev_row.get("preferred_language_code")
-            cur.execute(
-                """
-                UPDATE clients
-                SET preferred_language_code = %s,
-                    preferred_language_name = %s,
-                    language_source = %s,
-                    language_confidence = %s,
-                    language_updated_at = now()
-                WHERE id = %s
-                """,
-                (normalized, normalized, source, confidence, client_id),
-            )
-            log_activity(
-                conn,
-                entity_type="client",
-                entity_id=client_id,
-                action="language_changed",
-                description=f"Language updated: {prev_lang} → {normalized} (source={source})",
-                tenant_id=admin["tenant_id"],
-                user_id=admin.get("user_id"),
-                source_channel="admin",
-                details={
-                    "prev_language": prev_lang,
-                    "new_language": normalized,
-                    "source": source,
-                    "confidence": confidence,
-                },
-            )
-            conn.commit()
-        return {
-            "client_id": client_id,
-            "display_name": row["display_name"],
-            "preferred_language_code": normalized,
-            "language_source": source,
-            "language_confidence": confidence,
-        }
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
-@app.get("/admin/users/{user_id}/assistant-settings")
-async def admin_get_user_assistant_settings(user_id: int, request: Request):
-    """Return assistant language / tone / style settings for a user."""
-    admin = ensure_request_permissions(request, "manage_users")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, display_name, email,
-                       assistant_output_language_code,
-                       assistant_output_language_name,
-                       assistant_language_locked,
-                       assistant_tone,
-                       assistant_style
-                FROM users
-                WHERE id = %s AND tenant_id = %s
-                """,
-                (user_id, admin["tenant_id"]),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "User not found")
-            return {
-                "user_id": row["id"],
-                "display_name": row["display_name"],
-                "email": row["email"],
-                "assistant_language": normalize_language_code(
-                    row.get("assistant_output_language_code") or DEFAULT_ASSISTANT_LANG,
-                    DEFAULT_ASSISTANT_LANG,
-                ),
-                "assistant_language_name": row.get("assistant_output_language_name"),
-                "assistant_language_locked": bool(
-                    row.get("assistant_language_locked")
-                    if row.get("assistant_language_locked") is not None
-                    else True
-                ),
-                "assistant_tone": (row.get("assistant_tone") or DEFAULT_ASSISTANT_TONE).strip().lower(),
-                "assistant_style": (row.get("assistant_style") or DEFAULT_ASSISTANT_STYLE).strip().lower(),
-            }
-    finally:
-        release_conn(conn)
-
-
-VALID_TONES = {"professional", "friendly", "formal", "casual", "empathetic"}
-VALID_STYLES = {"concise", "detailed", "balanced"}
-
-
-@app.put("/admin/users/{user_id}/assistant-settings")
-async def admin_set_user_assistant_settings(user_id: int, data: dict, request: Request):
-    """Update assistant language / tone / style / locked flag for a user.
-
-    Body (all fields optional):
-    {
-      "language": "en-GB",
-      "locked": true,
-      "tone": "professional",
-      "style": "concise"
-    }
-    """
-    admin = ensure_request_permissions(request, "manage_users")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, display_name,
-                       assistant_output_language_code,
-                       assistant_language_locked,
-                       assistant_tone,
-                       assistant_style
-                FROM users
-                WHERE id = %s AND tenant_id = %s
-                """,
-                (user_id, admin["tenant_id"]),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "User not found")
-
-            # Resolve each field — keep existing value if not provided
-            new_lang = row.get("assistant_output_language_code") or DEFAULT_ASSISTANT_LANG
-            new_locked = bool(row.get("assistant_language_locked") if row.get("assistant_language_locked") is not None else True)
-            new_tone = (row.get("assistant_tone") or DEFAULT_ASSISTANT_TONE).strip().lower()
-            new_style = (row.get("assistant_style") or DEFAULT_ASSISTANT_STYLE).strip().lower()
-
-            changes = {}
-            if "language" in data:
-                new_lang = normalize_language_code(data["language"], DEFAULT_ASSISTANT_LANG)
-                changes["language"] = new_lang
-            if "locked" in data:
-                new_locked = bool(data["locked"])
-                changes["locked"] = new_locked
-            if "tone" in data:
-                tone_input = str(data["tone"]).strip().lower()
-                if tone_input not in VALID_TONES:
-                    raise HTTPException(400, f"tone must be one of: {sorted(VALID_TONES)}")
-                new_tone = tone_input
-                changes["tone"] = new_tone
-            if "style" in data:
-                style_input = str(data["style"]).strip().lower()
-                if style_input not in VALID_STYLES:
-                    raise HTTPException(400, f"style must be one of: {sorted(VALID_STYLES)}")
-                new_style = style_input
-                changes["style"] = new_style
-
-            if not changes:
-                raise HTTPException(400, "Nothing to update — provide at least one of: language, locked, tone, style")
-
-            cur.execute(
-                """
-                UPDATE users
-                SET assistant_output_language_code = %s,
-                    assistant_output_language_name = %s,
-                    assistant_language_locked = %s,
-                    assistant_tone = %s,
-                    assistant_style = %s
-                WHERE id = %s
-                """,
-                (new_lang, new_lang, new_locked, new_tone, new_style, user_id),
-            )
-            log_activity(
-                conn,
-                entity_type="user",
-                entity_id=user_id,
-                action="assistant_settings_changed",
-                description=f"Assistant settings updated: {changes}",
-                tenant_id=admin["tenant_id"],
-                user_id=admin.get("user_id"),
-                source_channel="admin",
-                details={
-                    "user_id": user_id,
-                    "changes": changes,
-                    "prev": {
-                        "language": row.get("assistant_output_language_code"),
-                        "locked": row.get("assistant_language_locked"),
-                        "tone": row.get("assistant_tone"),
-                        "style": row.get("assistant_style"),
-                    },
-                },
-            )
-            conn.commit()
-        return {
-            "user_id": user_id,
-            "display_name": row["display_name"],
-            "assistant_language": new_lang,
-            "assistant_language_locked": new_locked,
-            "assistant_tone": new_tone,
-            "assistant_style": new_style,
-            "updated_fields": list(changes.keys()),
-        }
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
-@app.post("/crm/jobs/{job_id}/audit")
-async def add_job_audit(job_id: int, data: dict, request: Request):
-    tid = get_request_tenant_id(request)
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            user_name = get_user_display_name(conn, tid, request.state.user.get("user_id")) or "system"
-            cur.execute("""INSERT INTO activity_timeline
-                (entity_type, entity_id, action, description, user_name, tenant_id, user_id_ref, created_at)
-                VALUES ('job', %s, %s, %s, %s, %s, %s, now())
-                RETURNING id,entity_id,action,description,user_name,created_at::text""",
-                (
-                    str(job_id),
-                    data.get("action_type", "update"),
-                    data.get("description", ""),
-                    user_name,
-                    tid,
-                    str(request.state.user.get("user_id") or ""),
-                ))
-            row = map_audit_row_to_job_audit(dict(cur.fetchone()))
-            conn.commit()
-        return row
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
 
 # ========== INVOICE ITEMS ==========
 @app.get("/crm/invoices/{invoice_id}/items")
@@ -10157,11 +2140,32 @@ async def get_work_report(report_id: int):
 
 # ========== AUTH: JWT ==========
 
+PBKDF2_PASSWORD_ITERATIONS = 200000
+
+
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    salt = os.urandom(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_PASSWORD_ITERATIONS}${salt.hex()}${derived.hex()}"
+
 
 def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
+    if not hashed:
+        return False
+    if hashed.startswith("pbkdf2_sha256$"):
+        try:
+            _, iterations_raw, salt_hex, hash_hex = hashed.split("$", 3)
+            iterations = int(iterations_raw)
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(hash_hex)
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+    if len(hashed) == 64 and all(c in "0123456789abcdefABCDEF" for c in hashed):
+        legacy = hashlib.sha256(password.encode()).hexdigest()
+        return hmac.compare_digest(legacy, hashed.lower())
+    return False
 
 def create_token(user_id: int, tenant_id: int, role: str, token_type: str = "access") -> str:
     if token_type == "access":
@@ -10205,85 +2209,6 @@ def require_role(*roles):
         return user
     return checker
 
-def require_permission(*permission_codes):
-    """Factory for permission-based access."""
-    async def checker(user: dict = Depends(require_auth)):
-        conn = get_db_conn()
-        try:
-            permissions = get_effective_permissions(conn, user["tenant_id"], user["user_id"], user.get("role"))
-            if not all(permissions.get(code, False) for code in permission_codes):
-                raise HTTPException(403, "Permission denied")
-            return user
-        finally:
-            release_conn(conn)
-    return checker
-
-@app.get("/assistant/memory")
-async def list_assistant_memory(request: Request, limit: int = 100):
-    user = get_request_user_payload(request)
-    tenant_id = user.get("tenant_id", 1)
-    user_id = user.get("user_id")
-    safe_limit = max(1, min(int(limit or 100), 200))
-    conn = get_db_conn()
-    try:
-        return load_assistant_memories(conn, tenant_id, user_id, safe_limit)
-    finally:
-        release_conn(conn)
-
-@app.post("/assistant/memory")
-async def create_assistant_memory(data: dict, request: Request):
-    user = get_request_user_payload(request)
-    tenant_id = user.get("tenant_id", 1)
-    user_id = user.get("user_id")
-    content = str(data.get("content") or data.get("text") or "").strip()
-    memory_type = data.get("memory_type") or data.get("type") or "long"
-    if not content:
-        raise HTTPException(400, "content required")
-    conn = get_db_conn()
-    try:
-        remembered = remember_assistant_memory(conn, tenant_id, user_id, content, memory_type)
-        conn.commit()
-        return remembered
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
-@app.delete("/assistant/memory/{memory_id}")
-async def delete_assistant_memory(memory_id: int, request: Request):
-    user = get_request_user_payload(request)
-    tenant_id = user.get("tenant_id", 1)
-    user_id = user.get("user_id")
-    conn = get_db_conn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                UPDATE assistant_memory
-                SET is_active=FALSE, forgotten_at=now(), updated_at=now()
-                WHERE id=%s
-                  AND tenant_id=%s
-                  AND (user_id IS NULL OR user_id IS NOT DISTINCT FROM %s)
-                  AND is_active=TRUE
-                RETURNING id, content
-                """,
-                (memory_id, tenant_id, user_id),
-            )
-            row = cur.fetchone()
-        if not row:
-            raise HTTPException(404, "Memory item not found")
-        conn.commit()
-        return {"status": "deleted", "item": dict(row)}
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
 @app.post("/auth/login")
 async def auth_login(data: dict):
     email = data.get("email","").strip().lower()
@@ -10293,7 +2218,6 @@ async def auth_login(data: dict):
     try:
         with conn.cursor() as cur:
             cur.execute("""SELECT u.id, u.tenant_id, u.display_name, u.email, u.password_hash, u.status, u.is_owner, u.is_assistant,
-                COALESCE(u.must_change_password, FALSE) AS must_change_password,
                 r.role_name FROM users u LEFT JOIN roles r ON u.role_id=r.id
                 WHERE LOWER(u.email)=%s AND u.deleted_at IS NULL""", (email,))
             user = cur.fetchone()
@@ -10303,17 +2227,14 @@ async def auth_login(data: dict):
             if not user["password_hash"] or not verify_password(password, user["password_hash"]):
                 raise HTTPException(401, "Invalid credentials")
             role = user["role_name"] or "viewer"
-            permissions = get_effective_permissions(conn, user["tenant_id"], user["id"], role)
             access = create_token(user["id"], user["tenant_id"], role, "access")
             refresh = create_token(user["id"], user["tenant_id"], role, "refresh")
             log_activity(conn, "user", str(user["id"]), "login", f"{user['display_name']} logged in", tenant_id=user["tenant_id"], user_id=user["id"])
             conn.commit()
         return {
             "access_token": access, "refresh_token": refresh, "token_type": "bearer",
-            "must_change_password": bool(user["must_change_password"]),
             "user": {"id": user["id"], "display_name": user["display_name"], "email": user["email"],
-                     "role": role, "tenant_id": user["tenant_id"], "is_owner": user["is_owner"], "permissions": permissions,
-                     "must_change_password": bool(user["must_change_password"])}
+                     "role": role, "tenant_id": user["tenant_id"], "is_owner": user["is_owner"]}
         }
     finally: release_conn(conn)
 
@@ -10332,167 +2253,66 @@ async def auth_me(user: dict = Depends(require_auth)):
     try:
         with conn.cursor() as cur:
             cur.execute("""SELECT u.id, u.tenant_id, u.display_name, u.email, u.phone, u.status, u.is_owner, u.is_assistant,
-                COALESCE(u.must_change_password, FALSE) AS must_change_password,
                 u.preferred_language_code, r.role_name FROM users u LEFT JOIN roles r ON u.role_id=r.id WHERE u.id=%s""", (user["user_id"],))
             u = cur.fetchone()
             if not u: raise HTTPException(404, "User not found")
-        payload = dict(u)
-        payload["permissions"] = get_effective_permissions(conn, u["tenant_id"], u["id"], u.get("role_name"))
-        return payload
-    finally: release_conn(conn)
-
-@app.get("/auth/permissions")
-async def auth_list_permissions(admin: dict = Depends(require_permission("manage_users"))):
-    conn = get_db_conn()
-    try:
-        return load_permission_catalog(conn)
+        return dict(u)
     finally: release_conn(conn)
 
 @app.get("/auth/roles")
-async def auth_list_roles(admin: dict = Depends(require_permission("manage_users"))):
+async def auth_list_roles(admin: dict = Depends(require_role("admin"))):
     conn = get_db_conn()
     try:
-        catalog = load_permission_catalog(conn)
-        role_maps = load_role_permission_maps(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT role_name, description FROM roles ORDER BY id")
-            rows = [dict(r) for r in cur.fetchall()]
-        for row in rows:
-            role_name = (row.get("role_name") or "viewer").lower()
-            row["permissions"] = complete_permission_map(role_maps.get(role_name, default_permissions_for_role(role_name)))
-            row["permission_details"] = catalog
-        return rows
+            return [dict(r) for r in cur.fetchall()]
     finally: release_conn(conn)
 
 @app.get("/auth/users")
-async def auth_list_users(admin: dict = Depends(require_permission("manage_users"))):
+async def auth_list_users(admin: dict = Depends(require_role("admin"))):
     conn = get_db_conn()
     try:
-        role_maps = load_role_permission_maps(conn)
-        user_overrides = load_user_permission_overrides(conn, admin["tenant_id"])
         with conn.cursor() as cur:
             cur.execute("""SELECT u.id, u.display_name, u.email, u.phone, u.status,
-                COALESCE(u.must_change_password, FALSE) AS must_change_password,
                 r.role_name, u.created_at
                 FROM users u LEFT JOIN roles r ON u.role_id=r.id
                 WHERE u.tenant_id=%s AND u.deleted_at IS NULL
                 ORDER BY u.id""", (admin["tenant_id"],))
-            rows = [dict(r) for r in cur.fetchall()]
-        for row in rows:
-            clean_user_row_display_name(row)
-            user_id = int(row["id"])
-            role_name = (row.get("role_name") or "viewer").lower()
-            role_permissions = complete_permission_map(role_maps.get(role_name, default_permissions_for_role(role_name)))
-            overrides = normalize_permission_payload(user_overrides.get(user_id, {}))
-            effective = dict(role_permissions)
-            effective.update(overrides)
-            row["role_permissions"] = role_permissions
-            row["user_permission_overrides"] = overrides
-            row["permissions"] = complete_permission_map(effective)
-        return rows
+            return [dict(r) for r in cur.fetchall()]
     finally: release_conn(conn)
 
-@app.get("/auth/first-login-users")
-async def auth_first_login_users(tenant_id: int = 1):
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT u.id, u.display_name, u.email
-                FROM users u
-                WHERE u.tenant_id=%s
-                  AND u.deleted_at IS NULL
-                  AND COALESCE(u.must_change_password, FALSE)=TRUE
-                  AND COALESCE(u.status, 'active') IN ('active','setup')
-                ORDER BY LOWER(COALESCE(u.display_name, u.email)), u.id
-            """, (tenant_id,))
-            return [clean_user_row_display_name(dict(r)) for r in cur.fetchall()]
-    finally:
-        release_conn(conn)
-
 @app.put("/auth/users/{user_id}")
-async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(require_permission("manage_users"))):
+async def auth_update_user(user_id: int, data: dict, admin: dict = Depends(require_role("admin"))):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""SELECT u.id, r.role_name
-                FROM users u
-                LEFT JOIN roles r ON r.id = u.role_id
-                WHERE u.id=%s AND u.tenant_id=%s AND u.deleted_at IS NULL""",
+            cur.execute("SELECT id FROM users WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL",
                 (user_id, admin["tenant_id"]))
-            user_row = cur.fetchone()
-            if not user_row: raise HTTPException(404, "User not found")
+            if not cur.fetchone(): raise HTTPException(404, "User not found")
             updates, params = [], []
-            resolved_role = user_row["role_name"] or "viewer"
             if "display_name" in data:
-                updates.append("display_name=%s"); params.append(clean_user_display_name(data["display_name"]))
+                updates.append("display_name=%s"); params.append(data["display_name"])
             if "phone" in data:
                 updates.append("phone=%s"); params.append(data["phone"])
             if "status" in data and data["status"] in ("active","inactive"):
-                if data["status"] == "inactive":
-                    blockers = get_user_deactivation_blockers(conn, admin["tenant_id"], user_id)
-                    if blockers["has_blockers"]:
-                        log_activity(
-                            conn,
-                            "user",
-                            user_id,
-                            "blocked_deactivation",
-                            f"Blocked user deactivation for {user_id}",
-                            tenant_id=admin["tenant_id"],
-                            user_id=admin["user_id"],
-                            source_channel="settings",
-                            details=blockers,
-                        )
-                        conn.commit()
-                        raise HTTPException(422, "User cannot be deactivated while holding active hierarchy responsibilities")
                 updates.append("status=%s"); params.append(data["status"])
             if "role" in data:
                 cur.execute("SELECT id FROM roles WHERE role_name=%s", (data["role"],))
                 row = cur.fetchone()
                 if not row: raise HTTPException(400, f"Unknown role: {data['role']}")
                 updates.append("role_id=%s"); params.append(row["id"])
-                resolved_role = data["role"]
-            if data.get("reset_password_to_default") is True:
-                updates.append("password_hash=%s"); params.append(hash_password(DEFAULT_TEMP_PASSWORD))
-                updates.append("must_change_password=TRUE")
-            if updates:
-                updates.append("updated_at=now()")
-                params += [user_id, admin["tenant_id"]]
-                cur.execute(f"UPDATE users SET {','.join(updates)} WHERE id=%s AND tenant_id=%s", params)
-            permissions_payload = normalize_permission_payload(data.get("permissions"))
-            if permissions_payload:
-                save_user_permission_overrides(conn, admin["tenant_id"], user_id, resolved_role, permissions_payload)
-            elif data.get("reset_permission_overrides") is True:
-                clear_user_permission_overrides(conn, user_id)
-            if not updates and not permissions_payload and data.get("reset_permission_overrides") is not True:
-                raise HTTPException(400, "Nothing to update")
-            log_activity(
-                conn,
-                "user",
-                user_id,
-                "update_user",
-                f"Updated user {user_id}",
-                tenant_id=admin["tenant_id"],
-                user_id=admin["user_id"],
-                details={
-                    "display_name": data.get("display_name"),
-                    "phone": data.get("phone"),
-                    "role": data.get("role"),
-                    "status": data.get("status"),
-                    "permissions_changed": bool(permissions_payload),
-                    "reset_password_to_default": data.get("reset_password_to_default") is True,
-                    "reset_permission_overrides": data.get("reset_permission_overrides") is True,
-                },
-                source_channel="settings",
-            )
+            if not updates: raise HTTPException(400, "Nothing to update")
+            updates.append("updated_at=now()")
+            params += [user_id, admin["tenant_id"]]
+            cur.execute(f"UPDATE users SET {','.join(updates)} WHERE id=%s AND tenant_id=%s", params)
             conn.commit()
-            return {"ok": True}
+        return {"ok": True}
     except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
 @app.delete("/auth/users/{user_id}")
-async def auth_delete_user(user_id: int, admin: dict = Depends(require_permission("manage_users"))):
+async def auth_delete_user(user_id: int, admin: dict = Depends(require_role("admin"))):
     if user_id == admin["user_id"]: raise HTTPException(400, "Cannot delete yourself")
     conn = get_db_conn()
     try:
@@ -10500,23 +2320,7 @@ async def auth_delete_user(user_id: int, admin: dict = Depends(require_permissio
             cur.execute("SELECT id FROM users WHERE id=%s AND tenant_id=%s AND deleted_at IS NULL",
                 (user_id, admin["tenant_id"]))
             if not cur.fetchone(): raise HTTPException(404, "User not found")
-            blockers = get_user_deactivation_blockers(conn, admin["tenant_id"], user_id)
-            if blockers["has_blockers"]:
-                log_activity(
-                    conn,
-                    "user",
-                    user_id,
-                    "blocked_delete",
-                    f"Blocked user delete for {user_id}",
-                    tenant_id=admin["tenant_id"],
-                    user_id=admin["user_id"],
-                    source_channel="settings",
-                    details=blockers,
-                )
-                conn.commit()
-                raise HTTPException(422, "User cannot be deleted while holding active hierarchy responsibilities")
-            cur.execute("UPDATE users SET deleted_at=now(), status='inactive' WHERE id=%s AND tenant_id=%s", (user_id, admin["tenant_id"]))
-            log_activity(conn, "user", user_id, "delete_user", f"Deleted user {user_id}", tenant_id=admin["tenant_id"], user_id=admin["user_id"], source_channel="settings")
+            cur.execute("UPDATE users SET deleted_at=now(), status='inactive' WHERE id=%s", (user_id,))
             conn.commit()
         return {"ok": True}
     except HTTPException: raise
@@ -10524,13 +2328,13 @@ async def auth_delete_user(user_id: int, admin: dict = Depends(require_permissio
     finally: release_conn(conn)
 
 @app.post("/auth/register")
-async def auth_register(data: dict, admin: dict = Depends(require_permission("manage_users"))):
+async def auth_register(data: dict, admin: dict = Depends(require_role("admin"))):
     """Admin-only: register new user."""
     email = data.get("email","").strip().lower()
-    password = data.get("password","").strip() or DEFAULT_TEMP_PASSWORD
-    display_name = clean_user_display_name(data.get("display_name",""))
-    if not email or not display_name:
-        raise HTTPException(400, "email and display_name required")
+    password = data.get("password","").strip()
+    display_name = data.get("display_name","").strip()
+    if not email or not password or not display_name:
+        raise HTTPException(400, "email, password, display_name required")
     conn = get_db_conn()
     try:
         ok, msg = check_subscription_limit(conn, admin["tenant_id"], "users")
@@ -10542,25 +2346,14 @@ async def auth_register(data: dict, admin: dict = Depends(require_permission("ma
             cur.execute("SELECT id FROM roles WHERE role_name=%s", (role_name,))
             role_row = cur.fetchone()
             role_id = role_row["id"] if role_row else None
-            cur.execute("""INSERT INTO users (tenant_id, role_id, first_name, last_name, display_name, email, phone, password_hash, must_change_password, status)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,'active') RETURNING id""",
+            cur.execute("""INSERT INTO users (tenant_id, role_id, first_name, last_name, display_name, email, phone, password_hash, status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active') RETURNING id""",
                 (admin["tenant_id"], role_id, data.get("first_name",""), data.get("last_name",""),
                  display_name, email, data.get("phone",""), hash_password(password)))
             uid = cur.fetchone()["id"]
-            permissions_payload = normalize_permission_payload(data.get("permissions"))
-            if permissions_payload:
-                save_user_permission_overrides(conn, admin["tenant_id"], uid, role_name, permissions_payload)
             log_activity(conn, "user", str(uid), "register", f"User {display_name} registered by admin", tenant_id=admin["tenant_id"], user_id=admin["user_id"])
             conn.commit()
-        return {
-            "id": uid,
-            "email": email,
-            "display_name": display_name,
-            "role": role_name,
-            "must_change_password": True,
-            "temporary_password": DEFAULT_TEMP_PASSWORD,
-            "permissions": get_effective_permissions(conn, admin["tenant_id"], uid, role_name)
-        }
+        return {"id": uid, "email": email, "display_name": display_name, "role": role_name}
     except HTTPException: raise
     except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
@@ -10571,7 +2364,6 @@ async def auth_change_password(data: dict, user: dict = Depends(require_auth)):
     new_pw = data.get("new_password","")
     if not old_pw or not new_pw: raise HTTPException(400, "old_password and new_password required")
     if len(new_pw) < 6: raise HTTPException(400, "Password must be at least 6 characters")
-    if new_pw == DEFAULT_TEMP_PASSWORD: raise HTTPException(400, "Choose a new password different from the default password")
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -10579,7 +2371,7 @@ async def auth_change_password(data: dict, user: dict = Depends(require_auth)):
             u = cur.fetchone()
             if not u or not verify_password(old_pw, u["password_hash"]):
                 raise HTTPException(401, "Old password incorrect")
-            cur.execute("UPDATE users SET password_hash=%s, must_change_password=FALSE, updated_at=now() WHERE id=%s", (hash_password(new_pw), user["user_id"]))
+            cur.execute("UPDATE users SET password_hash=%s, updated_at=now() WHERE id=%s", (hash_password(new_pw), user["user_id"]))
             conn.commit()
         return {"status": "password_changed"}
     except HTTPException: raise
@@ -10728,13 +2520,9 @@ async def get_tenant_config_endpoint(tenant_id: int):
     conn = get_db_conn()
     try:
         verify_tenant(conn, tenant_id)
-        # Always bypass cache for direct config requests so app sees fresh data
-        _tenant_config_cache.pop(tenant_id, None)
         config = get_tenant_config(conn, tenant_id)
         if not config.get("found"):
-            config["error"] = "Tenant config not found. Run onboarding first."
-            config["warnings"] = []
-            return config
+            raise HTTPException(404, "Tenant config not found. Run onboarding first.")
         # Soft limit warnings
         warnings = []
         limits = config.get("limits")
@@ -10752,82 +2540,6 @@ async def get_tenant_config_endpoint(tenant_id: int):
         return config
     finally: release_conn(conn)
 
-@app.put("/tenant/config/{tenant_id}/languages")
-async def update_tenant_languages_endpoint(tenant_id: int, data: dict, user: dict = Depends(require_permission("manage_users"))):
-    conn = get_db_conn()
-    try:
-        if user["tenant_id"] != tenant_id:
-            raise HTTPException(403, "Permission denied")
-        verify_tenant(conn, tenant_id)
-        default_customer_lang = data.get("default_customer_language_code")
-        default_internal_lang = data.get("default_internal_language_code")
-        if not default_customer_lang and not default_internal_lang:
-            raise HTTPException(400, "No language update requested")
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT internal_language_mode, customer_language_mode,
-                    default_internal_language_code, default_customer_language_code
-                FROM tenant_operating_profile
-                WHERE tenant_id=%s
-            """, (tenant_id,))
-            profile = cur.fetchone()
-            if not profile:
-                raise HTTPException(404, "Tenant config not found")
-            resolved_internal = default_internal_lang or profile["default_internal_language_code"]
-            resolved_customer = default_customer_lang or profile["default_customer_language_code"]
-            cur.execute("""
-                UPDATE tenant_operating_profile
-                SET default_internal_language_code=%s,
-                    default_customer_language_code=%s,
-                    updated_at=now()
-                WHERE tenant_id=%s
-            """, (resolved_internal, resolved_customer, tenant_id))
-
-            def upsert_default_language(scope: str, code: str):
-                cur.execute("""
-                    UPDATE tenant_languages
-                    SET is_default = CASE WHEN language_code=%s THEN true ELSE false END
-                    WHERE tenant_id=%s AND language_scope=%s
-                """, (code, tenant_id, scope))
-                cur.execute("""
-                    INSERT INTO tenant_languages (tenant_id, language_code, language_scope, is_default, is_active, sort_order)
-                    VALUES (%s, %s, %s, true, true, 1)
-                    ON CONFLICT (tenant_id, language_code, language_scope) DO UPDATE SET
-                        is_default=true,
-                        is_active=true
-                """, (tenant_id, code, scope))
-
-            if default_internal_lang:
-                upsert_default_language("internal", resolved_internal)
-                upsert_default_language("voice_input", resolved_internal)
-            if default_customer_lang:
-                upsert_default_language("customer", resolved_customer)
-                upsert_default_language("voice_output", resolved_customer)
-            log_activity(
-                conn,
-                "tenant_config",
-                tenant_id,
-                "update_languages",
-                "Updated tenant language settings",
-                tenant_id=tenant_id,
-                user_id=user["user_id"],
-                details={
-                    "default_internal_language_code": resolved_internal,
-                    "default_customer_language_code": resolved_customer,
-                },
-                source_channel="settings",
-            )
-            conn.commit()
-            _tenant_config_cache.pop(tenant_id, None)
-        return get_tenant_config(conn, tenant_id)
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
 @app.get("/onboarding/industry-subtypes/{group_id}")
 async def get_industry_subtypes(group_id: int):
     conn = get_db_conn()
@@ -10835,84 +2547,6 @@ async def get_industry_subtypes(group_id: int):
         with conn.cursor() as cur:
             cur.execute("SELECT id,code,name,sort_order FROM industry_subtypes WHERE industry_group_id=%s ORDER BY sort_order",(group_id,))
             return [dict(r) for r in cur.fetchall()]
-    finally: release_conn(conn)
-
-@app.get("/onboarding/industries/{tenant_id}")
-async def get_tenant_industries(tenant_id: int):
-    """Return all selected industries + subtypes for a tenant (checkbox state)."""
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""SELECT tip.id, tip.industry_group_id, tip.industry_subtype_id, tip.is_primary,
-                                  ig.code as group_code, ig.name as group_name,
-                                  ist.code as subtype_code, ist.name as subtype_name
-                             FROM tenant_industry_profile tip
-                             LEFT JOIN industry_groups ig ON tip.industry_group_id = ig.id
-                             LEFT JOIN industry_subtypes ist ON tip.industry_subtype_id = ist.id
-                            WHERE tip.tenant_id = %s
-                            ORDER BY tip.is_primary DESC, ig.sort_order, ist.sort_order""", (tenant_id,))
-            return [dict(r) for r in cur.fetchall()]
-    finally: release_conn(conn)
-
-@app.post("/onboarding/industry/{tenant_id}")
-async def add_tenant_industry(tenant_id: int, data: dict):
-    """Add one industry+subtype combo for a tenant. Checkbox ON.
-    Idempotent — calling twice with same values is a no-op."""
-    gid = data.get("industry_group_id")
-    sid = data.get("industry_subtype_id")  # may be None
-    if not gid:
-        raise HTTPException(422, "industry_group_id required")
-    conn = get_db_conn()
-    try:
-        verify_tenant(conn, tenant_id)
-        with conn.cursor() as cur:
-            # Check for duplicate (handle NULL subtype explicitly — NULL != NULL in SQL)
-            if sid is not None:
-                cur.execute(
-                    "SELECT id FROM tenant_industry_profile WHERE tenant_id=%s AND industry_group_id=%s AND industry_subtype_id=%s",
-                    (tenant_id, gid, sid))
-            else:
-                cur.execute(
-                    "SELECT id FROM tenant_industry_profile WHERE tenant_id=%s AND industry_group_id=%s AND industry_subtype_id IS NULL",
-                    (tenant_id, gid))
-            if cur.fetchone():
-                return {"ok": True, "already_exists": True}
-            # First entry for this tenant becomes primary
-            cur.execute("SELECT COUNT(*) FROM tenant_industry_profile WHERE tenant_id=%s", (tenant_id,))
-            count = cur.fetchone()[0]
-            cur.execute("""INSERT INTO tenant_industry_profile
-                (tenant_id, industry_group_id, industry_subtype_id, is_primary)
-                VALUES (%s,%s,%s,%s)""",
-                (tenant_id, gid, sid, count == 0))
-        conn.commit()
-        return {"ok": True}
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
-    finally: release_conn(conn)
-
-@app.delete("/onboarding/industry/{industry_id}")
-async def remove_tenant_industry(industry_id: int, tenant_id: int = Query(...)):
-    """Remove one industry+subtype combo. Checkbox OFF."""
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM tenant_industry_profile WHERE id=%s AND tenant_id=%s RETURNING is_primary",
-                (industry_id, tenant_id))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Industry entry not found")
-            # If primary was removed, promote the next one
-            if row[0]:
-                cur.execute("""UPDATE tenant_industry_profile SET is_primary=true
-                    WHERE tenant_id=%s AND id=(SELECT id FROM tenant_industry_profile
-                        WHERE tenant_id=%s ORDER BY id LIMIT 1)""",
-                    (tenant_id, tenant_id))
-        conn.commit()
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback(); raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
 @app.get("/onboarding/status/{tenant_id}")
@@ -10930,15 +2564,8 @@ async def get_onboarding_status(tenant_id: int):
             profile = cur.fetchone()
             cur.execute("SELECT language_code,language_scope,is_default FROM tenant_languages WHERE tenant_id=%s ORDER BY language_scope,sort_order",(tenant_id,))
             languages = [dict(r) for r in cur.fetchall()]
-            cur.execute("""SELECT tip.id, tip.industry_group_id, tip.industry_subtype_id, tip.is_primary,
-                                  ig.code as group_code, ig.name as group_name,
-                                  ist.code as subtype_code, ist.name as subtype_name
-                             FROM tenant_industry_profile tip
-                             LEFT JOIN industry_groups ig ON tip.industry_group_id = ig.id
-                             LEFT JOIN industry_subtypes ist ON tip.industry_subtype_id = ist.id
-                            WHERE tip.tenant_id = %s
-                            ORDER BY tip.is_primary DESC, tip.id""", (tenant_id,))
-            industries = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT tip.*, ig.code as group_code, ig.name as group_name, ist.code as subtype_code, ist.name as subtype_name FROM tenant_industry_profile tip LEFT JOIN industry_groups ig ON tip.industry_group_id=ig.id LEFT JOIN industry_subtypes ist ON tip.industry_subtype_id=ist.id WHERE tip.tenant_id=%s",(tenant_id,))
+            industry = cur.fetchone()
             cur.execute("SELECT * FROM subscription_limits WHERE tenant_id=%s",(tenant_id,))
             limits = cur.fetchone()
             return {
@@ -10946,9 +2573,9 @@ async def get_onboarding_status(tenant_id: int):
                 "settings": dict(settings) if settings else None,
                 "operating_profile": dict(profile) if profile else None,
                 "languages": languages,
-                "industries": industries,
+                "industry": dict(industry) if industry else None,
                 "subscription_limits": dict(limits) if limits else None,
-                "is_complete": all([settings, profile, languages, bool(industries), limits])
+                "is_complete": all([settings, profile, languages, industry, limits])
             }
     finally: release_conn(conn)
 
@@ -10968,12 +2595,8 @@ async def company_setup(data: dict):
     if customer_language_mode not in VALID_LANGUAGE_MODES: errors.append(f"customer_language_mode must be one of {VALID_LANGUAGE_MODES}")
     default_internal_lang = data.get("default_internal_language_code","en")
     default_customer_lang = data.get("default_customer_language_code","en")
-    # industries: [{industry_group_id, industry_subtype_id}] — first entry is primary
-    # backward compat: accept old single industry_group_id/industry_subtype_id too
-    industries = data.get("industries", [])
-    if not industries and data.get("industry_group_id"):
-        industries = [{"industry_group_id": data["industry_group_id"],
-                       "industry_subtype_id": data.get("industry_subtype_id")}]
+    industry_group_id = data.get("industry_group_id")
+    industry_subtype_id = data.get("industry_subtype_id")
     max_active_users = data.get("max_active_users", WORKSPACE_DEFAULTS.get(workspace_mode,{}).get("max_users",1))
     tenant_id = data.get("tenant_id", 1)
     languages = data.get("languages", [])
@@ -11021,25 +2644,28 @@ async def company_setup(data: dict):
                     internal_language_mode=%s, customer_language_mode=%s,
                     default_internal_language_code=%s, default_customer_language_code=%s,
                     voice_input_strategy=%s, voice_output_strategy=%s,
-                    workspace_mode=%s, max_active_users=%s, updated_at=now()
+                    workspace_mode=%s, max_active_users=%s,
+                    industry_group_id=%s, industry_subtype_id=%s, updated_at=now()
                     WHERE tenant_id=%s""",
                     (internal_language_mode, customer_language_mode,
                      default_internal_lang, default_customer_lang,
                      data.get("voice_input_strategy","auto_detect"),
                      data.get("voice_output_strategy","customer_default"),
-                     workspace_mode, max_active_users, tenant_id))
+                     workspace_mode, max_active_users,
+                     industry_group_id, industry_subtype_id, tenant_id))
             else:
                 cur.execute("""INSERT INTO tenant_operating_profile
                     (tenant_id, internal_language_mode, customer_language_mode,
                      default_internal_language_code, default_customer_language_code,
                      voice_input_strategy, voice_output_strategy,
-                     workspace_mode, max_active_users)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                     workspace_mode, max_active_users, industry_group_id, industry_subtype_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (tenant_id, internal_language_mode, customer_language_mode,
                      default_internal_lang, default_customer_lang,
                      data.get("voice_input_strategy","auto_detect"),
                      data.get("voice_output_strategy","customer_default"),
-                     workspace_mode, max_active_users))
+                     workspace_mode, max_active_users,
+                     industry_group_id, industry_subtype_id))
 
             # 4. TENANT LANGUAGES (replace — delete old, insert new)
             if languages:
@@ -11052,24 +2678,21 @@ async def company_setup(data: dict):
                         (tenant_id, lang_entry.get("code","en"), lang_entry.get("scope","internal"),
                          lang_entry.get("is_default",False), i+1))
 
-            # 5. TENANT INDUSTRY PROFILE (replace all — multi-industry, checkbox style)
-            # Each entry = one group+subtype combo; first entry gets is_primary=true.
-            if industries:
-                cur.execute("DELETE FROM tenant_industry_profile WHERE tenant_id=%s", (tenant_id,))
-                for i, ind in enumerate(industries):
-                    gid = ind.get("industry_group_id")
-                    sid = ind.get("industry_subtype_id")  # may be None if no subtype selected
-                    if not gid:
-                        continue
+            # 5. TENANT INDUSTRY PROFILE (upsert primary)
+            if industry_group_id:
+                cur.execute("SELECT id FROM tenant_industry_profile WHERE tenant_id=%s AND is_primary=true",(tenant_id,))
+                if cur.fetchone():
+                    cur.execute("""UPDATE tenant_industry_profile SET
+                        industry_group_id=%s, industry_subtype_id=%s, updated_at=now()
+                        WHERE tenant_id=%s AND is_primary=true""",
+                        (industry_group_id, industry_subtype_id, tenant_id))
+                else:
                     cur.execute("""INSERT INTO tenant_industry_profile
                         (tenant_id, industry_group_id, industry_subtype_id, is_primary)
-                        VALUES (%s,%s,%s,%s)""",
-                        (tenant_id, gid, sid, i == 0))
+                        VALUES (%s,%s,%s,true)""",
+                        (tenant_id, industry_group_id, industry_subtype_id))
 
-            # 6. SEED BUILT-IN RATE TYPES (only if tenant has none yet)
-            seed_builtin_rates_if_empty(conn, tenant_id)
-
-            # 8. SUBSCRIPTION LIMITS (upsert based on workspace_mode)
+            # 6. SUBSCRIPTION LIMITS (upsert based on workspace_mode)
             ws = WORKSPACE_DEFAULTS.get(workspace_mode, WORKSPACE_DEFAULTS["solo"])
             cur.execute("SELECT id FROM subscription_limits WHERE tenant_id=%s",(tenant_id,))
             if cur.fetchone():
@@ -11083,7 +2706,7 @@ async def company_setup(data: dict):
                     VALUES (%s,%s,%s,%s,%s)""",
                     (tenant_id, max_active_users, ws["max_clients"], ws["max_jobs"], ws["max_voice"]))
 
-            # 9. AUDIT LOG
+            # 7. AUDIT LOG
             audit_config_change(conn, tenant_id, "onboarding_setup",
                 f"Company: {company_name}, mode: {workspace_mode}, legal: {legal_type}, "
                 f"int_lang: {internal_language_mode}/{default_internal_lang}, "
@@ -11097,308 +2720,341 @@ async def company_setup(data: dict):
         raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
-@app.post("/session/summarize")
-async def summarize_session(request: Request):
-    """Summarize a completed dialog session and store as long-term memory."""
-    try:
-        body = await request.json()
-        history = body.get("history", [])          # [{role, content}, ...]
-        user_id = body.get("user_id")
-        tenant_id = body.get("tenant_id", 1)
-        internal_language = body.get("internal_language", "cs")
-
-        if not history or len(history) < 2:
-            return {"stored": False, "reason": "too_short"}
-
-        if not ai_client:
-            return {"stored": False, "reason": "no_ai"}
-
-        # Build readable transcript
-        transcript = "\n".join(
-            f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
-            for m in history
-            if m.get('content', '').strip()
-        )
-
-        # Ask GPT to summarize
-        lang_label = {"cs": "Czech", "en": "English", "pl": "Polish"}.get(internal_language[:2], "English")
-        summary_resp = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        f"Summarize the following voice assistant conversation in {lang_label}. "
-                        f"Focus on: what was decided, what was created/edited, important names/dates/numbers, "
-                        f"and any open tasks or follow-ups. Be concise (3-6 sentences max). "
-                        f"Start with the date/time if mentioned."
-                    )
-                },
-                {"role": "user", "content": transcript}
-            ],
-            max_tokens=300
-        )
-        summary = (summary_resp.choices[0].message.content or "").strip()
-        if not summary:
-            return {"stored": False, "reason": "empty_summary"}
-
-        # Store as session memory (type='session')
-        conn = get_db_conn()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                """INSERT INTO crm.assistant_memory
-                   (tenant_id, user_id, memory_type, content, source, is_active)
-                   VALUES (%s, %s, 'session', %s, 'voice_dialog', TRUE)""",
-                (tenant_id, user_id, summary)
-            )
-            # Keep only last 10 session memories per user to avoid bloat
-            cur.execute(
-                """DELETE FROM crm.assistant_memory
-                   WHERE tenant_id = %s AND user_id IS NOT DISTINCT FROM %s
-                     AND memory_type = 'session'
-                     AND id NOT IN (
-                         SELECT id FROM crm.assistant_memory
-                         WHERE tenant_id = %s AND user_id IS NOT DISTINCT FROM %s
-                           AND memory_type = 'session'
-                         ORDER BY created_at DESC LIMIT 10
-                     )""",
-                (tenant_id, user_id, tenant_id, user_id)
-            )
-            conn.commit()
-            return {"stored": True, "summary": summary}
-        except Exception as e:
-            conn.rollback()
-            return {"stored": False, "error": str(e)}
-        finally:
-            release_conn(conn)
-    except Exception as e:
-        return {"stored": False, "error": str(e)}
-
-@app.post("/translate")
-async def translate_message(request: Request):
-    """Translate a customer-facing message to the configured customer language."""
-    try:
-        body = await request.json()
-        text = (body.get("text") or "").strip()
-        target_language = (body.get("target_language") or "en").strip()
-        if not text:
-            return {"translated": "", "target_language": target_language}
-        translated = translate_customer_message(text, target_language)
-        return {"translated": translated, "target_language": target_language}
-    except Exception as e:
-        return {"translated": body.get("text", "") if "body" in dir() else "", "error": str(e)}
-
 @app.get("/health")
 async def health():
     try:
         conn = get_db_conn(); release_conn(conn)
-        return {"status":"ok","version":"1.3","ai":bool(OPENAI_API_KEY)}
+        return {"status":"ok","version":"1.2a","ai":bool(OPENAI_API_KEY)}
     except: return {"status":"error"}
 
-@app.get("/admin/db-diag")
-async def db_diag(key: str = Query(default="")):
-    """Diagnostic: returns DB state for debugging repair issues."""
-    if key != "diag2024":
-        raise HTTPException(403, "forbidden")
+class BootstrapFirstAdminRequest(BaseModel):
+    company_name: str
+    admin_email: str
+    admin_password: str
+    admin_display_name: str
+    admin_first_name: Optional[str] = None
+    admin_last_name: Optional[str] = None
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    legal_type: Optional[str] = None
+    country: Optional[str] = None
+    timezone: Optional[str] = None
+    currency: Optional[str] = None
+    industry_group_id: Optional[int] = None
+    industry_subtype_id: Optional[int] = None
+    default_internal_language_code: Optional[str] = None
+    default_customer_language_code: Optional[str] = None
+    workspace_mode: Optional[str] = None
+
+
+def _safe_slug(value: str) -> str:
+    chars = []
+    previous_dash = False
+    for ch in (value or "").lower():
+        if ch.isalnum():
+            chars.append(ch)
+            previous_dash = False
+        elif not previous_dash:
+            chars.append("-")
+            previous_dash = True
+    slug = "".join(chars).strip("-")
+    return slug[:60] or f"tenant-{uuid.uuid4().hex[:8]}"
+
+
+def _table_exists(cur, table_name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s) AS table_name", (f"crm.{table_name}",))
+    row = cur.fetchone()
+    if row and row.get("table_name"):
+        return True
+    cur.execute("SELECT to_regclass(%s) AS table_name", (table_name,))
+    row = cur.fetchone()
+    return bool(row and row.get("table_name"))
+
+
+def _table_columns(cur, table_name: str) -> dict:
+    cur.execute("""SELECT column_name, column_default
+        FROM information_schema.columns
+        WHERE table_schema IN ('crm','public') AND table_name=%s
+        ORDER BY CASE WHEN table_schema='crm' THEN 0 ELSE 1 END, ordinal_position""", (table_name,))
+    return {row["column_name"]: row.get("column_default") for row in cur.fetchall()}
+
+
+def _next_id_value(cur, table_name: str) -> int:
+    cur.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table_name}")
+    return int(cur.fetchone()["next_id"])
+
+
+def _insert_dynamic(cur, table_name: str, values: dict, columns: dict, returning: str = "id"):
+    insert_values = {k: v for k, v in values.items() if k in columns}
+    if "id" in columns and not columns.get("id") and "id" not in insert_values:
+        insert_values["id"] = _next_id_value(cur, table_name)
+    names = list(insert_values.keys())
+    placeholders = ["%s"] * len(names)
+    sql = f"INSERT INTO {table_name} ({','.join(names)}) VALUES ({','.join(placeholders)})"
+    if returning in columns:
+        sql += f" RETURNING {returning}"
+    cur.execute(sql, [insert_values[name] for name in names])
+    if returning in columns:
+        return cur.fetchone()[returning]
+    return None
+
+
+def _upsert_dynamic_by_tenant(cur, table_name: str, values: dict):
+    if not _table_exists(cur, table_name):
+        return
+    columns = _table_columns(cur, table_name)
+    if "tenant_id" not in columns:
+        return
+    safe_values = {k: v for k, v in values.items() if k in columns}
+    if not safe_values:
+        return
+    cur.execute(f"SELECT id FROM {table_name} WHERE tenant_id=%s LIMIT 1", (values["tenant_id"],))
+    existing = cur.fetchone()
+    if existing:
+        updates = [k for k in safe_values.keys() if k != "tenant_id"]
+        if updates:
+            if "updated_at" in columns and "updated_at" not in updates:
+                set_sql = ",".join([f"{k}=%s" for k in updates] + ["updated_at=now()"])
+                params = [safe_values[k] for k in updates]
+            else:
+                set_sql = ",".join([f"{k}=%s" for k in updates])
+                params = [safe_values[k] for k in updates]
+            params.append(values["tenant_id"])
+            cur.execute(f"UPDATE {table_name} SET {set_sql} WHERE tenant_id=%s", params)
+    else:
+        _insert_dynamic(cur, table_name, safe_values, columns, returning="id")
+
+
+@app.get("/bootstrap/status")
+async def bootstrap_status():
     conn = None
-    try:
-        conn = get_db_conn()
-        result = {}
-        with conn.cursor() as cur:
-            # migration_log
-            cur.execute("SELECT filename, applied_at FROM migration_log ORDER BY id DESC LIMIT 10")
-            result["migration_log_recent"] = [{"f": r["filename"], "at": str(r["applied_at"])} for r in cur.fetchall()]
-            # industry_groups
-            cur.execute("SELECT id, code, name, sort_order, is_active FROM industry_groups ORDER BY id")
-            result["industry_groups"] = [dict(r) for r in cur.fetchall()]
-            # industry_subtypes count per group
-            cur.execute("SELECT g.code, COUNT(s.id) as sub_count FROM industry_groups g LEFT JOIN industry_subtypes s ON s.industry_group_id=g.id GROUP BY g.id, g.code ORDER BY g.id")
-            result["subtypes_per_group"] = [dict(r) for r in cur.fetchall()]
-            # indexes on industry_groups
-            cur.execute("SELECT indexname, indexdef FROM pg_indexes WHERE tablename='industry_groups' AND schemaname='crm'")
-            result["industry_groups_indexes"] = [dict(r) for r in cur.fetchall()]
-            # indexes on industry_subtypes
-            cur.execute("SELECT indexname, indexdef FROM pg_indexes WHERE tablename='industry_subtypes' AND schemaname='crm'")
-            result["industry_subtypes_indexes"] = [dict(r) for r in cur.fetchall()]
-            # tenant_languages
-            cur.execute("SELECT language_code, language_scope FROM tenant_languages WHERE tenant_id=1 ORDER BY language_scope, language_code")
-            result["tenant_languages"] = [dict(r) for r in cur.fetchall()]
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-    finally:
-        if conn:
-            release_conn(conn)
-
-@app.post("/admin/force-repair")
-async def force_repair(key: str = Query(default="")):
-    """Force all DB repairs: unique indexes, group names, language codes."""
-    if key != "repair2024": raise HTTPException(403, "forbidden")
-    res = {}
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT code, name FROM industry_groups ORDER BY id")
-            res["before_groups"] = {x["code"]: x["name"] for x in cur.fetchall()}
-            cur.execute("SELECT indexname FROM pg_indexes WHERE tablename='industry_groups' AND schemaname='crm'")
-            res["idx_before"] = [x["indexname"] for x in cur.fetchall()]
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT code, COUNT(*) FROM industry_groups GROUP BY code HAVING COUNT(*)>1")
-                dg = cur.fetchall()
-                if dg: cur.execute("DELETE FROM industry_groups WHERE id NOT IN (SELECT MIN(id) FROM industry_groups GROUP BY code)")
-                cur.execute("SELECT industry_group_id,code,COUNT(*) FROM industry_subtypes GROUP BY industry_group_id,code HAVING COUNT(*)>1")
-                ds = cur.fetchall()
-                if ds: cur.execute("DELETE FROM industry_subtypes WHERE id NOT IN (SELECT MIN(id) FROM industry_subtypes GROUP BY industry_group_id,code)")
-            conn.commit(); res["dedup"] = f"ok grp={len(dg)} sub={len(ds)}"
-        except Exception as e:
-            conn.rollback(); res["dedup"] = f"FAIL:{e}"
-        try:
-            with conn.cursor() as cur:
-                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_groups_code ON industry_groups (code)")
-                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_industry_subtypes_group_code ON industry_subtypes (industry_group_id, code)")
-            conn.commit(); res["indexes"] = "ok"
-        except Exception as e:
-            conn.rollback(); res["indexes"] = f"FAIL:{e}"
-        try:
-            n = 0
-            with conn.cursor() as cur:
-                for code, name, so in [
-                    ("trades","Trades and field services",10),("construction","Construction and building",20),
-                    ("property","Property management",30),("real_estate","Real estate and lettings",40),
-                    ("cleaning","Cleaning services",50),("automotive","Automotive services",60),
-                    ("logistics","Logistics and transport",70),("beauty","Beauty and personal care",80),
-                    ("healthcare","Healthcare and wellbeing",90),("fitness","Fitness and coaching",100),
-                    ("hospitality","Hospitality and food service",110),("events","Events and entertainment",120),
-                    ("education","Education and training",130),("it_tech","IT and technology",140),
-                    ("retail","Retail and e-commerce",150),("security","Security services",160),
-                    ("agriculture","Agriculture and farming",170),("other","Other / General business",999),
-                ]:
-                    cur.execute("UPDATE industry_groups SET name=%s, sort_order=%s, is_active=true WHERE code=%s", (name, so, code))
-                    n += cur.rowcount
-                cur.execute("UPDATE industry_groups SET is_active=false WHERE code IN ('landscaping','it_services')")
-            conn.commit(); res["group_names"] = f"ok rows={n}"
-        except Exception as e:
-            conn.rollback(); res["group_names"] = f"FAIL:{e}"
-        try:
-            n = 0
-            with conn.cursor() as cur:
-                for old_c, new_c in [("cs","cs-CZ"),("cs_CZ","cs-CZ"),("en","en-GB"),("en_GB","en-GB"),
-                        ("pl","pl-PL"),("pl_PL","pl-PL"),("de","de-DE"),("sk","sk-SK"),("hu","hu-HU")]:
-                    cur.execute("UPDATE tenant_languages SET language_code=%s WHERE language_code=%s", (new_c, old_c))
-                    n += cur.rowcount
-            conn.commit(); res["languages"] = f"ok rows={n}"
-        except Exception as e:
-            conn.rollback(); res["languages"] = f"FAIL:{e}"
-        with conn.cursor() as cur:
-            cur.execute("SELECT code, name, is_active FROM industry_groups ORDER BY sort_order, id")
-            res["after_groups"] = [dict(x) for x in cur.fetchall()]
-            cur.execute("SELECT indexname FROM pg_indexes WHERE tablename='industry_groups' AND schemaname='crm'")
-            res["idx_after"] = [x["indexname"] for x in cur.fetchall()]
-            cur.execute("SELECT language_code, language_scope FROM tenant_languages WHERE tenant_id=1 ORDER BY language_scope")
-            res["langs_final"] = [dict(x) for x in cur.fetchall()]
-        return res
-    except Exception as e: return {"error": str(e)}
-    finally: release_conn(conn)
-
-
-@app.get("/version")
-async def get_version():
-    conn = None
+    details = {"migration_log_readable": False}
+    admin_exists = False
+    tenant_exists = False
+    latest_migration = None
     try:
         conn = get_db_conn()
         with conn.cursor() as cur:
-            cur.execute("SELECT filename, applied_at FROM migration_log ORDER BY id DESC LIMIT 1")
-            m = cur.fetchone()
-        return {
-            "server_version": "1.4",
-            "latest_migration": m["filename"] if m else None,
-            "applied_at": m["applied_at"].isoformat() if m and m["applied_at"] else None
-        }
-    except Exception as e:
-        return {"server_version": "1.4", "error": str(e)}
-    finally:
-        if conn:
-            release_conn(conn)
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM users u
+                LEFT JOIN roles r ON u.role_id = r.id
+                WHERE u.deleted_at IS NULL
+                  AND COALESCE(u.status, 'active') = 'active'
+                  AND r.role_name = 'admin'
+            ) AS exists""")
+            admin_exists = bool(cur.fetchone()["exists"])
 
-@app.get("/tenant/profile")
-async def get_tenant_profile(tenant_id: int = Query(default=1)):
-    conn = None
-    try:
-        conn = get_db_conn()
-        with conn.cursor() as cur:
-            result = {"found": False, "tenant_id": tenant_id}
-            cur.execute("SELECT name, slug FROM tenants WHERE id=%s", (tenant_id,))
-            t = cur.fetchone()
-            if t:
-                result["tenant_name"] = t["name"]
-                result["tenant_slug"] = t["slug"]
-            cur.execute("SELECT workspace_mode, internal_language_mode, customer_language_mode, default_internal_language_code, default_customer_language_code, voice_input_strategy, voice_output_strategy, max_active_users FROM tenant_operating_profile WHERE tenant_id=%s", (tenant_id,))
-            op = cur.fetchone()
-            if op:
-                result["found"] = True
-                result["workspace_mode"] = op["workspace_mode"]
-                result["internal_language_mode"] = op["internal_language_mode"]
-                result["customer_language_mode"] = op["customer_language_mode"]
-                result["default_internal_lang"] = op["default_internal_language_code"]
-                result["default_customer_lang"] = op["default_customer_language_code"]
-                result["voice_input_strategy"] = op["voice_input_strategy"]
-                result["voice_output_strategy"] = op["voice_output_strategy"]
-                result["max_active_users"] = op["max_active_users"]
-            cur.execute("SELECT max_users, max_clients, max_jobs_per_month, max_voice_minutes FROM subscription_limits WHERE tenant_id=%s", (tenant_id,))
-            sl = cur.fetchone()
-            if sl:
-                result["limits"] = {
-                    "max_users": sl["max_users"],
-                    "max_clients": sl["max_clients"],
-                    "max_jobs_per_month": sl["max_jobs_per_month"],
-                    "max_voice_minutes": sl["max_voice_minutes"]
-                }
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM tenants
+                WHERE COALESCE(status, 'active') = 'active'
+            ) AS exists""")
+            tenant_exists = bool(cur.fetchone()["exists"])
+
             try:
-                cur.execute("SELECT company_name, contact_name, phone, default_location, industry_description, currency FROM crm.tenant_settings WHERE tenant_id=%s LIMIT 1", (tenant_id,))
-                ts = cur.fetchone()
-                if ts:
-                    result["company_name"] = ts["company_name"]
-                    result["contact_name"] = ts["contact_name"]
-                    result["phone"] = ts["phone"]
-                    result["currency"] = ts["currency"]
-                    result["location"] = ts["default_location"]
-                    result["industry"] = ts["industry_description"]
+                cur.execute("SELECT to_regclass('crm.migration_log') AS table_name")
+                migration_table = cur.fetchone()["table_name"]
+                if migration_table:
+                    cur.execute("SELECT filename FROM migration_log ORDER BY applied_at DESC NULLS LAST, id DESC LIMIT 1")
+                    row = cur.fetchone()
+                    latest_migration = row["filename"] if row else None
+                    details["migration_log_readable"] = True
+                else:
+                    details["migration_log_message"] = "migration_log table not found"
             except Exception:
-                pass
-        return result
+                details["migration_log_message"] = "migration_log could not be read"
+
+        system_configured = admin_exists and tenant_exists
+        details["admin_check"] = "ok"
+        details["tenant_check"] = "ok"
+        return {
+            "system_configured": system_configured,
+            "admin_exists": admin_exists,
+            "tenant_exists": tenant_exists,
+            "onboarding_required": not system_configured,
+            "server_version": "1.2a",
+            "database_available": True,
+            "latest_migration": latest_migration,
+            "details": details,
+        }
     except Exception as e:
-        return {"found": False, "error": str(e)}
+        details["database_message"] = "database unavailable or bootstrap status checks failed"
+        details["error_type"] = type(e).__name__
+        return {
+            "system_configured": False,
+            "admin_exists": False,
+            "tenant_exists": False,
+            "onboarding_required": True,
+            "server_version": "1.2a",
+            "database_available": False,
+            "latest_migration": None,
+            "details": details,
+        }
     finally:
         if conn:
             release_conn(conn)
 
-@app.get("/tenant/languages")
-async def get_tenant_languages(tenant_id: int = Query(default=1)):
+
+@app.post("/bootstrap/first-admin")
+async def bootstrap_first_admin(data: BootstrapFirstAdminRequest):
+    company_name = data.company_name.strip()
+    admin_email = data.admin_email.strip().lower()
+    admin_password = data.admin_password
+    admin_display_name = data.admin_display_name.strip()
+    if not company_name:
+        raise HTTPException(422, "company_name is required")
+    if "@" not in admin_email:
+        raise HTTPException(422, "admin_email must be valid")
+    if len(admin_password) < 8:
+        raise HTTPException(422, "admin_password must be at least 8 characters")
+    if not admin_display_name:
+        raise HTTPException(422, "admin_display_name is required")
+
     conn = None
     try:
         conn = get_db_conn()
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT language_code, language_scope, is_default FROM tenant_languages WHERE tenant_id=%s AND is_active=true ORDER BY language_scope, sort_order",
-                (tenant_id,)
-            )
-            rows = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT pg_advisory_xact_lock(912202601)")
+            cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM users u
+                JOIN roles r ON u.role_id = r.id
+                WHERE u.deleted_at IS NULL
+                  AND COALESCE(u.status, 'active') IN ('active', 'setup')
+                  AND r.role_name = 'admin'
+            ) AS exists""")
+            if bool(cur.fetchone()["exists"]):
+                conn.rollback()
+                raise HTTPException(409, "First admin already exists")
+
+            cur.execute("SELECT id FROM users WHERE LOWER(email)=%s AND deleted_at IS NULL LIMIT 1", (admin_email,))
+            if cur.fetchone():
+                conn.rollback()
+                raise HTTPException(409, "Email already registered")
+
+            tenant_columns = _table_columns(cur, "tenants")
+            cur.execute("""SELECT id FROM tenants
+                WHERE COALESCE(status, 'active') = 'active'
+                ORDER BY id LIMIT 1""")
+            tenant = cur.fetchone()
+            if tenant:
+                tenant_id = tenant["id"]
+            else:
+                slug = _safe_slug(company_name)
+                cur.execute("SELECT id FROM tenants WHERE slug=%s LIMIT 1", (slug,))
+                if cur.fetchone():
+                    slug = f"{slug[:52]}-{uuid.uuid4().hex[:6]}"
+                tenant_values = {
+                    "name": company_name,
+                    "slug": slug,
+                    "status": "active",
+                    "legal_type": data.legal_type,
+                    "phone": data.phone,
+                    "email": admin_email,
+                    "website": data.website,
+                    "country_code": data.country or "GB",
+                    "timezone": data.timezone or "Europe/London",
+                    "currency": data.currency or "GBP",
+                }
+                tenant_id = _insert_dynamic(cur, "tenants", tenant_values, tenant_columns, returning="id")
+
+            cur.execute("SELECT id FROM roles WHERE role_name='admin' LIMIT 1")
+            role = cur.fetchone()
+            if role:
+                role_id = role["id"]
+            else:
+                role_columns = _table_columns(cur, "roles")
+                _insert_dynamic(cur, "roles", {"role_name": "admin", "description": "Full access"}, role_columns, returning="id")
+                cur.execute("SELECT id FROM roles WHERE role_name='admin' LIMIT 1")
+                role = cur.fetchone()
+                if not role:
+                    raise HTTPException(500, "Admin role could not be created")
+                role_id = role["id"]
+
+            first_name = (data.admin_first_name or admin_display_name.split(" ", 1)[0]).strip()
+            last_name = (data.admin_last_name or (admin_display_name.split(" ", 1)[1] if " " in admin_display_name else "")).strip()
+            user_columns = _table_columns(cur, "users")
+            user_values = {
+                "tenant_id": tenant_id,
+                "role_id": role_id,
+                "first_name": first_name,
+                "last_name": last_name,
+                "display_name": admin_display_name,
+                "email": admin_email,
+                "phone": data.phone,
+                "password_hash": hash_password(admin_password),
+                "status": "active",
+                "is_owner": True,
+                "preferred_language_code": data.default_internal_language_code or "en",
+            }
+            admin_user_id = _insert_dynamic(cur, "users", user_values, user_columns, returning="id")
+
+            settings_values = {
+                "tenant_id": tenant_id,
+                "company_name": company_name,
+                "phone": data.phone,
+                "website": data.website,
+                "legal_type": data.legal_type,
+                "default_location": data.country,
+                "country": data.country,
+                "country_code": data.country,
+                "currency": data.currency or "GBP",
+            }
+            _upsert_dynamic_by_tenant(cur, "tenant_settings", settings_values)
+
+            workspace_mode = data.workspace_mode or "solo"
+            internal_lang = data.default_internal_language_code or "en"
+            customer_lang = data.default_customer_language_code or "en"
+            profile_values = {
+                "tenant_id": tenant_id,
+                "workspace_mode": workspace_mode,
+                "default_internal_language_code": internal_lang,
+                "default_customer_language_code": customer_lang,
+                "internal_language_mode": "single",
+                "customer_language_mode": "single",
+                "industry_group_id": data.industry_group_id,
+                "industry_subtype_id": data.industry_subtype_id,
+            }
+            _upsert_dynamic_by_tenant(cur, "tenant_operating_profile", profile_values)
+
+            if _table_exists(cur, "tenant_languages"):
+                language_columns = _table_columns(cur, "tenant_languages")
+                for index, (language_code, scope) in enumerate(((internal_lang, "internal"), (customer_lang, "customer")), start=1):
+                    cur.execute("""SELECT id FROM tenant_languages
+                        WHERE tenant_id=%s AND language_code=%s AND language_scope=%s LIMIT 1""",
+                        (tenant_id, language_code, scope))
+                    if not cur.fetchone():
+                        _insert_dynamic(cur, "tenant_languages", {
+                            "tenant_id": tenant_id,
+                            "language_code": language_code,
+                            "language_scope": scope,
+                            "is_default": True,
+                            "is_active": True,
+                            "sort_order": index,
+                        }, language_columns, returning="id")
+
+            conn.commit()
         return {
-            "found": len(rows) > 0,
-            "languages": [{"code": r["language_code"], "scope": r["language_scope"], "is_default": r["is_default"]} for r in rows],
-            "internal_langs": [r["language_code"] for r in rows if r["language_scope"] == "internal"],
-            "customer_langs": [r["language_code"] for r in rows if r["language_scope"] == "customer"]
+            "success": True,
+            "system_configured": True,
+            "tenant_id": tenant_id,
+            "admin_user_id": admin_user_id,
+            "admin_email": admin_email,
+            "onboarding_required": False,
         }
-    except Exception as e:
-        return {"found": False, "languages": [], "error": str(e)}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise HTTPException(500, "First admin bootstrap failed")
     finally:
         if conn:
             release_conn(conn)
 
 @app.get("/debug/test-ai")
-async def test_ai():
+async def test_ai(request: Request):
+    require_debug_admin(request)
     if not ai_client: return {"status":"error","message":"OPENAI_API_KEY not set"}
     try:
         r = ai_client.chat.completions.create(model="gpt-4o",messages=[{"role":"user","content":"Rekni ahoj"}],max_tokens=20)
@@ -11406,7 +3062,8 @@ async def test_ai():
     except Exception as e: return {"status":"error","message":str(e)}
 
 @app.get("/debug/schema-audit")
-async def schema_audit():
+async def schema_audit(request: Request):
+    require_debug_admin(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -11432,18 +3089,6 @@ async def schema_audit():
     finally: release_conn(conn)
 
 # ========== PRICING ENGINE ==========
-def map_pricing_rule_to_service_rate(rule_type, rule_key=None):
-    if rule_type == "waste_rate":
-        return "garden_waste_bulkbag"
-    if rule_type != "task_rate":
-        return None
-    low = str(rule_key or "").strip().lower().replace(" ", "_")
-    if low in ("pruning", "hedge", "hedge_trimming", "trim", "trimming"):
-        return "hedge_trimming"
-    if low in ("arborist", "arborist_works", "tree", "tree_surgeon", "tree-surgeon", "tree_surgery"):
-        return "arborist_works"
-    return "garden_maintenance"
-
 def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_id=None):
     """Priority: job → client → system default"""
     with conn.cursor() as cur:
@@ -11461,36 +3106,27 @@ def resolve_rate(conn, tenant_id, rule_type, rule_key=None, job_id=None, client_
             (tenant_id,rule_type,rule_key))
         r = cur.fetchone()
         if r: return float(r['rate'])
-    mapped_service_rate = map_pricing_rule_to_service_rate(rule_type, rule_key)
-    if mapped_service_rate:
-        rate = get_effective_rate(conn, tenant_id, client_id=client_id, rate_type=mapped_service_rate)
-        if rate > 0:
-            return rate
     defaults = {"worker_rate":35.0,"task_rate":35.0,"waste_rate":80.0,"material_price":0.0}
     return defaults.get(rule_type, 0.0)
 
 # ========== DIALOG STATE MACHINE ==========
-DIALOG_STEPS = ["client","client_create_name","date","workers","total_hours","entries","validate_hours","waste","materials","notes","summary","confirm"]
+DIALOG_STEPS = ["client","workers","total_hours","entries","validate_hours","waste","materials","notes","summary","confirm"]
 VALID_TRANSITIONS = {
-    "client": ["client","client_create_name","date"],
-    "client_create_name": ["client_create_name","client","date"],
-    "date": ["date","workers"],
-    "workers": ["workers","date","total_hours"],
+    "client": ["client","workers"],
+    "workers": ["workers","total_hours"],
     "total_hours": ["total_hours","entries"],
     "entries": ["entries","validate_hours","waste"],
     "validate_hours": ["validate_hours","waste","entries"],
     "materials": ["materials","notes"],
     "waste": ["waste","materials"],
     "notes": ["notes","summary"],
-    "summary": ["summary","confirm","date","client","workers","total_hours","entries","materials","waste","notes"],
+    "summary": ["summary","confirm","client","workers","total_hours","entries","materials","waste","notes"],
     "confirm": ["confirm"],
 }
 def validate_transition(current_step, next_step):
     return next_step in VALID_TRANSITIONS.get(current_step, [])
 DIALOG_PROMPTS = {
-    "client": {"en":"Which client did you work for? You can also say 'new client'.","cs":"U kterého klienta jsi pracoval? Můžeš také říct 'nový klient'.","pl":"U którego klienta pracowałeś? Możesz też powiedzieć 'nowy klient'."},
-    "client_create_name": {"en":"What is the new client name?","cs":"Jak se jmenuje nový klient?","pl":"Jak nazywa się nowy klient?"},
-    "date": {"en":"Which date is this work report for? Say a date like 2026-04-18 or 18.04.2026.","cs":"Na jaké datum je tento výkaz práce? Řekni datum například 2026-04-18 nebo 18.04.2026.","pl":"Na jaką datę jest ten raport pracy? Powiedz datę na przykład 2026-04-18 albo 18.04.2026."},
+    "client": {"en":"Which client did you work for?","cs":"U kterého klienta jsi pracoval?","pl":"U którego klienta pracowałeś?"},
     "workers": {"en":"Who worked? (names)","cs":"Kdo pracoval? (jména)","pl":"Kto pracował? (imiona)"},
     "total_hours": {"en":"How many hours total?","cs":"Kolik hodin celkem?","pl":"Ile godzin łącznie?"},
     "entries": {"en":"How many hours pruning?","cs":"Kolik hodin prořez?","pl":"Ile godzin przycinanie?"},
@@ -11498,644 +3134,11 @@ DIALOG_PROMPTS = {
     "materials": {"en":"Any materials used? (name, quantity, price) or 'no'","cs":"Použili jste materiál? (název, množství, cena) nebo 'ne'","pl":"Czy użyto materiałów? (nazwa, ilość, cena) lub 'nie'"},
     "waste": {"en":"How many bulk bags of waste? (number or 'none')","cs":"Kolik pytlů odpadu? (číslo nebo 'žádný')","pl":"Ile worków odpadów? (liczba lub 'żaden')"},
     "notes": {"en":"Any notes? (or 'no')","cs":"Chceš přidat poznámku? (nebo 'ne')","pl":"Chcesz dodać notatkę? (lub 'nie')"},
-    "summary": {"en":"Here is the day summary. Say 'another day' to add more dates, 'confirm' to save all reports, or 'edit [field]' to change.","cs":"Tady je shrnutí dne. Řekni 'další den' pro přidání dalšího data, 'potvrdit' pro uložení všech reportů nebo 'oprav [pole]' pro změnu.","pl":"Oto podsumowanie dnia. Powiedz 'kolejny dzień', aby dodać następną datę, 'potwierdź', aby zapisać wszystkie raporty, albo 'popraw [pole]', aby coś zmienić."},
-    "confirm": {"en":"Work reports saved.","cs":"Reporty uloženy.","pl":"Raporty zapisane."},
+    "summary": {"en":"Here is the summary. Say 'confirm' to save or 'edit [field]' to change.","cs":"Tady je shrnutí. Řekni 'potvrdit' pro uložení nebo 'oprav [pole]' pro změnu.","pl":"Oto podsumowanie. Powiedz 'potwierdź' aby zapisać lub 'popraw [pole]' aby zmienić."},
+    "confirm": {"en":"Work report saved.","cs":"Report uložen.","pl":"Raport zapisany."},
 }
 def get_prompt(step, lang="en"):
     return DIALOG_PROMPTS.get(step,{}).get(lang, DIALOG_PROMPTS.get(step,{}).get("en",""))
-
-def parse_new_client_command(text: str) -> tuple[bool, Optional[str]]:
-    raw = (text or "").strip()
-    low = raw.lower()
-    prefixes = [
-        "new client", "create client", "add client",
-        "novy klient", "nový klient", "vytvor klienta", "vytvoř klienta", "pridat klienta", "přidat klienta",
-        "nowy klient", "utworz klienta", "utwórz klienta", "dodaj klienta",
-    ]
-    for prefix in prefixes:
-        if low == prefix:
-            return True, None
-        if low.startswith(prefix + " "):
-            remainder = raw[len(prefix):].strip(" :-,")
-            for leading in ("named ", "called ", "jmenem ", "s nazvem ", "s názvem ", "o nazwie "):
-                if remainder.lower().startswith(leading):
-                    remainder = remainder[len(leading):].strip()
-                    break
-            return True, remainder or None
-    return False, None
-
-def create_voice_work_report_client(conn, tenant_id: int, actor_user_id: int, client_name: str, lang: str) -> dict:
-    name = clean_contact_display_name(client_name)
-    if not name:
-        raise HTTPException(422, "Client name is required")
-    owner = validate_active_user(conn, tenant_id, actor_user_id, "client owner")
-    actor_name = get_user_display_name(conn, tenant_id, actor_user_id) or owner["display_name"] or "system"
-    code = f"CL-{uuid.uuid4().hex[:6].upper()}"
-    planning_dt = next_business_day_at_nine()
-    planning_note = tr_lang(
-        lang,
-        "System placeholder task created from voice work report. Review and replace with the real next action.",
-        "Systémový placeholder úkol vytvořený z hlasového výkazu práce. Zkontroluj ho a nahraď skutečným dalším krokem.",
-        "Systemowe zadanie zastępcze utworzone z głosowego raportu pracy. Sprawdź je i zastąp właściwym kolejnym krokiem."
-    )
-    action_title = tr_lang(lang, "Fill in next action", "Doplnit další krok", "Uzupełnić kolejny krok")
-    with conn.cursor() as cur:
-        cur.execute("""INSERT INTO clients
-            (client_code, display_name, status, tenant_id, owner_user_id, hierarchy_status)
-            VALUES (%s,%s,'active',%s,%s,'pending')
-            RETURNING id, display_name""",
-            (code, name, tenant_id, int(owner["id"])))
-        client = cur.fetchone()
-    next_action = create_workflow_task(
-        conn,
-        tenant_id,
-        {
-            "title": action_title,
-            "assigned_user_id": int(owner["id"]),
-            "assigned_to": owner["display_name"],
-            "planned_start_at": format_planning_datetime(planning_dt),
-            "deadline": planning_dt.strftime("%Y-%m-%d"),
-            "priority": "vysoka",
-            "planning_note": planning_note,
-            "client_id": int(client["id"]),
-            "client_name": client["display_name"],
-        },
-        actor_name=actor_name,
-        default_client_id=int(client["id"]),
-        default_client_name=client["display_name"],
-        source="voice_client_create",
-    )
-    set_client_next_action(conn, tenant_id, int(client["id"]), str(next_action["id"]))
-    validation = validate_client_hierarchy(conn, tenant_id, int(client["id"]))
-    if not validation["valid"]:
-        raise HTTPException(422, f"Client hierarchy invalid: {', '.join(validation['issues'])}")
-    log_activity(
-        conn,
-        "client",
-        int(client["id"]),
-        "create",
-        f"Voice-created client {client['display_name']}",
-        tenant_id=tenant_id,
-        user_id=actor_user_id,
-        source_channel="voice",
-        details={"next_action_task_id": str(next_action["id"])},
-    )
-    return {"id": int(client["id"]), "display_name": client["display_name"], "next_action_task_id": str(next_action["id"])}
-
-WORK_REPORT_DAY_FIELDS = [
-    "work_date", "workers", "total_hours", "entries", "materials", "waste", "notes",
-    "grand_total", "_entry_sub", "_entry_type_name"
-]
-
-def parse_voice_work_date(text: str) -> Optional[str]:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    try:
-        now = datetime.now(ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/London")))
-    except Exception:
-        now = datetime.now()
-    low = raw.lower().strip()
-    normalized_words = unicodedata.normalize("NFKD", low).encode("ascii", "ignore").decode("ascii")
-    normalized_words = "".join(ch if ch.isalnum() else " " for ch in normalized_words)
-    tokens = set(normalized_words.split())
-    if low in {"today", "dnes", "dneska", "dzisiaj"} or tokens.intersection({"today", "dnes", "dneska", "dzisiaj"}):
-        return now.strftime("%Y-%m-%d")
-    if low in {"yesterday", "vcera", "včera", "wczoraj"} or tokens.intersection({"yesterday", "vcera", "wczoraj"}):
-        return (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    if low in {"tomorrow", "zitra", "zítra", "jutro"} or tokens.intersection({"tomorrow", "zitra", "jutro"}):
-        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
-    cleaned = raw.replace(" ", "")
-    formats = ["%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"]
-    for fmt in formats:
-        try:
-            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    for fmt in ("%d.%m.", "%d/%m", "%d-%m"):
-        try:
-            parsed = datetime.strptime(cleaned, fmt)
-            parsed = parsed.replace(year=now.year)
-            return parsed.strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    return None
-
-VOICE_NUMBER_WORDS = {
-    # Czech, normalized without diacritics.
-    "nula": 0, "jeden": 1, "jedna": 1, "jedno": 1, "prvni": 1,
-    "dva": 2, "dve": 2, "druhy": 2, "druha": 2,
-    "tri": 3, "treti": 3, "tree": 3, "free": 3, "true": 3, "try": 3,
-    "ctyri": 4, "ctvrty": 4, "four": 4, "for": 4,
-    "pet": 5, "pat": 5, "pad": 5, "pete": 5, "paty": 5, "sest": 6, "sesty": 6, "sedm": 7,
-    "osmy": 8, "osm": 8, "devet": 9, "devaty": 9, "deset": 10,
-    "jedenact": 11, "dvanact": 12, "trinact": 13, "ctrnact": 14,
-    "patnact": 15, "sestnact": 16, "sedmnact": 17, "osmnact": 18,
-    "devatenact": 19,
-    # English.
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
-    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
-    "nineteen": 19,
-    # Polish, normalized without diacritics.
-    "jeden": 1, "jedna": 1, "dwa": 2, "dwie": 2, "trzy": 3,
-    "cztery": 4, "piec": 5, "szesc": 6, "siedem": 7, "osiem": 8,
-    "dziewiec": 9, "dziesiec": 10, "jedenascie": 11, "dwanascie": 12,
-    "trzynascie": 13, "czternascie": 14, "pietnascie": 15,
-    "szesnascie": 16, "siedemnascie": 17, "osiemnascie": 18,
-    "dziewietnascie": 19,
-}
-
-VOICE_NUMBER_TENS = {
-    "dvacet": 20, "tricet": 30, "ctyricet": 40, "padesat": 50,
-    "sedesat": 60, "sedmdesat": 70, "osmdesat": 80, "devadesat": 90,
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
-    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
-    "dwadziescia": 20, "trzydziesci": 30, "czterdziesci": 40,
-    "piecdziesiat": 50, "szescdziesiat": 60, "siedemdziesiat": 70,
-    "osiemdziesiat": 80, "dziewiecdziesiat": 90,
-}
-
-VOICE_NUMBER_UNITS = {
-    "h", "hodin", "hodina", "hodiny", "hodinu", "hodinama", "cas", "casy",
-    "hour", "hours", "godzin", "godzina", "godziny", "godzine",
-    "pytel", "pytle", "pytlu", "pytel", "pytle", "bags", "bag", "bulkbag",
-    "liber", "pound", "pounds", "ks", "kus", "kusu", "pieces", "piece",
-    "krat", "x", "razy", "times",
-}
-
-VOICE_NUMBER_FILLERS = {
-    "a", "and", "plus", "minus", "asi", "cca", "okolo", "zhruba", "about",
-    "approximately", "kolem", "circa", "oraz", "i",
-}
-
-VOICE_NEGATIVE_WORDS = {
-    "ne", "nee", "neee", "nah", "non", "no", "nope", "none", "nothing", "nic", "zadny", "zadna",
-    "zadne", "zadnej", "zaden", "zadnou", "bez", "nie", "brak", "zaden",
-    "nemam", "nemame", "neni", "nepouzili", "nepouzito", "nebyl", "nebylo",
-    "skip", "preskoc", "preskocit", "dalsi", "dal", "dalej", "zadnych",
-    "zadneho", "zadne", "zaden", "ani", "niczego",
-}
-
-VOICE_POSITIVE_WORDS = {
-    "ano", "jo", "jasne", "potvrdit", "potvrzuji", "souhlasim", "ulozit",
-    "yes", "yeah", "yep", "confirm", "save", "tak", "potwierdz", "zapisz",
-}
-
-def normalize_voice_text(text: str) -> str:
-    raw = unicodedata.normalize("NFKD", (text or "").strip().lower())
-    ascii_text = raw.encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9,.\-+]+", " ", ascii_text).strip()
-
-def voice_tokens(text: str) -> list[str]:
-    normalized = normalize_voice_text(text)
-    return [token for token in re.split(r"[\s,.;:!?]+", normalized) if token]
-
-def extract_assistant_memory_command(text: str) -> Optional[tuple[str, str, str]]:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    remember_patterns = [
-        r"^\s*(zapamatuj si|pamatuj si|uloz si|ulož si|zapis si|zapiš si|remember that|remember|zapamietaj|zapamiętaj)\s+(.+)$",
-    ]
-    forget_patterns = [
-        r"^\s*(zapomen na|zapomeň na|zapomen|zapomeň|smaz z pameti|smaž z paměti|forget that|forget|zapomnij)\s+(.+)$",
-    ]
-    for pattern in remember_patterns:
-        match = re.match(pattern, raw, flags=re.IGNORECASE)
-        if match:
-            content = match.group(2).strip()
-            memory_type = "medium" if any(token in normalize_voice_text(raw) for token in ["strednedobe", "stredni", "medium"]) else "long"
-            return ("remember", content, memory_type) if content else None
-    for pattern in forget_patterns:
-        match = re.match(pattern, raw, flags=re.IGNORECASE)
-        if match:
-            query = match.group(2).strip()
-            return ("forget", query, "long") if query else None
-    return None
-
-def load_assistant_memories(conn, tenant_id: int, user_id: Optional[int], limit: int = 30) -> list[dict]:
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT id, memory_type, content, updated_at
-            FROM assistant_memory
-            WHERE tenant_id=%s
-              AND is_active=TRUE
-              AND (user_id IS NULL OR user_id IS NOT DISTINCT FROM %s)
-            ORDER BY updated_at DESC, id DESC
-            LIMIT %s
-            """,
-            (tenant_id, user_id, limit),
-        )
-        return [dict(row) for row in cur.fetchall()]
-
-def remember_assistant_memory(conn, tenant_id: int, user_id: Optional[int], content: str, memory_type: str = "long") -> dict:
-    clean_content = (content or "").strip()
-    if not clean_content:
-        raise ValueError("memory content is empty")
-    clean_type = memory_type if memory_type in {"medium", "long"} else "long"
-    normalized = normalize_voice_text(clean_content)
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT id
-            FROM assistant_memory
-            WHERE tenant_id=%s
-              AND user_id IS NOT DISTINCT FROM %s
-              AND normalized_content=%s
-              AND is_active=TRUE
-            LIMIT 1
-            """,
-            (tenant_id, user_id, normalized),
-        )
-        existing = cur.fetchone()
-        if existing:
-            cur.execute(
-                "UPDATE assistant_memory SET updated_at=now(), memory_type=%s WHERE id=%s RETURNING id, content, memory_type",
-                (clean_type, existing["id"]),
-            )
-            row = cur.fetchone()
-            return {"id": row["id"], "content": row["content"], "memory_type": row["memory_type"], "created": False}
-        cur.execute(
-            """
-            INSERT INTO assistant_memory (tenant_id, user_id, memory_type, content, normalized_content, source)
-            VALUES (%s, %s, %s, %s, %s, 'voice')
-            RETURNING id, content, memory_type
-            """,
-            (tenant_id, user_id, clean_type, clean_content, normalized),
-        )
-        row = cur.fetchone()
-        return {"id": row["id"], "content": row["content"], "memory_type": row["memory_type"], "created": True}
-
-def forget_assistant_memory(conn, tenant_id: int, user_id: Optional[int], query: str) -> dict:
-    clean_query = (query or "").strip()
-    if not clean_query:
-        raise ValueError("memory forget query is empty")
-    normalized_query = normalize_voice_text(clean_query)
-    forget_all = normalized_query in {"vse", "vsechno", "vsetko", "all", "everything", "wszystko"}
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        if forget_all:
-            cur.execute(
-                """
-                UPDATE assistant_memory
-                SET is_active=FALSE, forgotten_at=now(), updated_at=now()
-                WHERE tenant_id=%s
-                  AND user_id IS NOT DISTINCT FROM %s
-                  AND is_active=TRUE
-                RETURNING id, content
-                """,
-                (tenant_id, user_id),
-            )
-        else:
-            cur.execute(
-                """
-                UPDATE assistant_memory
-                SET is_active=FALSE, forgotten_at=now(), updated_at=now()
-                WHERE tenant_id=%s
-                  AND user_id IS NOT DISTINCT FROM %s
-                  AND is_active=TRUE
-                  AND (normalized_content LIKE %s OR content ILIKE %s)
-                RETURNING id, content
-                """,
-                (tenant_id, user_id, f"%{normalized_query}%", f"%{clean_query}%"),
-            )
-        rows = [dict(row) for row in cur.fetchall()]
-        return {"count": len(rows), "items": rows[:10]}
-
-def is_voice_negative_response(text: str, *, include_zero: bool = False) -> bool:
-    normalized = normalize_voice_text(text)
-    if not normalized:
-        return False
-    tokens = voice_tokens(text)
-    compact = " ".join(tokens)
-    if compact in VOICE_NEGATIVE_WORDS:
-        return True
-    if tokens and (tokens[0] in VOICE_NEGATIVE_WORDS or any(token in VOICE_NEGATIVE_WORDS for token in tokens)):
-        return True
-    if include_zero:
-        parsed = parse_voice_number(text)
-        if parsed == 0:
-            return True
-    return False
-
-def is_voice_positive_response(text: str) -> bool:
-    tokens = voice_tokens(text)
-    if not tokens:
-        return False
-    compact = " ".join(tokens)
-    return compact in VOICE_POSITIVE_WORDS or any(token in VOICE_POSITIVE_WORDS for token in tokens)
-
-def _parse_voice_number_tokens(tokens: list[str]) -> Optional[float]:
-    current = 0.0
-    total = 0.0
-    found = False
-    for token in tokens:
-        if not token or token in VOICE_NUMBER_UNITS or token in VOICE_NUMBER_FILLERS:
-            continue
-        if token in {"pul", "pol", "half"}:
-            current += 0.5
-            found = True
-            continue
-        if token in {"sto", "hundred", "setka"}:
-            current = (current or 1) * 100
-            found = True
-            continue
-        value = VOICE_NUMBER_WORDS.get(token)
-        if value is not None:
-            current += value
-            found = True
-            continue
-        value = VOICE_NUMBER_TENS.get(token)
-        if value is not None:
-            current += value
-            found = True
-            continue
-        return None
-    if not found:
-        return None
-    return total + current
-
-def parse_voice_number(text: str) -> Optional[float]:
-    normalized = normalize_voice_text(text)
-    if not normalized:
-        return None
-    numeric = re.search(r"[-+]?\d+(?:[,.]\d+)?", normalized)
-    if numeric:
-        try:
-            return float(numeric.group(0).replace(",", "."))
-        except ValueError:
-            return None
-    tokens = voice_tokens(text)
-    if not tokens:
-        return None
-    half_tokens = {"pul", "pol", "half"}
-    if any(token in half_tokens for token in tokens):
-        half_index = next(i for i, token in enumerate(tokens) if token in half_tokens)
-        base_tokens = [token for token in tokens[:half_index] if token not in VOICE_NUMBER_FILLERS]
-        if not base_tokens:
-            return 0.5
-        base = _parse_voice_number_tokens(base_tokens)
-        if base is not None:
-            return base + 0.5
-    parsed = _parse_voice_number_tokens(tokens)
-    if parsed is not None:
-        return parsed
-    numberish = set(VOICE_NUMBER_WORDS) | set(VOICE_NUMBER_TENS) | {"sto", "hundred", "setka"} | half_tokens | VOICE_NUMBER_FILLERS | VOICE_NUMBER_UNITS
-    best: Optional[float] = None
-    for start in range(len(tokens)):
-        if tokens[start] not in numberish:
-            continue
-        window = []
-        for token in tokens[start:]:
-            if token not in numberish:
-                break
-            window.append(token)
-            candidate = _parse_voice_number_tokens(window)
-            if candidate is not None:
-                best = candidate
-        if best is not None:
-            return best
-    return None
-
-def extract_current_report_day(ctx: dict) -> dict:
-    day = {
-        "client_id": ctx.get("client_id"),
-        "client_name": ctx.get("client_name"),
-        "job_id": ctx.get("job_id"),
-        "work_date": ctx.get("work_date"),
-        "workers": ctx.get("workers") or [],
-        "total_hours": ctx.get("total_hours", 0),
-        "entries": ctx.get("entries") or [],
-        "materials": ctx.get("materials") or [],
-        "waste": ctx.get("waste") or {"qty": 0, "rate": 0, "total": 0},
-        "notes": ctx.get("notes"),
-        "grand_total": ctx.get("grand_total", 0),
-    }
-    return json.loads(json.dumps(day, ensure_ascii=False))
-
-def reset_current_report_day(ctx: dict, work_date: Optional[str] = None):
-    preserved = {
-        "client_id": ctx.get("client_id"),
-        "client_name": ctx.get("client_name"),
-        "job_id": ctx.get("job_id"),
-        "language": ctx.get("language", "en"),
-        "report_days": ctx.get("report_days") or [],
-    }
-    for key in WORK_REPORT_DAY_FIELDS:
-        ctx.pop(key, None)
-    ctx.update(preserved)
-    ctx["work_date"] = work_date or datetime.now().strftime("%Y-%m-%d")
-    return ctx
-
-def append_current_report_day(ctx: dict) -> dict:
-    day = extract_current_report_day(ctx)
-    ctx.setdefault("report_days", []).append(day)
-    return day
-
-def normalize_voice_name_key(value: Optional[str]) -> str:
-    raw = unicodedata.normalize("NFKD", (value or "").strip().lower())
-    ascii_text = raw.encode("ascii", "ignore").decode("ascii")
-    chars = []
-    prev_space = False
-    for ch in ascii_text:
-        if ch.isalnum():
-            chars.append(ch)
-            prev_space = False
-        elif not prev_space:
-            chars.append(" ")
-            prev_space = True
-    return "".join(chars).strip()
-
-def split_voice_worker_fragments(text: str) -> List[str]:
-    normalized = normalize_voice_name_key(text)
-    if not normalized:
-        return []
-    for separator in (" and ", " a ", " i ", " plus ", "&", "+", ";", "/"):
-        normalized = normalized.replace(separator, ",")
-    fragments = [part.strip() for part in normalized.split(",") if part.strip()]
-    if len(fragments) != 1:
-        return fragments
-    return fragments
-
-def match_voice_workers(conn, tenant_id: int, text: str, client_id=None, job_id=None) -> tuple[list, list]:
-    with conn.cursor() as cur:
-        cur.execute("""SELECT id, display_name, email
-            FROM users
-            WHERE tenant_id=%s AND deleted_at IS NULL AND COALESCE(status,'active')='active'
-            ORDER BY display_name, id""", (tenant_id,))
-        user_rows = [dict(row) for row in cur.fetchall()]
-    if not user_rows:
-        return [], []
-    users = []
-    for row in user_rows:
-        display_name = clean_user_display_name(row.get("display_name")) or row.get("email") or f"User {row['id']}"
-        normalized_name = normalize_voice_name_key(display_name)
-        normalized = normalize_voice_name_key(f"{display_name} {row.get('email') or ''}")
-        tokens = [token for token in normalized.split() if token]
-        users.append({
-            "id": row["id"],
-            "display_name": display_name,
-            "normalized_name": normalized_name,
-            "normalized": normalized,
-            "tokens": tokens,
-        })
-
-    def build_worker(user_row: dict) -> dict:
-        rate = resolve_rate(conn, tenant_id, "worker_rate", rule_key=str(user_row["id"]), job_id=job_id, client_id=client_id)
-        return {"name": user_row["display_name"], "user_id": user_row["id"], "hours": 0, "rate": rate, "total": 0}
-
-    def find_best_user(fragment: str):
-        normalized_fragment = normalize_voice_name_key(fragment)
-        if not normalized_fragment:
-            return None
-        exact = [u for u in users if u["normalized_name"] == normalized_fragment or u["normalized"] == normalized_fragment]
-        if len(exact) == 1:
-            return exact[0]
-        token_exact = [u for u in users if normalized_fragment in u["tokens"]]
-        if len(token_exact) == 1:
-            return token_exact[0]
-        contains = [
-            u for u in users
-            if normalized_fragment in u["normalized"]
-            or u["normalized_name"] in normalized_fragment
-            or u["normalized"] in normalized_fragment
-        ]
-        if len(contains) == 1:
-            return contains[0]
-        if len(contains) > 1:
-            contains.sort(key=lambda item: (abs(len(item["normalized"]) - len(normalized_fragment)), len(item["normalized"])))
-            best = contains[0]
-            if len(contains) == 1 or abs(len(contains[1]["normalized"]) - len(normalized_fragment)) != abs(len(best["normalized"]) - len(normalized_fragment)):
-                return best
-        return None
-
-    matched_workers = []
-    seen_user_ids = set()
-    not_found = []
-    fragments = split_voice_worker_fragments(text)
-    for fragment in fragments:
-        user_row = find_best_user(fragment)
-        if user_row:
-            if user_row["id"] not in seen_user_ids:
-                matched_workers.append(build_worker(user_row))
-                seen_user_ids.add(user_row["id"])
-            continue
-        token_parts = [part for part in normalize_voice_name_key(fragment).split() if part]
-        token_matches = []
-        unresolved_tokens = []
-        for token in token_parts:
-            token_user = find_best_user(token)
-            if token_user:
-                if token_user["id"] not in seen_user_ids and token_user["id"] not in {item["id"] for item in token_matches}:
-                    token_matches.append(token_user)
-            else:
-                unresolved_tokens.append(token)
-        if token_matches and not unresolved_tokens:
-            for token_user in token_matches:
-                matched_workers.append(build_worker(token_user))
-                seen_user_ids.add(token_user["id"])
-        else:
-            not_found.append(fragment.strip())
-    return matched_workers, not_found
-
-def generate_batch_summary(ctx, lang="en"):
-    days = list(ctx.get("report_days") or [])
-    current = extract_current_report_day(ctx)
-    if current.get("entries"):
-        days.append(current)
-    if not days:
-        return generate_summary(ctx, lang)
-    header = (
-        f"Multi-day work report for {ctx.get('client_name', '?')}"
-        if lang == "en" else
-        f"Vícedenní výkaz práce pro {ctx.get('client_name', '?')}"
-        if lang == "cs" else
-        f"Wielodniowy raport pracy dla {ctx.get('client_name', '?')}"
-    )
-    lines = [header]
-    total_hours = 0.0
-    grand_total = 0.0
-    for index, day in enumerate(days, start=1):
-        lines.append("")
-        day_label = (
-            f"Day {index}: {day.get('work_date', '?')}"
-            if lang == "en" else
-            f"Den {index}: {day.get('work_date', '?')}"
-            if lang == "cs" else
-            f"Dzień {index}: {day.get('work_date', '?')}"
-        )
-        lines.append(day_label)
-        lines.append(generate_summary(day, lang))
-        total_hours += float(day.get("total_hours") or 0)
-        grand_total += float(day.get("grand_total") or 0)
-    footer = (
-        f"Combined total: {total_hours:.2f} h, £{grand_total:.2f}"
-        if lang == "en" else
-        f"Celkem: {total_hours:.2f} h, £{grand_total:.2f}"
-        if lang == "cs" else
-        f"Razem: {total_hours:.2f} h, £{grand_total:.2f}"
-    )
-    lines.extend(["", footer])
-    return "\n".join(lines)
-
-def generate_batch_whatsapp(ctx, lang="en", footer=None):
-    days = list(ctx.get("report_days") or [])
-    current = extract_current_report_day(ctx)
-    if current.get("entries"):
-        days.append(current)
-    if not days:
-        return generate_whatsapp(ctx)
-    greeting = (
-        f"Hello {ctx.get('client_name','')},\n\nHere is the summary of the work completed across multiple days:\n"
-        if lang == "en" else
-        f"Dobrý den {ctx.get('client_name','')},\n\nTady je shrnutí práce za více dní:\n"
-        if lang == "cs" else
-        f"Dzień dobry {ctx.get('client_name','')},\n\nOto podsumowanie prac z kilku dni:\n"
-    )
-    lines = [greeting]
-    grand_total = 0.0
-    for day in days:
-        lines.append(f"{day.get('work_date')}: £{float(day.get('grand_total') or 0):.2f}")
-        for entry in day.get("entries") or []:
-            lines.append(f"- {entry.get('type','Work')}: {entry.get('hours',0)}h = £{float(entry.get('total') or 0):.2f}")
-        grand_total += float(day.get("grand_total") or 0)
-        lines.append("")
-    lines.append(f"Total: £{grand_total:.2f}")
-    if footer: lines.append(f"\n{footer}")
-    return "\n".join(lines)
-
-def save_voice_work_report_day(conn, tenant_id: int, actor_user_id: Optional[int], day_ctx: dict) -> int:
-    with conn.cursor() as cur:
-        cur.execute("""INSERT INTO work_reports (tenant_id,client_id,job_id,work_date,total_hours,total_price,notes,created_by,input_type,status)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'voice','confirmed') RETURNING id""",
-            (
-                tenant_id,
-                day_ctx.get("client_id"),
-                day_ctx.get("job_id"),
-                day_ctx.get("work_date", datetime.now().strftime("%Y-%m-%d")),
-                day_ctx.get("total_hours", 0),
-                day_ctx.get("grand_total", 0),
-                day_ctx.get("notes"),
-                actor_user_id,
-            ))
-        rid = cur.fetchone()['id']
-        for w in day_ctx.get("workers", []):
-            cur.execute("INSERT INTO work_report_workers (work_report_id,user_id,worker_name,hours,hourly_rate,total_price) VALUES (%s,%s,%s,%s,%s,%s)",
-                (rid, w.get("user_id"), w["name"], w["hours"], w["rate"], w["total"]))
-        for e in day_ctx.get("entries", []):
-            cur.execute("INSERT INTO work_report_entries (work_report_id,type,hours,unit_rate,total_price) VALUES (%s,%s,%s,%s,%s)",
-                (rid, e["type"], e["hours"], e["rate"], e["total"]))
-        for m in day_ctx.get("materials", []):
-            cur.execute("INSERT INTO work_report_materials (work_report_id,material_name,quantity,unit_price,total_price) VALUES (%s,%s,%s,%s,%s)",
-                (rid, m["name"], m["qty"], m["price"], m["total"]))
-        waste = day_ctx.get("waste", {})
-        if waste.get("qty", 0) > 0:
-            cur.execute("INSERT INTO work_report_waste (work_report_id,quantity,unit,unit_price,total_price) VALUES (%s,%s,'bulkbag',%s,%s)",
-                (rid, waste["qty"], waste["rate"], waste["total"]))
-    log_activity(conn, "work_report", str(rid), "create", f"Work report £{day_ctx.get('grand_total',0):.2f} for {day_ctx.get('client_name','?')}")
-    return rid
 
 def generate_summary(ctx, lang="en"):
     c = ctx
@@ -12157,7 +3160,7 @@ def generate_summary(ctx, lang="en"):
     if c.get("notes"): lines.append(f"Notes: {c['notes']}")
     return "\n".join(lines)
 
-def generate_whatsapp(ctx, footer=None):
+def generate_whatsapp(ctx):
     c = ctx
     lines = [f"Hello {c.get('client_name','')},", "", "Here is the summary of today's work:", ""]
     for e in c.get("entries",[]):
@@ -12168,59 +3171,32 @@ def generate_whatsapp(ctx, footer=None):
     for m in c.get("materials",[]):
         lines.append(f"Material - {m.get('name','')}: {m.get('qty',0)} × £{m.get('price',0):.2f} = £{m.get('total',0):.2f}")
     lines.append(f"\nTotal: £{c.get('grand_total',0):.2f}")
-    if footer: lines.append(f"\n{footer}")
+    lines.append(f"\nMarek\nDesignLeaf\n07395 813008")
     return "\n".join(lines)
 
 # ========== VOICE SESSION API ==========
 @app.post("/voice/session/start")
-async def voice_session_start(data: dict, request: Request):
+async def voice_session_start(data: dict):
     conn = get_db_conn()
     try:
         sid = str(uuid.uuid4())
         tenant_id = data.get("tenant_id",1)
         tenant_config = get_tenant_config(conn, tenant_id)
-        actor_user_id = request.state.user.get("user_id")
-        lang = normalize_language_short(
-            get_assistant_internal_language(actor_user_id, tenant_id).get("lang", DEFAULT_ASSISTANT_LANG),
-            "en",
-        )
+        lang = resolve_voice_language(tenant_config, data.get("language"))
         with conn.cursor() as cur:
-            ctx = json.dumps({
-                "language": lang,
-                "work_date": data.get("work_date", datetime.now().strftime("%Y-%m-%d")),
-                "report_days": [],
-            })
+            ctx = json.dumps({"language":lang,"work_date":data.get("work_date",datetime.now().strftime("%Y-%m-%d"))})
             cur.execute("INSERT INTO voice_sessions (id,tenant_id,user_id,session_type,state,dialog_step,context) VALUES (%s,%s,%s,'work_report','active','client',%s)",
-                (sid,tenant_id,actor_user_id,ctx))
+                (sid,tenant_id,data.get("user_id"),ctx))
             conn.commit()
-        audit_request_event(
-            request,
-            action="voice_session_start",
-            description="Started voice session",
-            entity_type="voice_session",
-            entity_id=sid,
-            details={"language": lang, "work_date": data.get("work_date")},
-            source_channel="voice",
-        )
         return {"session_id":sid,"step":"client","prompt":get_prompt("client",lang)}
     except Exception as e: conn.rollback(); raise HTTPException(500,str(e))
     finally: release_conn(conn)
 
 @app.post("/voice/session/input")
-async def voice_session_input(data: dict, request: Request):
+async def voice_session_input(data: dict):
     sid = data.get("session_id")
     text = data.get("text","").strip()
     if not sid: raise HTTPException(400,"session_id required")
-    if text:
-        audit_request_event(
-            request,
-            action="voice_session_input",
-            description=text,
-            entity_type="voice_session",
-            entity_id=sid,
-            details={"tenant_id": data.get("tenant_id", 1)},
-            source_channel="voice",
-        )
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -12245,104 +3221,57 @@ async def voice_session_input(data: dict, request: Request):
 
             # === STEP: CLIENT ===
             if step == "client":
-                wants_new_client, provided_new_client_name = parse_new_client_command(text)
-                if wants_new_client and provided_new_client_name:
-                    actor_user_id = sess.get("user_id")
-                    if not actor_user_id:
-                        raise HTTPException(422, "Voice session has no user for client creation")
-                    created_client = create_voice_work_report_client(conn, tenant_id, int(actor_user_id), provided_new_client_name, lang)
-                    ctx["client_id"] = created_client["id"]
-                    ctx["client_name"] = created_client["display_name"]
-                    next_step = "date"
-                    reply = (
-                        f"Created client {created_client['display_name']}. {get_prompt('date',lang)}"
-                        if lang == "en" else
-                        f"Vytvořil jsem klienta {created_client['display_name']}. {get_prompt('date',lang)}"
-                        if lang == "cs" else
-                        f"Utworzyłem klienta {created_client['display_name']}. {get_prompt('date',lang)}"
-                    )
-                elif wants_new_client:
-                    next_step = "client_create_name"
-                    reply = get_prompt("client_create_name", lang)
+                cur.execute("SELECT id,display_name FROM clients WHERE tenant_id=%s AND deleted_at IS NULL AND (display_name ILIKE %s OR client_code ILIKE %s) LIMIT 5",
+                    (tenant_id,f"%{text}%",f"%{text}%"))
+                matches = cur.fetchall()
+                if len(matches) == 1:
+                    ctx["client_id"] = matches[0]['id']; ctx["client_name"] = matches[0]['display_name']
+                    next_step = "workers"; reply = f"{matches[0]['display_name']}. {get_prompt('workers',lang)}"
+                elif len(matches) > 1:
+                    names = ", ".join([m['display_name'] for m in matches])
+                    reply = f"Found: {names}. Which one?" if lang=="en" else f"Nalezeni: {names}. Který?" if lang=="cs" else f"Znalezieni: {names}. Który?"
                 else:
-                    cur.execute("SELECT id,display_name FROM clients WHERE tenant_id=%s AND deleted_at IS NULL AND (display_name ILIKE %s OR client_code ILIKE %s) LIMIT 5",
-                        (tenant_id,f"%{text}%",f"%{text}%"))
-                    matches = cur.fetchall()
-                    if len(matches) == 1:
-                        ctx["client_id"] = matches[0]['id']; ctx["client_name"] = matches[0]['display_name']
-                        next_step = "date"; reply = f"{matches[0]['display_name']}. {get_prompt('date',lang)}"
-                    elif len(matches) > 1:
-                        names = ", ".join([m['display_name'] for m in matches])
-                        reply = f"Found: {names}. Which one?" if lang=="en" else f"Nalezeni: {names}. Který?" if lang=="cs" else f"Znalezieni: {names}. Który?"
-                    else:
-                        reply = (
-                            "Client not found. Try again or say 'new client'."
-                            if lang=="en" else
-                            "Klient nenalezen. Zkus to znovu nebo řekni 'nový klient'."
-                            if lang=="cs" else
-                            "Klient nie znaleziony. Spróbuj ponownie albo powiedz 'nowy klient'."
-                        )
-
-            elif step == "client_create_name":
-                actor_user_id = sess.get("user_id")
-                if not actor_user_id:
-                    raise HTTPException(422, "Voice session has no user for client creation")
-                created_client = create_voice_work_report_client(conn, tenant_id, int(actor_user_id), text, lang)
-                ctx["client_id"] = created_client["id"]
-                ctx["client_name"] = created_client["display_name"]
-                next_step = "date"
-                reply = (
-                    f"Created client {created_client['display_name']}. {get_prompt('date',lang)}"
-                    if lang == "en" else
-                    f"Vytvořil jsem klienta {created_client['display_name']}. {get_prompt('date',lang)}"
-                    if lang == "cs" else
-                    f"Utworzyłem klienta {created_client['display_name']}. {get_prompt('date',lang)}"
-                )
-
-            # === STEP: DATE ===
-            elif step == "date":
-                parsed_date = parse_voice_work_date(text)
-                if not parsed_date:
-                    reply = (
-                        "Invalid date. Say a date like 2026-04-18 or 18.04.2026."
-                        if lang == "en" else
-                        "Neplatné datum. Řekni datum jako 2026-04-18 nebo 18.04.2026."
-                        if lang == "cs" else
-                        "Nieprawidłowa data. Powiedz datę jak 2026-04-18 albo 18.04.2026."
-                    )
-                else:
-                    reset_current_report_day(ctx, parsed_date)
-                    next_step = "workers"
-                    reply = (
-                        f"Date {parsed_date}. {get_prompt('workers',lang)}"
-                        if lang == "en" else
-                        f"Datum {parsed_date}. {get_prompt('workers',lang)}"
-                        if lang == "cs" else
-                        f"Data {parsed_date}. {get_prompt('workers',lang)}"
-                    )
+                    reply = "Client not found. Try again." if lang=="en" else "Klient nenalezen. Zkus znovu." if lang=="cs" else "Klient nie znaleziony. Spróbuj ponownie."
 
             # === STEP: WORKERS ===
             elif step == "workers":
-                workers, not_found = match_voice_workers(conn, tenant_id, text, client_id=ctx.get("client_id"), job_id=ctx.get("job_id"))
+                names = [n.strip() for n in text.replace(" and ",",").replace(" a ",",").replace(" i ",",").split(",") if n.strip()]
+                workers = []; not_found = []
+                for name in names:
+                    cur.execute("SELECT id,display_name FROM users WHERE tenant_id=%s AND display_name ILIKE %s AND deleted_at IS NULL LIMIT 1",(tenant_id,f"%{name}%"))
+                    u = cur.fetchone()
+                    if u:
+                        rate = resolve_rate(conn,tenant_id,"worker_rate",rule_key=str(u['id']),job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
+                        workers.append({"name":u['display_name'],"user_id":u['id'],"hours":0,"rate":rate,"total":0})
+                    else:
+                        not_found.append(name)
                 if workers and not not_found:
                     ctx["workers"] = workers; next_step = "total_hours"
                     reply = f"{len(workers)} workers. {get_prompt('total_hours',lang)}"
                 elif workers and not_found:
                     ctx["workers"] = workers
                     nf = ", ".join(not_found)
-                    reply = f"Not found in system: {nf}. Found: {len(workers)}. Add more or say 'continue'." if lang=="en" else f"Nenalezeni: {nf}. Nalezeno: {len(workers)}. Přidej další nebo řekni 'pokračuj'." if lang=="cs" else f"Nie znaleziono: {nf}. Znaleziono: {len(workers)}. Dodaj kolejne albo powiedz 'dalej'."
+                    reply = f"Not found in system: {nf}. Found: {len(workers)}. Add more or say 'continue'." if lang=="en" else f"Nenalezeni: {nf}. Nalezeno: {len(workers)}. Přidej další nebo řekni 'pokračuj'."
                 elif "continu" in text.lower() or "pokrac" in text.lower() or "dalej" in text.lower():
                     if ctx.get("workers"):
                         next_step = "total_hours"; reply = get_prompt("total_hours",lang)
                     else:
-                        reply = "No workers added. Try again." if lang=="en" else "Žádní pracovníci. Zkus znovu." if lang=="cs" else "Nie dodano pracowników. Spróbuj ponownie."
+                        reply = "No workers added. Try again." if lang=="en" else "Žádní pracovníci. Zkus znovu."
                 else:
-                    reply = "No workers found in system. Try first names or say them one by one." if lang=="en" else "Žádní pracovníci nenalezeni. Zkus křestní jména nebo je řekni po jednom." if lang=="cs" else "Nie znaleziono pracowników. Spróbuj podać imiona albo powiedz je po kolei."
+                    reply = "No workers found in system. Use exact names." if lang=="en" else "Žádní pracovníci nenalezeni. Použij přesná jména." if lang=="cs" else "Nie znaleziono pracowników. Użyj dokładnych imion."
 
             # === STEP: TOTAL HOURS ===
             elif step == "total_hours":
-                hrs = parse_voice_number(text)
-                if hrs is not None:
+                try:
+                    _num_words = {"nula":0,"jedna":1,"jeden":1,"jedno":1,"dva":2,"dve":2,"tri":3,"tři":3,"ctyri":4,"čtyři":4,"pet":5,"pět":5,"sest":6,"šest":6,"sedm":7,"osm":8,"devet":9,"devět":9,"deset":10,"jedenact":11,"dvanact":12,
+                        "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10,"eleven":11,"twelve":12,
+                        "jeden a půl":1.5,"jedna a půl":1.5,"dva a půl":2.5,"dvě a půl":2.5,"tři a půl":3.5,"čtyři a půl":4.5,"pět a půl":5.5,"šest a půl":6.5,"sedm a půl":7.5,"osm a půl":8.5,
+                        "půl":0.5,"half":0.5}
+                    _clean = text.lower().replace("hours","").replace("hodin","").replace("hodiny","").replace("hodinu","").replace("godzin","").strip()
+                    if _clean in _num_words:
+                        hrs = _num_words[_clean]
+                    else:
+                        hrs = float(_clean.replace(",","."))
                     ctx["total_hours"] = hrs
                     # Distribute equally if multiple workers
                     wc = len(ctx.get("workers",[]))
@@ -12350,18 +3279,18 @@ async def voice_session_input(data: dict, request: Request):
                         per = round(hrs / wc, 2)
                         for w in ctx["workers"]: w["hours"] = per; w["total"] = round(per * w["rate"],2)
                     ctx["_entry_sub"] = "pruning"; ctx["entries"] = []; next_step = "entries"; reply = f"{hrs}h. " + get_prompt("entries",lang)
-                else:
-                    reply = "Invalid number." if lang=="en" else "Neplatné číslo." if lang=="cs" else "Nieprawidłowa liczba."
+                except: reply = "Invalid number." if lang=="en" else "Neplatné číslo." if lang=="cs" else "Nieprawidłowa liczba."
 
             # === STEP: ENTRIES (pruning -> maintenance -> additional if needed) ===
             elif step == "entries":
+                _nw = {"nula":0,"jedna":1,"jeden":1,"dva":2,"dve":2,"dvě":2,"tri":3,"tři":3,"ctyri":4,"čtyři":4,"pet":5,"pět":5,"sest":6,"šest":6,"sedm":7,"osm":8,"devet":9,"devět":9,"deset":10,"půl":0.5,"half":0.5,
+                    "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10}
                 sub = ctx.get("_entry_sub","pruning")
                 low = text.lower().strip()
                 def _parse_hours(t):
-                    parsed = parse_voice_number(t)
-                    if parsed is None:
-                        raise ValueError("invalid voice number")
-                    return parsed
+                    t2 = t.lower().replace("hodin","").replace("hodiny","").replace("hodinu","").replace("hours","").replace("h","").replace(",",".").strip()
+                    if t2 in _nw: return _nw[t2]
+                    return float(t2)
                 if not ctx.get("entries"): ctx["entries"] = []
 
                 if sub == "pruning":
@@ -12426,36 +3355,36 @@ async def voice_session_input(data: dict, request: Request):
 
             # === STEP: MATERIALS ===
             elif step == "materials":
-                if is_voice_negative_response(text, include_zero=True):
+                if any(text.lower().startswith(x) for x in ("no","ne","nie","none","zadny","żaden","skip","přeskoč","preskoc","dalsi","další","zadny","žádný")):
                     ctx["materials"] = []
                 else:
+                    import re
                     mats = []
                     parts = re.findall(r'(\w[\w\s]*?)\s+([\d.,]+)\s*[x×]?\s*£?([\d.,]+)?', text)
                     for mname, mqty, mprice in parts:
                         q = float(mqty.replace(",","."))
                         p = float(mprice.replace(",",".")) if mprice else 0
                         mats.append({"name":mname.strip(),"qty":q,"price":p,"total":round(q*p,2)})
-                    if not mats and not is_voice_negative_response(text, include_zero=True):
+                    if not mats and text.lower() not in ("no","ne","nie","none","skip"):
                         mats.append({"name":text,"qty":1,"price":0,"total":0})
                     ctx["materials"] = mats
                 next_step = "notes"; reply = get_prompt("notes",lang)
 
             # === STEP: WASTE ===
             elif step == "waste":
-                if is_voice_negative_response(text, include_zero=True):
+                if any(text.lower().startswith(x) for x in ("no","ne","nie","none","zadny","żaden","0","skip","přeskoč","preskoc","dalsi","další")):
                     ctx["waste"] = {"qty":0,"rate":0,"total":0}
                 else:
-                    qty = parse_voice_number(text)
-                    if qty is not None:
+                    try:
+                        qty = float(text.replace(",",".").split()[0])
                         rate = resolve_rate(conn,tenant_id,"waste_rate",job_id=ctx.get("job_id"),client_id=ctx.get("client_id"))
                         ctx["waste"] = {"qty":qty,"rate":rate,"total":round(qty*rate,2)}
-                    else:
-                        ctx["waste"] = {"qty":0,"rate":0,"total":0}
+                    except: ctx["waste"] = {"qty":0,"rate":0,"total":0}
                 next_step = "materials"; reply = get_prompt("materials",lang)
 
             # === STEP: NOTES ===
             elif step == "notes":
-                if not is_voice_negative_response(text) and text.strip() != "":
+                if not any(text.lower().startswith(x) for x in ("no","ne","nie","skip","přeskoč","preskoc","dalsi","další")) and text.strip() != "":
                     ctx["notes"] = text
                 # Calculate grand total
                 gt = sum(e.get("total",0) for e in ctx.get("entries",[]))
@@ -12468,23 +3397,11 @@ async def voice_session_input(data: dict, request: Request):
             # === STEP: SUMMARY (edit or confirm) ===
             elif step == "summary":
                 low = text.lower()
-                normalized_low = normalize_voice_text(text)
                 # POTVRDIT
-                if is_voice_positive_response(text) or any(x in normalized_low for x in ["confirm","potvrdit","potwierdz","yes","ano","tak","ulozit","save"]):
+                if any(x in low for x in ["confirm","potvrdit","potwierdź","yes","ano","tak","uložit","ulozit","save"]):
                     next_step = "confirm"
-                elif any(x in low for x in ["another day","next day","add day","další den","dalsi den","další datum","dalsi datum","kolejny dzień","kolejny dzien","następny dzień","nastepny dzien"]):
-                    completed_day = append_current_report_day(ctx)
-                    reset_current_report_day(ctx)
-                    next_step = "date"
-                    reply = (
-                        f"Day {completed_day.get('work_date')} added. {get_prompt('date', lang)}"
-                        if lang == "en" else
-                        f"Den {completed_day.get('work_date')} přidán. {get_prompt('date', lang)}"
-                        if lang == "cs" else
-                        f"Dzień {completed_day.get('work_date')} dodany. {get_prompt('date', lang)}"
-                    )
                 # ZRUSIT / SMAZAT
-                elif is_voice_negative_response(text) or any(x in normalized_low for x in ["zrusit","smazat","cancel","delete","storno","konec","stop"]):
+                elif any(x in low for x in ["zrušit","zrusit","smazat","cancel","delete","storno","konec","stop"]):
                     cur.execute("UPDATE voice_sessions SET state='cancelled',updated_at=now() WHERE id=%s",(sid,))
                     conn.commit()
                     reply = "Report zrušen." if lang=="cs" else "Report cancelled." if lang=="en" else "Raport anulowany."
@@ -12492,7 +3409,6 @@ async def voice_session_input(data: dict, request: Request):
                 # OPRAVIT
                 elif any(low.startswith(x) for x in ["edit","oprav","popraw","zmen","změ","uprav"]):
                     _step_map = {"client":"client","klient":"client","klienta":"client",
-                        "date":"date","datum":"date","data":"date","den":"date","dzień":"date","dzien":"date",
                         "worker":"workers","pracovn":"workers","kdo":"workers",
                         "hour":"total_hours","hodin":"total_hours","celkem":"total_hours","total":"total_hours","godzin":"total_hours",
                         "entr":"entries","polozk":"entries","položk":"entries","rozpad":"entries","práce":"entries","prace":"entries","typ":"entries",
@@ -12504,9 +3420,9 @@ async def voice_session_input(data: dict, request: Request):
                         if _kw in low:
                             next_step = _target; reply = get_prompt(_target,lang); _found = True; break
                     if not _found:
-                        reply = "Co opravit? (klienta/datum/pracovníky/hodiny/položky/odpad/materiál/poznámku)" if lang=="cs" else "What to edit? (client/date/workers/hours/entries/waste/materials/notes)"
+                        reply = "Co opravit? (klient/pracovniky/hodiny/polozky/odpad/material/poznamku)" if lang=="cs" else "What to edit?"
                 else:
-                    reply = "Řekni 'další den', 'potvrdit', 'oprav [co]' nebo 'zrušit'." if lang=="cs" else "Say 'another day', 'confirm', 'edit [field]', or 'cancel'."
+                    reply = "Řekni 'potvrdit', 'oprav [co]', nebo 'zrušit'." if lang=="cs" else "Say 'confirm', 'edit [field]', or 'cancel'."
 
             # === STEP: CONFIRM → save to DB ===
             if next_step == "confirm" and step != "confirm":
@@ -12519,26 +3435,30 @@ async def voice_session_input(data: dict, request: Request):
                     ctx["total_hours"] = sum(e["hours"] for e in ctx.get("entries",[])); next_step = "confirm"
                 else:
                   try:
-                    pending_days = list(ctx.get("report_days") or [])
-                    pending_days.append(extract_current_report_day(ctx))
-                    report_ids = []
-                    for day_ctx in pending_days:
-                        rid = save_voice_work_report_day(conn, tenant_id, sess.get("user_id"), day_ctx)
-                        report_ids.append(rid)
-                    ctx["saved_work_report_ids"] = report_ids
+                    cur.execute("""INSERT INTO work_reports (tenant_id,client_id,job_id,work_date,total_hours,total_price,notes,created_by,input_type,status)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'voice','confirmed') RETURNING id""",
+                        (tenant_id,ctx.get("client_id"),ctx.get("job_id"),ctx.get("work_date",datetime.now().strftime("%Y-%m-%d")),
+                         ctx.get("total_hours",0),ctx.get("grand_total",0),ctx.get("notes"),sess.get("user_id")))
+                    rid = cur.fetchone()['id']
+                    for w in ctx.get("workers",[]):
+                        cur.execute("INSERT INTO work_report_workers (work_report_id,user_id,worker_name,hours,hourly_rate,total_price) VALUES (%s,%s,%s,%s,%s,%s)",
+                            (rid,w.get("user_id"),w["name"],w["hours"],w["rate"],w["total"]))
+                    for e in ctx.get("entries",[]):
+                        cur.execute("INSERT INTO work_report_entries (work_report_id,type,hours,unit_rate,total_price) VALUES (%s,%s,%s,%s,%s)",
+                            (rid,e["type"],e["hours"],e["rate"],e["total"]))
+                    for m in ctx.get("materials",[]):
+                        cur.execute("INSERT INTO work_report_materials (work_report_id,material_name,quantity,unit_price,total_price) VALUES (%s,%s,%s,%s,%s)",
+                            (rid,m["name"],m["qty"],m["price"],m["total"]))
+                    waste = ctx.get("waste",{})
+                    if waste.get("qty",0) > 0:
+                        cur.execute("INSERT INTO work_report_waste (work_report_id,quantity,unit,unit_price,total_price) VALUES (%s,%s,'bulkbag',%s,%s)",
+                            (rid,waste["qty"],waste["rate"],waste["total"]))
+                    log_activity(conn,"work_report",str(rid),"create",f"Work report £{ctx.get('grand_total',0):.2f} for {ctx.get('client_name','?')}")
                     cur.execute("UPDATE voice_sessions SET state='completed',context=%s,updated_at=now() WHERE id=%s",(json.dumps(ctx),sid))
                     conn.commit()
-                    _ts_wr = _get_tenant_settings(conn, tenant_id); whatsapp = generate_batch_whatsapp(ctx, lang, footer=_ts_wr.get("whatsapp_footer"))
+                    whatsapp = generate_whatsapp(ctx)
                     reply = get_prompt("confirm",lang)
-                    return {
-                        "session_id":sid,
-                        "step":"done",
-                        "prompt":reply,
-                        "work_report_id":report_ids[-1],
-                        "work_report_ids":report_ids,
-                        "whatsapp_message":whatsapp,
-                        "summary":generate_batch_summary(ctx,lang)
-                    }
+                    return {"session_id":sid,"step":"done","prompt":reply,"work_report_id":rid,"whatsapp_message":whatsapp,"summary":generate_summary(ctx,lang)}
                   except Exception as e:
                     conn.rollback(); raise HTTPException(500,f"Save error: {e}")
 
@@ -12547,7 +3467,7 @@ async def voice_session_input(data: dict, request: Request):
                 "step": step, "next_step": next_step,
                 "input_length": len(text),
                 "input_preview": text[:50].replace("\n", " "),
-                "has_numbers": parse_voice_number(text) is not None
+                "has_numbers": any(c.isdigit() for c in text) or any(x in text.lower() for x in ["half","quarter","one","two","three"])
             })
             log_activity(conn, "voice_session", sid, "voice_input", audit_details, tenant_id=tenant_id, user_id=sess.get("user_id"))
 
@@ -12601,120 +3521,6 @@ async def voice_session_resume(data: dict):
     except Exception as e: raise HTTPException(500, str(e))
     finally: release_conn(conn)
 
-# ── VOICE SESSION: INTERRUPT (barge-in) ──────────────────────────────────────
-@app.post("/voice/session/interrupt")
-async def voice_session_interrupt(data: dict, request: Request):
-    """
-    Called by Android when barge-in is detected (VAD trigger or interrupt phrase).
-    Server records the interruption; Android is responsible for stopping TTS playback.
-
-    Request body:
-        session_id       (str, required)
-        tenant_id        (int, default 1)
-        phrase           (str, optional)  — detected phrase that triggered interrupt
-        interruption_type (str, default 'phrase') — phrase | vad | barge_in | manual
-        tts_position_ms  (int, optional)  — ms into TTS playback when interrupted
-
-    Response:
-        {session_id, status:'interrupted', previous_state, dialog_step}
-    """
-    sid               = data.get("session_id")
-    tenant_id         = int(data.get("tenant_id", 1))
-    phrase            = data.get("phrase", "") or ""
-    interruption_type = data.get("interruption_type", "phrase")
-    tts_position_ms   = data.get("tts_position_ms")
-
-    if not sid:
-        raise HTTPException(400, "session_id required")
-
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM crm.voice_sessions WHERE id=%s AND tenant_id=%s",
-                (sid, tenant_id)
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, f"Session {sid} not found")
-
-            previous_state = row["state"]
-            step           = row.get("dialog_step", "unknown")
-            actor_user_id  = (
-                request.state.user.get("user_id")
-                if hasattr(request, "state") and hasattr(request.state, "user")
-                else row.get("user_id")
-            )
-
-            cur.execute("""
-                UPDATE crm.voice_sessions
-                   SET state              = 'interrupted',
-                       interrupted        = TRUE,
-                       interrupted_at     = NOW(),
-                       interrupted_text   = %s,
-                       interruption_reason = %s,
-                       previous_state     = %s,
-                       updated_at         = NOW()
-                 WHERE id = %s
-            """, (phrase or None, interruption_type, previous_state, sid))
-
-            cur.execute("""
-                INSERT INTO crm.voice_interrupt_logs
-                    (tenant_id, user_id, voice_session_id, detected_phrase,
-                     interruption_type, previous_state, new_state, tts_position_ms, session_step)
-                VALUES (%s, %s, %s, %s, %s, %s, 'interrupted', %s, %s)
-            """, (
-                tenant_id,
-                actor_user_id or row.get("user_id"),
-                sid,
-                phrase or None,
-                interruption_type,
-                previous_state,
-                tts_position_ms,
-                step,
-            ))
-
-            conn.commit()
-
-        return {
-            "session_id":     sid,
-            "status":         "interrupted",
-            "previous_state": previous_state,
-            "dialog_step":    step,
-        }
-    except HTTPException: raise
-    except Exception as e: conn.rollback(); raise HTTPException(500, str(e))
-    finally: release_conn(conn)
-
-
-# ── VOICE INTERRUPT COMMANDS: fetch for Android VAD phrase detector ──────────
-@app.get("/voice/interrupt-commands")
-async def list_voice_interrupt_commands(tenant_id: int = 1, language_code: str = "cs"):
-    """
-    Returns interrupt phrases for the given tenant + language.
-    Android fetches this at session start to build its local phrase detector.
-    Response can be cached on device between sessions.
-
-    Query params:
-        tenant_id      (int, default 1)
-        language_code  (str, default 'cs') — BCP-47: cs, en, en-GB, pl
-    """
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT phrase, command_type, sort_order
-                  FROM crm.voice_interrupt_commands
-                 WHERE tenant_id    = %s
-                   AND language_code = %s
-                   AND is_active    = TRUE
-                 ORDER BY sort_order
-            """, (tenant_id, language_code))
-            cmds = [{"phrase": r["phrase"], "command_type": r["command_type"]} for r in cur.fetchall()]
-        return {"tenant_id": tenant_id, "language_code": language_code, "commands": cmds}
-    except Exception as e: raise HTTPException(500, str(e))
-    finally: release_conn(conn)
-
 @app.get("/pricing-rules")
 async def list_pricing_rules(tenant_id: int=1):
     conn = get_db_conn()
@@ -12738,171 +3544,39 @@ async def create_pricing_rule(data: dict):
 
 # ========== WHATSAPP CLOUD API ==========
 
-def translate_customer_message(message: str, target_language: str = "en") -> str:
-    source_text = (message or "").strip()
-    if not source_text:
-        return ""
-    normalized_target_language = normalize_language_code(target_language, default="en")
-    translated = source_text
+def wa_send_message(to_phone: str, message: str):
+    """Send WhatsApp message via Cloud API. Auto-translates to English."""
+    if not WA_TOKEN or not WA_PHONE_ID:
+        return {"error": "WhatsApp not configured"}
+    # Auto-translate to English using GPT
+    translated = message
     if ai_client:
         try:
-            target_label = {
-                "en": "English",
-                "cs": "Czech",
-                "pl": "Polish",
-            }.get(normalized_target_language, "English")
-            translation = ai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            f"Translate the following customer message to {target_label}. "
-                            f"Return ONLY the translated message, nothing else. "
-                            f"Preserve meaning and tone. If already in {target_label}, return it as-is."
-                        ),
-                    },
-                    {"role": "user", "content": source_text},
-                ],
-                max_tokens=500,
-            )
-            candidate = (translation.choices[0].message.content or "").strip()
-            if candidate:
-                translated = candidate
-        except Exception:
-            translated = source_text
-    return translated
-
-def wa_send_message(to_phone: str, message: str, target_language: str = "en"):
-    """Send WhatsApp message via configured provider. By default translates to customer language."""
-    provider = get_whatsapp_provider()
-    if provider == "none":
-        return {
-            "error": "WhatsApp not configured",
-            "config_error": True,
-            "missing": {
-                "WHATSAPP_ACCESS_TOKEN": not bool(WA_TOKEN),
-                "WHATSAPP_PHONE_NUMBER_ID": not bool(WA_PHONE_ID),
-                "TWILIO_ACCOUNT_SID": not bool(TWILIO_ACCOUNT_SID),
-                "TWILIO_AUTH_TOKEN": not bool(TWILIO_AUTH_TOKEN),
-                "TWILIO_WHATSAPP_FROM": not bool(TWILIO_WHATSAPP_FROM),
-            },
-        }
-    normalized_phone = normalize_whatsapp_phone(to_phone)
-    if len(normalized_phone) < 8:
-        return {
-            "error": "Invalid WhatsApp phone number",
-            "meta_status": 400,
-            "detail": f"Phone '{to_phone}' could not be normalized to a valid international number.",
-        }
-
-    normalized_target_language = normalize_language_code(target_language, default="en")
-    translated = translate_customer_message(message, normalized_target_language)
-    if provider == "twilio":
-        sender = TWILIO_WHATSAPP_FROM.strip()
-        if not sender.startswith("whatsapp:"):
-            sender = f"whatsapp:{sender}"
-        form = urlencode({
-            "To": f"whatsapp:+{normalized_phone}",
-            "From": sender,
-            "Body": translated,
-        }).encode("utf-8")
-        basic_auth = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")).decode("ascii")
-        req = urllib.request.Request(
-            get_twilio_messages_api_url(),
-            data=form,
-            method="POST",
-            headers={
-                "Authorization": f"Basic {basic_auth}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-        )
-        try:
-            with urllib.request.urlopen(req) as resp:
-                result = json.loads(resp.read().decode())
-                result["translated_text"] = translated
-                result["original_text"] = message
-                result["target_language"] = normalized_target_language
-                result["normalized_phone"] = normalized_phone
-                result["provider"] = "twilio"
-                return result
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            twilio_error = None
-            try:
-                twilio_error = json.loads(body)
-            except Exception:
-                twilio_error = None
-            human_error = "Twilio WhatsApp request failed"
-            if e.code == 401:
-                human_error = "Twilio authorization failed"
-            elif e.code == 403:
-                human_error = "Twilio access forbidden"
-            elif e.code == 400 and isinstance(twilio_error, dict):
-                human_error = f"Twilio rejected the request: {twilio_error.get('message') or 'invalid request'}"
-            return {
-                "error": human_error,
-                "meta_status": e.code,
-                "detail": body,
-                "meta_error": twilio_error,
-                "provider": "twilio",
-                "config_hint": "Check Railway env vars TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM." if e.code in (400, 401, 403) else None,
-            }
-        except Exception as e:
-            return {"error": str(e), "provider": "twilio"}
-
+            tr = ai_client.chat.completions.create(model="gpt-4o-mini", messages=[
+                {"role":"system","content":"Translate the following message to English. Return ONLY the translation, nothing else. If already in English, return as-is."},
+                {"role":"user","content":message}
+            ], max_tokens=500)
+            translated = tr.choices[0].message.content.strip()
+        except: translated = message
     payload = json.dumps({
         "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": normalized_phone,
+        "to": to_phone.replace("+","").replace(" ",""),
         "type": "text",
         "text": {"body": translated}
     }).encode("utf-8")
-    print(f"DEBUG WA: Sending to Meta API: {get_wa_api_url()}")
-    print(f"DEBUG WA: Payload: {payload.decode()}")
-    req = urllib.request.Request(get_wa_api_url(), data=payload, method="POST",
+    req = urllib.request.Request(WA_API_URL, data=payload, method="POST",
         headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read().decode())
-            print(f"DEBUG WA: Meta API Success: {result}")
             result["translated_text"] = translated
             result["original_text"] = message
-            result["target_language"] = normalized_target_language
-            result["normalized_phone"] = normalized_phone
             return result
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        print(f"DEBUG WA: Meta API HTTP Error {e.code}: {body}")
-        meta_error = None
-        try:
-            meta_error = json.loads(body)
-        except Exception:
-            meta_error = None
-        human_error = "Meta WhatsApp request failed"
-        if e.code == 401:
-            human_error = "WhatsApp token (WHATSAPP_ACCESS_TOKEN) is invalid or expired."
-        elif e.code == 403:
-            human_error = "Permission denied. Check if the token has 'whatsapp_business_messaging' scope."
-        elif e.code == 404:
-            human_error = "Endpoint not found. Check WHATSAPP_PHONE_NUMBER_ID."
-        elif e.code == 400 and isinstance(meta_error, dict):
-            err = meta_error.get("error", {})
-            msg = err.get("message") or "Unknown Meta error"
-            human_error = f"WhatsApp Cloud API error: {msg}"
-            if "24-hour window" in msg or err.get("code") == 131047:
-                human_error = "Cannot send free-text message. The 24-hour conversation window has closed. You must wait for the customer to message you first or use a Template."
-        return {
-            "error": human_error,
-            "meta_status": e.code,
-            "detail": body,
-            "meta_error": meta_error,
-            "provider": "meta",
-            "config_hint": "Check Railway env vars WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID." if e.code in (400, 401, 403, 404) else None,
-        }
+        return {"error": f"WhatsApp API {e.code}", "detail": body}
     except Exception as e:
-        print(f"DEBUG WA: Meta API Exception: {e}")
-        return {"error": str(e), "provider": "meta"}
+        return {"error": str(e)}
 
 def wa_find_client_by_phone(conn, phone: str):
     """Find CRM client by phone number"""
@@ -12945,7 +3619,7 @@ async def wa_incoming(request: Request):
                                 if contact.get("wa_id") == sender:
                                     profile = contact.get("profile", {})
                                     wa_name = profile.get("name", "")
-                            display = clean_contact_display_name(wa_name) or f"WhatsApp +{sender}"
+                            display = wa_name or f"WhatsApp +{sender}"
                             code = f"CL-WA-{sender[-6:]}"
                             with conn.cursor() as cur:
                                 cur.execute("""INSERT INTO clients (client_code,client_type,display_name,phone_primary,source,status,tenant_id)
@@ -12957,19 +3631,9 @@ async def wa_incoming(request: Request):
                                     client_name = display
                                     log_activity(conn,"client",client_id,"auto_create",f"Klient vytvoren z WhatsApp: {display}")
                         with conn.cursor() as cur:
-                            upsert_communication_message(cur, 1, {
-                                "client_id": client_id,
-                                "comm_type": "whatsapp",
-                                "source": "whatsapp",
-                                "external_message_id": msg.get("id"),
-                                "source_phone": f"+{sender}",
-                                "phone": f"+{sender}",
-                                "subject": f"WA od {client_name or '+'+sender}",
-                                "message": text[:500],
-                                "direction": "inbound",
-                                "notes": f"Phone: +{sender}",
-                                "sent_at": msg.get("timestamp"),
-                            })
+                            cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                                VALUES (1,%s,'whatsapp',%s,%s,'inbound',%s,now())""",
+                                (client_id, f"WA od {client_name or '+'+sender}", text[:500], f"Phone: +{sender}"))
                         log_activity(conn,"communication",0,"whatsapp_in",f"WhatsApp od +{sender}: {text[:100]}")
                         conn.commit()
                     finally: release_conn(conn)
@@ -12983,1307 +3647,32 @@ async def wa_send(request: Request, data: dict):
     to = data.get("to", "")
     message = data.get("message", "")
     client_id = data.get("client_id")
-    tenant_id = get_request_tenant_id(request)
     if not to or not message:
         raise HTTPException(400, "to and message required")
-    conn = get_db_conn()
-    try:
-        tenant_config = get_tenant_config(conn, tenant_id)
-        outgoing_language = resolve_customer_language(tenant_config, data.get("language"))
-    finally:
-        release_conn(conn)
-    result = wa_send_message(to, message, outgoing_language)
+    result = wa_send_message(to, message)
     if "error" in result:
-        status_code = 500 if result.get("config_error") else (result.get("meta_status") or 502)
-        raise HTTPException(status_code, result)
+        raise HTTPException(502, result)
     conn = get_db_conn()
     try:
         translated = result.get("translated_text", message)
         with conn.cursor() as cur:
-            upsert_communication_message(cur, tenant_id, {
-                "client_id": client_id,
-                "comm_type": "whatsapp",
-                "source": "whatsapp",
-                "target_phone": to,
-                "phone": to,
-                "subject": "WA zpráva",
-                "message": translated[:500],
-                "direction": "outbound",
-                "notes": f"To: {to} | Original: {message[:200]} | Language: {outgoing_language}",
-            })
-        log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to} ({outgoing_language}): {translated[:100]}", tenant_id=tenant_id)
+            cur.execute("""INSERT INTO communications (tenant_id,client_id,comm_type,subject,message_summary,direction,notes,sent_at)
+                VALUES (1,%s,'whatsapp','WA zpráva',%s,'outbound',%s,now())""",
+                (client_id, translated[:500], f"To: {to} | Original: {message[:200]}"))
+        log_activity(conn,"communication",0,"whatsapp_out",f"WhatsApp na {to}: {translated[:100]}")
         conn.commit()
     finally: release_conn(conn)
-    return {"status": "sent", "translated": translated, "original": message, "language": outgoing_language}
+    return {"status": "sent", "translated": translated, "original": message}
 
 @app.get("/whatsapp/status")
 async def wa_status():
-    return {
-        "configured": get_whatsapp_provider() != "none",
-        "provider": get_whatsapp_provider(),
-        "phone_id": WA_PHONE_ID[:6]+"..." if WA_PHONE_ID else None,
-        "business_account_id": WA_ACCOUNT_ID[:6]+"..." if WA_ACCOUNT_ID else None,
-        "token_present": bool(WA_TOKEN),
-        "twilio_account_sid": TWILIO_ACCOUNT_SID[:6]+"..." if TWILIO_ACCOUNT_SID else None,
-        "twilio_sender": TWILIO_WHATSAPP_FROM or None,
-    }
-
-# ========== TOOL PACKAGE SYSTEM ==========
-
-def _tool_db_conn():
-    """Return a psycopg2 RealDictCursor connection for tool operations."""
-    import psycopg2
-    import psycopg2.extras
-    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL not configured")
-    conn = psycopg2.connect(db_url, cursor_factory=psycopg2.extras.RealDictCursor)
-    conn.autocommit = False
-    return conn
-
-
-@app.get("/tools/packages")
-async def list_tool_packages(
-    tenant_id: int = 1,
-    install_status: str = None,
-    request: Request = None,
-):
-    """
-    List all tools registered for a tenant with their install status.
-    Optional filter: ?install_status=enabled
-    """
-    conn = _tool_db_conn()
-    try:
-        query = """
-            SELECT tr.tool_id, tr.tool_name, tr.description, tr.version,
-                   tr.author, tr.risk_level, tr.install_status,
-                   tr.installed_at, tr.updated_at,
-                   (
-                       SELECT COUNT(*) FROM crm.tool_config_slots tcs
-                        WHERE tcs.tool_id = tr.tool_id AND tcs.required = TRUE
-                   ) AS required_slot_count,
-                   (
-                       SELECT COUNT(*) FROM crm.tenant_tool_secret tts
-                        WHERE tts.tenant_id = tr.tenant_id
-                          AND tts.tool_id = tr.tool_id
-                          AND tts.is_active = TRUE
-                   ) AS secret_slots_filled
-              FROM crm.tool_registry tr
-             WHERE tr.tenant_id = %s
-        """
-        params = [tenant_id]
-        if install_status:
-            query += " AND tr.install_status = %s"
-            params.append(install_status)
-        query += " ORDER BY tr.tool_name"
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            tools = [dict(r) for r in cur.fetchall()]
-        for t in tools:
-            for k in ("installed_at", "updated_at"):
-                if t.get(k):
-                    t[k] = t[k].isoformat()
-        return {"tenant_id": tenant_id, "tools": tools, "count": len(tools)}
-    finally:
-        conn.close()
-
-
-@app.get("/tools/hub-tiles")
-async def get_tool_hub_tiles(tenant_id: int = 1, request: Request = None):
-    """
-    Return the tool hub tiles for a tenant from crm.tool_hub_tiles.
-    Used by Android ToolsHubScreen to dynamically show installed plugin tiles.
-    """
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT tile_key, tile_title_en, tile_title_cs, tile_title_pl,
-                          tile_hint_en, tile_hint_cs, tile_hint_pl,
-                          icon, sort_order
-                     FROM crm.tool_hub_tiles
-                    WHERE tenant_id = %s AND is_active = TRUE
-                    ORDER BY sort_order, tile_title_en""",
-                (tenant_id,)
-            )
-            tiles = [dict(r) for r in cur.fetchall()]
-        return {"tenant_id": tenant_id, "tiles": tiles, "count": len(tiles)}
-    except Exception as e:
-        return {"tenant_id": tenant_id, "tiles": [], "count": 0, "error": str(e)}
-    finally:
-        release_conn(conn)
-
-
-@app.post("/tools/install")
-async def install_tool_endpoint(request: Request):
-    """
-    Install a tool package from a .zip upload.
-    Multipart form fields: file (required), tenant_id, slot_values (JSON), skip_test, force.
-    """
-    import tempfile as _tmp2
-    from tool_installer import install_tool as _install_tool
-    from tool_installer import InstallError, ManifestError, ChecksumError, CompatibilityError
-
-    form = await request.form()
-    file = form.get("file")
-    if not file:
-        raise HTTPException(status_code=400, detail="'file' field is required")
-
-    tenant_id   = int(form.get("tenant_id", 1))
-    skip_test   = str(form.get("skip_test", "false")).lower() == "true"
-    force       = str(form.get("force", "false")).lower() == "true"
-    slot_values = {}
-    sv_raw = form.get("slot_values")
-    if sv_raw:
-        try:
-            slot_values = json.loads(sv_raw)
-        except Exception:
-            raise HTTPException(status_code=400, detail="slot_values must be valid JSON")
-
-    import os as _os2
-    with _tmp2.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-
-    conn = _tool_db_conn()
-    try:
-        result = _install_tool(
-            conn, zip_path=tmp_path, tenant_id=tenant_id,
-            slot_values=slot_values, skip_connection_test=skip_test, force_reinstall=force,
-        )
-        conn.commit()
-        return result
-    except (InstallError, ManifestError, ChecksumError, CompatibilityError) as e:
-        conn.rollback()
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Install error: {e}")
-    finally:
-        conn.close()
-        try:
-            _os2.unlink(tmp_path)
-        except Exception:
-            pass
-
-
-@app.post("/tools/export")
-async def export_tool_endpoint(data: dict, request: Request):
-    """
-    Export an installed tool to a downloadable .zip package.
-    Body: {tool_id, tenant_id, export_mode}
-    """
-    from fastapi.responses import FileResponse
-    from tool_exporter import export_tool as _export_tool
-    import tempfile as _tmp3, os as _os3
-
-    tool_id     = data.get("tool_id")
-    tenant_id   = int(data.get("tenant_id", 1))
-    export_mode = data.get("export_mode", "empty_slots")
-
-    if not tool_id:
-        raise HTTPException(status_code=400, detail="'tool_id' is required")
-
-    output_dir = _os3.path.join(_tmp3.gettempdir(), "tool_exports")
-    _os3.makedirs(output_dir, exist_ok=True)
-
-    conn = _tool_db_conn()
-    try:
-        result = _export_tool(conn, tool_id=tool_id, tenant_id=tenant_id,
-                               output_dir=output_dir, export_mode=export_mode)
-        conn.commit()
-    except ValueError as e:
-        conn.rollback()
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Export error: {e}")
-    finally:
-        conn.close()
-
-    pkg_path = result["package_path"]
-    filename = _os3.path.basename(pkg_path)
-    return FileResponse(
-        pkg_path, media_type="application/zip", filename=filename,
-        headers={
-            "X-Tool-Id":          tool_id,
-            "X-Tool-Version":     result["version"],
-            "X-Export-Mode":      export_mode,
-            "X-Package-Checksum": result["checksum"],
-        },
-    )
-
-
-@app.put("/tools/{tool_id}/config/{slot_name}")
-async def update_tool_config_slot(
-    tool_id: str,
-    slot_name: str,
-    data: dict,
-    request: Request,
-):
-    """
-    Set or update a single config/secret slot. Re-runs connection tests if all slots filled.
-    Body: {value, tenant_id, run_test}
-    """
-    from tool_installer import update_tool_slot as _update_slot
-    from tool_installer import InstallError
-
-    value     = data.get("value")
-    tenant_id = int(data.get("tenant_id", 1))
-    run_test  = bool(data.get("run_test", True))
-
-    if value is None:
-        raise HTTPException(status_code=400, detail="'value' is required")
-
-    conn = _tool_db_conn()
-    try:
-        result = _update_slot(conn, tool_id=tool_id, tenant_id=tenant_id,
-                               slot_name=slot_name, plain_value=value,
-                               run_connection_test=run_test)
-        conn.commit()
-        return result
-    except InstallError as e:
-        conn.rollback()
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Slot update error: {e}")
-    finally:
-        conn.close()
-
-
-@app.post("/tools/{tool_id}/test-connection")
-async def test_tool_connection(
-    tool_id: str,
-    data: dict,
-    request: Request,
-):
-    """
-    Run connection tests for an installed tool.
-    Body: {tenant_id, slot_overrides}
-    """
-    from tool_connection_test import run_tool_connection_tests
-
-    tenant_id      = int(data.get("tenant_id", 1))
-    slot_overrides = data.get("slot_overrides")
-
-    conn = _tool_db_conn()
-    try:
-        result = run_tool_connection_tests(tool_id, tenant_id, conn,
-                                            override_slot_values=slot_overrides)
-        conn.commit()
-        return result
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Connection test error: {e}")
-    finally:
-        conn.close()
-
-
-@app.delete("/tools/{tool_id}")
-async def uninstall_tool_endpoint(
-    tool_id: str,
-    data: dict,
-    request: Request,
-):
-    """
-    Uninstall a tool. DESTRUCTIVE — requires confirmation phrase.
-    Body: {tenant_id, purge_secrets, confirmation}
-    confirmation must equal: "Potvrzuji odinstalaci nastroje: {tool_id}"
-    """
-    from tool_installer import uninstall_tool as _uninstall_tool
-
-    tenant_id     = int(data.get("tenant_id", 1))
-    purge_secrets = bool(data.get("purge_secrets", False))
-    confirmation  = data.get("confirmation", "")
-    required_phrase = f"Potvrzuji odinstalaci nastroje: {tool_id}"
-
-    if confirmation != required_phrase:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Confirmation phrase required. Send confirmation='{required_phrase}'"
-        )
-
-    conn = _tool_db_conn()
-    try:
-        result = _uninstall_tool(conn, tool_id=tool_id, tenant_id=tenant_id,
-                                  purge_secrets=purge_secrets)
-        conn.commit()
-        return result
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Uninstall error: {e}")
-    finally:
-        conn.close()
-
-
-
-
-@app.get("/tools/{tool_id}/slots")
-async def get_tool_slots(
-    tool_id: str,
-    tenant_id: int = 1,
-    request: Request = None,
-):
-    """
-    Return config slots for a tool with fill status (no secret values).
-    """
-    conn = _tool_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT tcs.slot_name, tcs.display_name, tcs.description,
-                       tcs.slot_type, tcs.is_secret, tcs.required,
-                       tcs.default_value, tcs.sort_order,
-                       CASE WHEN tts.id IS NOT NULL AND tts.is_active THEN TRUE ELSE FALSE END AS is_filled
-                  FROM crm.tool_config_slots tcs
-                  LEFT JOIN crm.tenant_tool_secret tts
-                         ON tts.tool_id = tcs.tool_id
-                        AND tts.slot_name = tcs.slot_name
-                        AND tts.tenant_id = %s
-                        AND tts.is_active = TRUE
-                 WHERE tcs.tool_id = %s
-                 ORDER BY tcs.sort_order, tcs.slot_name
-            """, [tenant_id, tool_id])
-            slots = [dict(r) for r in cur.fetchall()]
-        return {"tool_id": tool_id, "tenant_id": tenant_id, "slots": slots}
-    finally:
-        conn.close()
-
-
-# ========== IMPORT SYSTEM ==========
-
-class _ImportSessionCreate(BaseModel):
-    source_type: str
-    target_table: str
-    import_mode: str = "semi_automatic"
-    session_name: str = ""
-    source_config: dict = {}
-    options: dict = {}
-
-class _ImportMappingItem(BaseModel):
-    source_column: str
-    target_field: Optional[str] = None
-    transform_type: str = "direct"
-    transform_config_json: dict = {}
-    required: bool = False
-    default_value: Optional[str] = None
-    sort_order: int = 0
-
-class _ImportMappingsSave(BaseModel):
-    mappings: List[_ImportMappingItem]
-
-class _ImportApproveRequest(BaseModel):
-    confirmation: str  # must equal "Potvrzuji import dat do {target_table}"
-
-def _import_db_conn():
-    import psycopg2
-    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
-    if not db_url:
-        raise HTTPException(status_code=500, detail="DATABASE_URL not set")
-    return psycopg2.connect(db_url)
-
-
-@app.get("/import/sessions")
-async def import_list_sessions(
-    status: Optional[str] = None,
-    target_table: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-    tenant_id: int = 1,
-):
-    """List import sessions for a tenant."""
-    from data_importer import list_sessions as _list_sessions
-    conn = _import_db_conn()
-    try:
-        return _list_sessions(conn, tenant_id=tenant_id, status=status,
-                               target_table=target_table, limit=limit, offset=offset)
-    finally:
-        conn.close()
-
-
-@app.post("/import/sessions")
-async def import_create_session(body: _ImportSessionCreate, tenant_id: int = 1,
-                                 user_id: Optional[int] = None):
-    """Create a new import session."""
-    from data_importer import create_session as _create_session
-    conn = _import_db_conn()
-    try:
-        session = _create_session(
-            conn,
-            tenant_id=tenant_id,
-            source_type=body.source_type,
-            target_table=body.target_table,
-            import_mode=body.import_mode,
-            session_name=body.session_name,
-            source_config=body.source_config,
-            options=body.options,
-            created_by=user_id,
-        )
-        conn.commit()
-        return session
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        conn.close()
-
-
-@app.get("/import/sessions/{session_id}")
-async def import_get_session(session_id: str, tenant_id: int = 1):
-    """Get a single import session by ID."""
-    from data_importer import _get_session
-    conn = _import_db_conn()
-    try:
-        return _get_session(conn, session_id=session_id, tenant_id=tenant_id)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    finally:
-        conn.close()
-
-
-@app.post("/import/sessions/{session_id}/upload")
-async def import_upload_file(
-    session_id: str,
-    file: UploadFile,
-    tenant_id: int = 1,
-    user_id: Optional[int] = None,
-):
-    """Upload and parse a source file (CSV, Excel, JSON). Loads raw rows into import_staging."""
-    from data_importer import upload_and_parse as _upload_and_parse, ParseError
-    conn = _import_db_conn()
-    try:
-        data = await file.read()
-        session = _upload_and_parse(
-            conn,
-            session_id=session_id,
-            tenant_id=tenant_id,
-            file_data=data,
-            filename=file.filename or "upload",
-            actor_user_id=user_id,
-        )
-        return session
-    except ParseError as e:
-        conn.rollback()
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-
-@app.put("/import/sessions/{session_id}/mappings")
-async def import_save_mappings(
-    session_id: str,
-    body: _ImportMappingsSave,
-    tenant_id: int = 1,
-    user_id: Optional[int] = None,
-):
-    """Save field mappings and re-apply transforms to all staging rows."""
-    from data_importer import save_mappings as _save_mappings, MappingError
-    conn = _import_db_conn()
-    try:
-        session = _save_mappings(
-            conn,
-            session_id=session_id,
-            tenant_id=tenant_id,
-            mappings=[m.dict() for m in body.mappings],
-            actor_user_id=user_id,
-        )
-        return session
-    except MappingError as e:
-        conn.rollback()
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-
-@app.post("/import/sessions/{session_id}/validate")
-async def import_validate(
-    session_id: str,
-    tenant_id: int = 1,
-    user_id: Optional[int] = None,
-):
-    """Run validation on all staged rows and set session to preview_ready."""
-    from data_importer import validate as _validate
-    conn = _import_db_conn()
-    try:
-        session = _validate(conn, session_id=session_id, tenant_id=tenant_id,
-                             actor_user_id=user_id)
-        return session
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-
-@app.get("/import/sessions/{session_id}/preview")
-async def import_preview(
-    session_id: str,
-    tenant_id: int = 1,
-    page: int = 1,
-    page_size: int = 50,
-    filter_status: Optional[str] = None,
-):
-    """Return a paginated preview of staging rows."""
-    from data_importer import get_preview as _get_preview
-    conn = _import_db_conn()
-    try:
-        return _get_preview(conn, session_id=session_id, tenant_id=tenant_id,
-                             page=page, page_size=page_size, filter_status=filter_status)
-    finally:
-        conn.close()
-
-
-@app.post("/import/sessions/{session_id}/approve")
-async def import_approve(
-    session_id: str,
-    body: _ImportApproveRequest,
-    tenant_id: int = 1,
-    user_id: Optional[int] = None,
-):
-    """Approve a previewed import. Requires: confirmation='Potvrzuji import dat do {target_table}'"""
-    from data_importer import approve as _approve, _get_session
-    conn = _import_db_conn()
-    try:
-        session = _get_session(conn, session_id=session_id, tenant_id=tenant_id)
-        expected = f"Potvrzuji import dat do {session['target_table']}"
-        if body.confirmation != expected:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Confirmation phrase mismatch. Expected: \"{expected}\"",
-            )
-        result = _approve(conn, session_id=session_id, tenant_id=tenant_id,
-                           actor_user_id=user_id)
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-
-@app.post("/import/sessions/{session_id}/apply")
-async def import_apply(
-    session_id: str,
-    tenant_id: int = 1,
-    user_id: Optional[int] = None,
-):
-    """Apply an approved import session to production tables. Only valid rows are written."""
-    from data_importer import apply_import as _apply_import, ApplyError
-    conn = _import_db_conn()
-    try:
-        session = _apply_import(conn, session_id=session_id, tenant_id=tenant_id,
-                                 actor_user_id=user_id)
-        return session
-    except ApplyError as e:
-        conn.rollback()
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-
-@app.post("/import/sessions/{session_id}/rollback")
-async def import_rollback(
-    session_id: str,
-    tenant_id: int = 1,
-    user_id: Optional[int] = None,
-):
-    """Rollback a completed or partially-failed import. Deletes all inserted production rows."""
-    from data_importer import rollback_import as _rollback_import, RollbackError
-    conn = _import_db_conn()
-    try:
-        session = _rollback_import(conn, session_id=session_id, tenant_id=tenant_id,
-                                    actor_user_id=user_id)
-        return session
-    except RollbackError as e:
-        conn.rollback()
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-
-@app.get("/import/sessions/{session_id}/audit")
-async def import_audit_log(
-    session_id: str,
-    tenant_id: int = 1,
-    limit: int = 100,
-):
-    """Return the full audit log for an import session."""
-    from data_importer import get_audit_log as _get_audit_log
-    conn = _import_db_conn()
-    try:
-        return _get_audit_log(conn, session_id=session_id, tenant_id=tenant_id, limit=limit)
-    finally:
-        conn.close()
-
-
-# ========== ACTIONS ==========
-
-
-# ========== ACTIONS ==========
-
-class ExecuteActionRequest(BaseModel):
-    action_code: str
-    args: dict = {}
-    tenant_id: int = 1
-    source: str = "api"
-    session_id: Optional[str] = None
-    lang: str = "en"
-    confirmed: bool = False
-    confirmation_token: Optional[str] = None
-
-@app.post("/actions/execute")
-async def api_execute_action(
-    req: ExecuteActionRequest,
-    user_id: int = Query(default=1),
-    conn=Depends(get_db),
-):
-    """Universal action executor. Manual UI, voice, API and automation all call this."""
-    result = await execute_action(
-        action_code=req.action_code,
-        args=req.args,
-        conn=conn,
-        tenant_id=req.tenant_id,
-        user_id=user_id,
-        source=req.source,
-        session_id=req.session_id,
-        lang=req.lang,
-        confirmed=req.confirmed,
-        confirmation_token=req.confirmation_token,
-    )
-    return {
-        "ok": result.ok,
-        "reply": result.reply,
-        "action_type": result.action_type,
-        "action_data": result.action_data,
-        "requires_confirmation": result.requires_confirmation,
-        "confirmation_token": result.confirmation_token,
-        "error": result.error,
-    }
-
-@app.get("/actions/registered")
-async def api_get_registered_actions():
-    return {"actions": get_registered_actions()}
-
-
-# ========== VOICE RESOLVE ==========
-
-class VoiceResolveRequest(BaseModel):
-    text: str
-    tenant_id: int = 1
-    user_id: int = 1
-    lang: str = "en"
-    session_id: Optional[str] = None
-
-@app.post("/voice/resolve")
-async def api_voice_resolve(req: VoiceResolveRequest, conn=Depends(get_db)):
-    """
-    Resolve a voice utterance to control_code + action_code.
-    Resolution order: screen context -> exact synonym -> entity alias
-    -> embedding -> AI -> clarification.
-    Does NOT execute the action.
-    """
-    openai_key = os.getenv("OPENAI_API_KEY")
-    result = resolve_voice_command(
-        text=req.text,
-        conn=conn,
-        tenant_id=req.tenant_id,
-        user_id=req.user_id,
-        lang=req.lang,
-        session_id=req.session_id,
-        openai_api_key=openai_key,
-    )
-    return {
-        "resolved": result.resolved,
-        "control_code": result.control_code,
-        "action_code": result.action_code,
-        "confidence": result.confidence,
-        "resolution_method": result.resolution_method,
-        "requires_clarification": result.requires_clarification,
-        "clarification_question": result.clarification_question,
-        "candidates": result.candidates,
-        "args": result.args,
-        "risk_level": result.risk_level,
-        "error": result.error,
-    }
-
-class VoiceContextRequest(BaseModel):
-    tenant_id: int = 1
-    user_id: int = 1
-    screen_code: Optional[str] = None
-    module_name: Optional[str] = None
-    entity_type: Optional[str] = None
-    entity_id: Optional[str] = None
-    session_id: Optional[str] = None
-    extra: Optional[dict] = None
-
-@app.post("/voice/context")
-async def api_update_voice_context(req: VoiceContextRequest, conn=Depends(get_db)):
-    """Called by Android whenever user changes screen or selects an entity."""
-    update_voice_context(
-        conn=conn,
-        tenant_id=req.tenant_id,
-        user_id=req.user_id,
-        screen_code=req.screen_code,
-        module_name=req.module_name,
-        entity_type=req.entity_type,
-        entity_id=req.entity_id,
-        session_id=req.session_id,
-        extra=req.extra or {},
-    )
-    return {"ok": True}
-
-
-# ========== UI CONTROLS ==========
-
-@app.get("/ui/controls")
-async def api_get_screen_controls(
-    screen_code: str,
-    tenant_id: int = Query(default=1),
-    lang: str = Query(default="en"),
-    conn=Depends(get_db),
-):
-    """Returns all voice-enabled controls for a given screen."""
-    controls = get_screen_controls(conn, tenant_id, screen_code, lang)
-    return {
-        "screen_code": screen_code,
-        "lang": lang,
-        "controls": [
-            {
-                "control_code": c.control_code,
-                "label": c.label,
-                "action_code": c.action_code,
-                "risk_level": c.risk_level,
-                "voice_enabled": c.voice_enabled,
-                "example_phrases": c.example_phrases,
-                "short_help": c.short_help,
-            }
-            for c in controls
-        ],
-        "count": len(controls),
-    }
-
-@app.get("/ui/controls/registry")
-async def api_get_controls_registry(
-    tenant_id: int = Query(default=1),
-    module_name: Optional[str] = Query(default=None),
-    screen_code: Optional[str] = Query(default=None),
-    conn=Depends(get_db),
-):
-    """Return raw ui_control_registry rows for admin/debug."""
-    with conn.cursor() as cur:
-        filters = ["tenant_id IN (%s, 0)"]
-        params: list = [tenant_id]
-        if module_name:
-            filters.append("module_name = %s")
-            params.append(module_name)
-        if screen_code:
-            filters.append("screen_code = %s")
-            params.append(screen_code)
-        where = " AND ".join(filters)
-        cur.execute(
-            f"""SELECT control_code, screen_code, module_name, control_type,
-                       label, action_code, risk_level, voice_enabled, enabled
-                  FROM crm.ui_control_registry
-                 WHERE {where}
-                 ORDER BY tenant_id DESC, screen_code, sort_order""",
-            params,
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    return {"controls": rows, "count": len(rows)}
-
-
-# ========== SYNONYM MANAGEMENT ==========
-
-class SynonymApproveRequest(BaseModel):
-    suggestion_id: str
-    tenant_id: int = 1
-    user_id: int = 1
-
-@app.post("/synonyms/approve")
-async def api_approve_synonym(req: SynonymApproveRequest, conn=Depends(get_db)):
-    """Approve an AI-suggested synonym from the review queue."""
-    ok = approve_synonym(conn, req.tenant_id, req.suggestion_id, req.user_id)
-    return {"ok": ok}
-
-@app.post("/synonyms/reject")
-async def api_reject_synonym(
-    suggestion_id: str = Body(...),
-    tenant_id: int = Body(default=1),
-    user_id: int = Body(default=1),
-    note: Optional[str] = Body(default=None),
-    conn=Depends(get_db),
-):
-    """Reject an AI-suggested synonym."""
-    ok = reject_synonym(conn, tenant_id, suggestion_id, user_id, note)
-    return {"ok": ok}
-
-@app.get("/synonyms/pending")
-async def api_get_pending_synonyms(
-    tenant_id: int = Query(default=1),
-    target_code: Optional[str] = Query(default=None),
-    limit: int = Query(default=50),
-    conn=Depends(get_db),
-):
-    """Get AI suggestions waiting for admin review."""
-    with conn.cursor() as cur:
-        params: list = [tenant_id]
-        extra = ""
-        if target_code:
-            extra = "AND target_code = %s"
-            params.append(target_code)
-        params.append(limit)
-        cur.execute(
-            f"""SELECT id, suggestion_type, target_type, target_code,
-                       language_code, suggested_value, reason, confidence, created_at
-                  FROM crm.ai_suggestion_review_queue
-                 WHERE tenant_id = %s AND status = 'pending'
-                       {extra}
-                 ORDER BY created_at DESC
-                 LIMIT %s""",
-            params,
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    return {"suggestions": rows, "count": len(rows)}
-
-class GenerateSynonymsRequest(BaseModel):
-    control_code: str
-    tenant_id: int = 1
-    user_id: int = 1
-    language_codes: list = ["en", "cs", "pl"]
-
-@app.post("/synonyms/generate")
-async def api_generate_synonyms(req: GenerateSynonymsRequest, conn=Depends(get_db)):
-    """Queue AI synonym generation for a UI control. Drafts require admin approval."""
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
-    job_id = generate_synonyms_for_control(
-        conn=conn,
-        tenant_id=req.tenant_id,
-        control_code=req.control_code,
-        language_codes=req.language_codes,
-        openai_api_key=openai_key,
-        user_id=req.user_id,
-    )
-    return {"ok": bool(job_id), "job_id": job_id}
-
-@app.post("/synonyms/embed")
-async def api_generate_embeddings(
-    control_code: str = Body(...),
-    tenant_id: int = Body(default=1),
-    conn=Depends(get_db),
-):
-    """Generate/refresh semantic embeddings for a control's synonyms."""
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
-    count = generate_embeddings_for_control(conn, tenant_id, control_code, openai_key)
-    return {"ok": True, "embeddings_created": count}
-
-
-
-# ========== CONTACT VOICE ALIASES ==========
-
-@app.get("/contacts/{contact_id}/aliases")
-async def api_get_contact_aliases(
-    contact_id: int,
-    tenant_id: int = Query(default=1),
-    conn=Depends(get_db),
-):
-    """Return all voice aliases for a contact."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """SELECT id, alias_text, alias_type, language_code,
-                      confidence, source, is_active, created_at
-                 FROM crm.contact_voice_aliases
-                WHERE tenant_id = %s AND contact_id = %s
-                ORDER BY confidence DESC, created_at DESC""",
-            (tenant_id, contact_id),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    return {"contact_id": contact_id, "aliases": rows, "count": len(rows)}
-
-
-class AliasAddRequest(BaseModel):
-    alias_text: str
-    alias_type: str = "user_defined"
-    language_code: Optional[str] = None
-    tenant_id: int = 1
-    contact_id: int
-
-
-@app.post("/contacts/aliases/add")
-async def api_add_contact_alias(req: AliasAddRequest, conn=Depends(get_db)):
-    """Manually add a voice alias for a contact (admin)."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO crm.contact_voice_aliases
-                       (tenant_id, contact_id, language_code, alias_text,
-                        alias_type, source, confidence)
-                   VALUES (%s, %s, %s, %s, %s, 'admin_manual', 1.0)
-                   ON CONFLICT (tenant_id, contact_id, alias_text)
-                   DO UPDATE SET is_active = TRUE, alias_type = EXCLUDED.alias_type,
-                                 updated_at = now()
-                   RETURNING id""",
-                (req.tenant_id, req.contact_id, req.language_code,
-                 req.alias_text.lower().strip(), req.alias_type),
-            )
-            row = cur.fetchone()
-        conn.commit()
-        return {"ok": True, "id": str(row[0]) if row else None}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/contacts/aliases/{alias_id}")
-async def api_delete_contact_alias(
-    alias_id: str,
-    tenant_id: int = Query(default=1),
-    conn=Depends(get_db),
-):
-    """Disable a contact alias."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """UPDATE crm.contact_voice_aliases
-                  SET is_active = FALSE, updated_at = now()
-                WHERE id = %s AND tenant_id = %s""",
-            (alias_id, tenant_id),
-        )
-    conn.commit()
-    return {"ok": True}
-
-
-class AliasLearnRequest(BaseModel):
-    contact_id: int
-    alias_text: str
-    alias_type: str = "learned_from_voice"
-    language_code: Optional[str] = None
-    tenant_id: int = 1
-    user_id: int = 1
-    voice_session_id: Optional[str] = None
-    raw_text: Optional[str] = None
-    candidates: Optional[list] = None
-
-
-@app.post("/contacts/aliases/learn")
-async def api_learn_contact_alias(req: AliasLearnRequest, conn=Depends(get_db)):
-    """
-    Called after voice disambiguation: user confirmed which contact they meant.
-    Saves a learned_from_voice alias so next time resolves immediately.
-    """
-    ok = learn_contact_alias(
-        conn=conn,
-        tenant_id=req.tenant_id,
-        contact_id=req.contact_id,
-        alias_text=req.alias_text,
-        alias_type=req.alias_type,
-        language_code=req.language_code,
-        voice_session_id=req.voice_session_id,
-        user_id=req.user_id,
-        raw_text=req.raw_text,
-        candidates_json=req.candidates or [],
-    )
-    return {"ok": ok}
-
-
-@app.get("/contacts/aliases/search")
-async def api_search_contact_aliases(
-    q: str,
-    tenant_id: int = Query(default=1),
-    lang: str = Query(default="en"),
-    limit: int = Query(default=10),
-    conn=Depends(get_db),
-):
-    """
-    Search contacts by voice alias.
-    Returns candidates with disambiguation hints.
-    """
-    matches = _find_contacts_by_alias(conn, tenant_id, q, lang)
-    return {
-        "query": q,
-        "candidates": [
-            {
-                "contact_id": c["id"],
-                "display_name": c["display_name"],
-                "company_name": c.get("company_name"),
-                "matched_alias": c.get("matched_alias", q),
-                "match_confidence": float(c.get("match_confidence", 0.75)),
-                "disambiguation_hint": c.get("disambiguation_hint", ""),
-                "alias_type": c.get("alias_type", ""),
-            }
-            for c in matches[:limit]
-        ],
-        "count": len(matches[:limit]),
-    }
-
+    return {"configured": bool(WA_TOKEN and WA_PHONE_ID), "phone_id": WA_PHONE_ID[:6]+"..." if WA_PHONE_ID else None}
 
 # ========== SYSTEM ==========
-# ===== ACTIVITY TEMPLATES =====
-
-@app.get("/activities/templates")
-async def get_activity_templates(
-    subtype_id: int | None = None,
-    group_id: int | None = None,
-    subtype_code: str | None = None,
-    group_code: str | None = None,
-):
-    """Return all activity templates for a given industry subtype or group."""
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            if subtype_code:
-                cur.execute("""
-                    SELECT at.id, at.code, at.name, at.default_pricing_method,
-                           at.allowed_pricing_methods, at.default_unit, at.sort_order,
-                           at.is_builtin,
-                           ig.code AS group_code, ist.code AS subtype_code
-                    FROM activity_templates at
-                    JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
-                    JOIN industry_groups ig ON ist.industry_group_id = ig.id
-                    WHERE ist.code = %s AND at.is_active = true
-                    ORDER BY at.sort_order, at.name
-                """, (subtype_code,))
-            elif subtype_id:
-                cur.execute("""
-                    SELECT at.id, at.code, at.name, at.default_pricing_method,
-                           at.allowed_pricing_methods, at.default_unit, at.sort_order,
-                           at.is_builtin,
-                           ig.code AS group_code, ist.code AS subtype_code
-                    FROM activity_templates at
-                    JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
-                    JOIN industry_groups ig ON ist.industry_group_id = ig.id
-                    WHERE at.industry_subtype_id = %s AND at.is_active = true
-                    ORDER BY at.sort_order, at.name
-                """, (subtype_id,))
-            elif group_code:
-                cur.execute("""
-                    SELECT at.id, at.code, at.name, at.default_pricing_method,
-                           at.allowed_pricing_methods, at.default_unit, at.sort_order,
-                           at.is_builtin,
-                           ig.code AS group_code,
-                           COALESCE(ist.code, '') AS subtype_code
-                    FROM activity_templates at
-                    JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
-                    JOIN industry_groups ig ON ist.industry_group_id = ig.id
-                    WHERE ig.code = %s AND at.is_active = true
-                    ORDER BY COALESCE(ist.sort_order, 0), at.sort_order, at.name
-                """, (group_code,))
-            elif group_id:
-                cur.execute("""
-                    SELECT at.id, at.code, at.name, at.default_pricing_method,
-                           at.allowed_pricing_methods, at.default_unit, at.sort_order,
-                           at.is_builtin,
-                           ig.code AS group_code,
-                           COALESCE(ist.code, '') AS subtype_code
-                    FROM activity_templates at
-                    JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
-                    JOIN industry_groups ig ON ist.industry_group_id = ig.id
-                    WHERE ig.id = %s AND at.is_active = true
-                    ORDER BY COALESCE(ist.sort_order, 0), at.sort_order, at.name
-                """, (group_id,))
-            else:
-                raise HTTPException(400, "Provide subtype_id, subtype_code, group_id or group_code")
-            return cur.fetchall()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
-@app.get("/activities/tenant/{tenant_id}")
-async def get_tenant_activity_pricing(tenant_id: int, subtype_id: int | None = None, subtype_code: str | None = None):
-    """Return tenant's activity pricing overrides, optionally filtered by subtype."""
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            if subtype_code or subtype_id:
-                filter_clause = "AND ist.code = %s" if subtype_code else "AND at.industry_subtype_id = %s"
-                filter_val = subtype_code if subtype_code else subtype_id
-                cur.execute(f"""
-                    SELECT tap.id, tap.activity_template_id AS template_id, tap.is_active,
-                           tap.pricing_method, tap.rate, tap.rate_secondary,
-                           tap.custom_name, tap.supplementary, tap.voice_aliases, tap.notes,
-                           at.code, at.name AS template_name, at.default_pricing_method,
-                           at.allowed_pricing_methods, at.default_unit,
-                           ist.code AS subtype_code
-                    FROM tenant_activity_pricing tap
-                    JOIN activity_templates at ON tap.activity_template_id = at.id
-                    LEFT JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
-                    WHERE tap.tenant_id = %s {filter_clause}
-                    ORDER BY at.sort_order
-                """, (tenant_id, filter_val))
-            else:
-                cur.execute("""
-                    SELECT tap.id, tap.activity_template_id AS template_id, tap.is_active,
-                           tap.pricing_method, tap.rate, tap.rate_secondary,
-                           tap.custom_name, tap.supplementary, tap.voice_aliases, tap.notes,
-                           at.code, at.name AS template_name, at.default_pricing_method,
-                           at.allowed_pricing_methods, at.default_unit,
-                           COALESCE(ist.code,'') AS subtype_code
-                    FROM tenant_activity_pricing tap
-                    JOIN activity_templates at ON tap.activity_template_id = at.id
-                    LEFT JOIN industry_subtypes ist ON at.industry_subtype_id = ist.id
-                    WHERE tap.tenant_id = %s
-                    ORDER BY at.sort_order
-                """, (tenant_id,))
-            return cur.fetchall()
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
-@app.put("/activities/tenant/{tenant_id}/{template_id}")
-async def upsert_tenant_activity_pricing(tenant_id: int, template_id: int, data: dict):
-    """Create or update a tenant's pricing override for one activity template."""
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            pricing_method = data.get("pricing_method")
-            rate = data.get("rate")
-            rate_secondary = data.get("rate_secondary")
-            is_active = data.get("is_active", True)
-            custom_name = data.get("custom_name")
-            supplementary = data.get("supplementary", {})
-            voice_aliases = data.get("voice_aliases", [])
-            notes = data.get("notes")
-
-            cur.execute("""
-                INSERT INTO tenant_activity_pricing
-                    (tenant_id, activity_template_id, is_active, pricing_method, rate, rate_secondary,
-                     custom_name, supplementary, voice_aliases, notes, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (tenant_id, activity_template_id) DO UPDATE SET
-                    is_active = EXCLUDED.is_active,
-                    pricing_method = EXCLUDED.pricing_method,
-                    rate = EXCLUDED.rate,
-                    rate_secondary = EXCLUDED.rate_secondary,
-                    custom_name = EXCLUDED.custom_name,
-                    supplementary = EXCLUDED.supplementary,
-                    voice_aliases = EXCLUDED.voice_aliases,
-                    notes = EXCLUDED.notes,
-                    updated_at = now()
-                RETURNING id
-            """, (tenant_id, template_id, is_active, pricing_method, rate, rate_secondary,
-                  custom_name, json.dumps(supplementary) if isinstance(supplementary, dict) else supplementary,
-                  voice_aliases, notes))
-            row = cur.fetchone()
-            conn.commit()
-            return {"ok": True, "id": row["id"]}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
-@app.delete("/activities/tenant/{tenant_id}/{template_id}")
-async def reset_tenant_activity_pricing(tenant_id: int, template_id: int):
-    """Delete tenant override — reverts to system default pricing method."""
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM tenant_activity_pricing WHERE tenant_id=%s AND activity_template_id=%s RETURNING id",
-                (tenant_id, template_id)
-            )
-            deleted = cur.fetchone()
-            conn.commit()
-            return {"ok": True, "deleted": deleted is not None}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        release_conn(conn)
-
-
 @app.get("/")
 async def root():
-    return {"service": "Secretary CRM", "status": "running"}
-
-
-# ========== TEMP ADMIN BOOTSTRAP (REMOVE AFTER USE) ==========
-@app.get("/bootstrap/users-list")
-async def admin_list_users(secret: str = ""):
-    if secret != JWT_SECRET:
-        raise HTTPException(403, "Forbidden")
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, email, display_name, role, is_active, deleted_at, tenant_id FROM crm.users ORDER BY id")
-            users = [dict(r) for r in cur.fetchall()]
-        return {"users": users, "count": len(users)}
-    finally:
-        release_conn(conn)
-
-@app.post("/bootstrap/create-user")
-async def admin_create_user(data: dict, secret: str = ""):
-    if secret != JWT_SECRET:
-        raise HTTPException(403, "Forbidden")
-    import bcrypt
-    conn = get_db_conn()
-    try:
-        email = data.get("email", "").strip().lower()
-        display_name = data.get("display_name", "")
-        role = data.get("role", "worker")
-        password = data.get("password", "")
-        tenant_id = data.get("tenant_id", 1)
-        if not email or not password:
-            raise HTTPException(400, "email and password required")
-        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO crm.users (email, display_name, role, password_hash, is_active, tenant_id, first_login)
-                VALUES (%s, %s, %s, %s, true, %s, false)
-                ON CONFLICT (email) DO UPDATE SET
-                    deleted_at = NULL, is_active = true,
-                    display_name = EXCLUDED.display_name,
-                    role = EXCLUDED.role
-                RETURNING id, email, display_name, role
-            """, (email, display_name, role, pw_hash, tenant_id))
-            conn.commit()
-            user = dict(cur.fetchone())
-        return {"created": True, "user": user}
-    finally:
-        release_conn(conn)
-
+    return {"app":"Secretary DesignLeaf","version":"1.2a","ai_configured":bool(OPENAI_API_KEY),"docs":"/docs"}
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
-
-
-# TEMPORARY — delete after use
-@app.get("/admin/reset-pw-temp-x7k2")
-async def temp_reset_pw():
-    import hashlib
-    h = hashlib.sha256(b"admin123").hexdigest()
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SET search_path TO crm, public")
-            cur.execute("SELECT id, email, display_name FROM users WHERE deleted_at IS NULL ORDER BY id")
-            users = cur.fetchall()
-            cur.execute("UPDATE users SET password_hash=%s, must_change_password=FALSE WHERE deleted_at IS NULL", (h,))
-        conn.commit()
-        return {"reset": "ok", "password": "admin123", "users_updated": len(users), "users": [dict(u) for u in users]}
-    finally:
-        release_conn(conn)
+    port = int(os.getenv("PORT",8000))
+    uvicorn.run(app,host="0.0.0.0",port=port)
