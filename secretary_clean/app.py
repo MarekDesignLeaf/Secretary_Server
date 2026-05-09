@@ -27,3 +27,5 @@ def create_app(repository: InMemorySecretaryRepository | None = None) -> FastAPI
     app.include_router(crm.router, prefix="/api/v1")
     app.include_router(voice.router, prefix="/api/v1")
     return app
+
+app = create_app()
