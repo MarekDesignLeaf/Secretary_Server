@@ -127,21 +127,28 @@ class InMemorySecretaryRepository:
             raise ValueError("First company already exists")
         if any(user.role == Role.owner for user in self.users.values()):
             raise ValueError("First admin already exists")
+        # Resolve primary industry from list or explicit override fields
+        primary = next(
+            (s for s in payload.selected_industries if s.is_primary),
+            payload.selected_industries[0] if payload.selected_industries else None,
+        )
+        industry_group = payload.primary_industry_group or (primary.industry_group if primary else None)
+        industry_subtype = payload.primary_industry_subtype or (primary.industry_subtype if primary else None)
         company = self.create_first_company(
             FirstCompanyCreate(
                 legal_name=payload.company_name,
                 trading_name=payload.company_name,
                 legal_type=payload.company_legal_type,
-                default_country=payload.country,
-                default_currency=payload.currency,
-                timezone=payload.timezone,
+                default_country=payload.country or "GB",
+                default_currency=payload.currency or "GBP",
+                timezone=payload.timezone or "Europe/London",
                 phone=payload.phone,
                 website=payload.website,
-                workspace_mode=payload.workspace_mode,
-                industry_group=payload.industry_group,
-                industry_subtype=payload.industry_subtype,
-                default_internal_language_code=payload.internal_company_language,
-                default_customer_language_code=payload.default_customer_language,
+                workspace_mode=payload.workspace_mode or "single_company",
+                industry_group=industry_group,
+                industry_subtype=industry_subtype,
+                default_internal_language_code=payload.default_internal_language_code or "en-GB",
+                default_customer_language_code=payload.default_customer_language_code or "en-GB",
             )
         )
         admin = self.create_first_admin(
@@ -149,7 +156,7 @@ class InMemorySecretaryRepository:
             email=payload.first_admin_email,
             display_name=payload.first_admin_display_name,
             password=payload.first_admin_password,
-            preferred_language_code=payload.internal_company_language,
+            preferred_language_code=payload.default_internal_language_code or "en-GB",
             first_name=payload.first_admin_first_name,
             last_name=payload.first_admin_last_name,
             phone=payload.phone,
@@ -337,14 +344,4 @@ class InMemorySecretaryRepository:
     def list_tenant_pricing(self, company_id: str) -> list[TenantActivityPricing]:
         return [item for (tenant, _), item in self.tenant_pricing.items() if tenant == company_id]
 
-    def create_crm_record(self, module: str, company_id: str, name: str, data: dict) -> CRMRecord:
-        if module not in self.crm:
-            raise KeyError("Unknown CRM module")
-        record = CRMRecord(id=str(uuid4()), company_id=company_id, name=name, data=data)
-        self.crm[module][record.id] = record
-        return record
-
-    def list_crm_records(self, module: str, company_id: str) -> list[CRMRecord]:
-        if module not in self.crm:
-            raise KeyError("Unknown CRM module")
-        return [record for record in self.crm[module].values() if record.company_id == company_id]
+    def create_crm_record(self, module: st

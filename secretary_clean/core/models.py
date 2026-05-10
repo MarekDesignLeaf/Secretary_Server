@@ -166,17 +166,27 @@ class FirstAdminCreate(BaseModel):
     phone: str | None = None
 
 
+class FirstInstallIndustrySelection(BaseModel):
+    industry_group: str
+    industry_subtype: str
+    is_primary: bool = False
+
+
 class FirstInstallCreate(BaseModel):
     company_name: str = Field(min_length=1)
     company_legal_type: str | None = None
-    country: str = "GB"
-    timezone: str = "Europe/London"
-    currency: str = "GBP"
-    internal_company_language: str = "en-GB"
-    default_customer_language: str = "en-GB"
-    workspace_mode: str = "single_company"
-    industry_group: str | None = None
-    industry_subtype: str | None = None
+    country: str | None = "GB"
+    timezone: str | None = "Europe/London"
+    currency: str | None = "GBP"
+    selected_languages: list[str] = Field(default_factory=list)
+    default_internal_language_code: str | None = "en-GB"
+    default_customer_language_code: str | None = "en-GB"
+    voice_input_language_codes: list[str] = Field(default_factory=list)
+    voice_output_language_codes: list[str] = Field(default_factory=list)
+    workspace_mode: str | None = "single_company"
+    selected_industries: list[FirstInstallIndustrySelection] = Field(default_factory=list)
+    primary_industry_group: str | None = None
+    primary_industry_subtype: str | None = None
     first_admin_display_name: str = Field(min_length=1)
     first_admin_email: str = Field(min_length=1)
     first_admin_password: str = Field(min_length=12)
@@ -294,22 +304,4 @@ class VoiceResolveRequest(BaseModel):
 class VoiceResolveResult(BaseModel):
     utterance: str
     resolved_intent: str | None
-    confidence: float
-    requires_confirmation: bool = True
-    reason: str
-    language_context: LanguageContext | None = None
-
-
-class VoiceExecuteRequest(BaseModel):
-    utterance: str
-    confirmed: bool = False
-    client_id: str | None = None
-    context: dict[str, Any] = Field(default_factory=dict)
-
-
-class VoiceExecuteResult(BaseModel):
-    executed: bool
-    resolved_intent: str | None
-    requires_confirmation: bool
-    message: str
-    language_context: LanguageContext | None = None
+    confid
