@@ -304,4 +304,21 @@ class VoiceResolveRequest(BaseModel):
 class VoiceResolveResult(BaseModel):
     utterance: str
     resolved_intent: str | None
-    confid
+    confidence: float = 0
+    requires_confirmation: bool = True
+    reason: str | None = None
+    language_context: LanguageContext | None = None
+
+
+class VoiceExecuteRequest(BaseModel):
+    utterance: str
+    client_id: str | None = None
+    confirmed: bool = False
+
+
+class VoiceExecuteResult(BaseModel):
+    executed: bool
+    resolved_intent: str | None = None
+    requires_confirmation: bool = True
+    message: str | None = None
+    language_context: LanguageContext | None = None
