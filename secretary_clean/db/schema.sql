@@ -251,16 +251,3 @@ CREATE TABLE clean_voice_command_logs (
     requires_confirmation BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
--- Password reset tokens (single-use, 30-minute expiry, stored hashed)
-CREATE TABLE password_reset_tokens (
-    id UUID PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES clean_users(id) ON DELETE CASCADE,
-    email TEXT NOT NULL,
-    token_hash TEXT NOT NULL UNIQUE,
-    expires_at TIMESTAMPTZ NOT NULL,
-    used_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_prt_token_hash ON password_reset_tokens (token_hash);
-CREATE INDEX idx_prt_user_id ON password_reset_tokens (user_id);

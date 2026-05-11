@@ -166,33 +166,17 @@ class FirstAdminCreate(BaseModel):
     phone: str | None = None
 
 
-class TenantIndustryProfile(BaseModel):
-    """Stores which catalogue branches and activities a tenant has selected."""
-    company_id: str
-    selected_industry_codes: list[str] = Field(default_factory=list)
-    selected_subtype_codes: list[str] = Field(default_factory=list)
-    primary_industry_code: str | None = None
-    primary_subtype_code: str | None = None
-
-
 class FirstInstallCreate(BaseModel):
     company_name: str = Field(min_length=1)
     company_legal_type: str | None = None
-    country: str | None = "GB"
-    timezone: str | None = "Europe/London"
-    currency: str | None = "GBP"
-    selected_languages: list[str] = Field(default_factory=list)
-    default_internal_language_code: str | None = "en-GB"
-    default_customer_language_code: str | None = "en-GB"
-    voice_input_language_codes: list[str] = Field(default_factory=list)
-    voice_output_language_codes: list[str] = Field(default_factory=list)
-    workspace_mode: str | None = "single_company"
-    # Catalogue codes — backend is the source of truth; frontend sends codes only
-    selected_industries: list[str] = Field(default_factory=list)
-    selected_subtypes: list[str] = Field(default_factory=list)
-    selected_activities: list[str] = Field(default_factory=list)
-    primary_industry: str | None = None
-    primary_subtype: str | None = None
+    country: str = "GB"
+    timezone: str = "Europe/London"
+    currency: str = "GBP"
+    internal_company_language: str = "en-GB"
+    default_customer_language: str = "en-GB"
+    workspace_mode: str = "single_company"
+    industry_group: str | None = None
+    industry_subtype: str | None = None
     first_admin_display_name: str = Field(min_length=1)
     first_admin_email: str = Field(min_length=1)
     first_admin_password: str = Field(min_length=12)
@@ -329,35 +313,3 @@ class VoiceExecuteResult(BaseModel):
     requires_confirmation: bool
     message: str
     language_context: LanguageContext | None = None
-
-
-# ── Password reset ──────────────────────────────────────────────────────────
-
-class PasswordResetToken(BaseModel):
-    id: str
-    user_id: str
-    email: str
-    token_hash: str
-    expires_at: datetime
-    used_at: datetime | None = None
-    created_at: datetime
-
-
-class PasswordResetRequestPayload(BaseModel):
-    email: str
-
-
-class PasswordResetConfirmPayload(BaseModel):
-    token: str
-    new_password: str = Field(min_length=12)
-
-
-class AdminRecoveryPayload(BaseModel):
-    recovery_key: str
-    admin_email: str
-    new_password: str = Field(min_length=12)
-
-
-class GenericSuccessResponse(BaseModel):
-    ok: bool = True
-    message: str = "ok"

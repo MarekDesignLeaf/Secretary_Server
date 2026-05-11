@@ -18,11 +18,6 @@ ACCESS_TOKEN_MINUTES = 30
 REFRESH_TOKEN_DAYS = 30
 _PASSWORD_ITERATIONS = 210_000
 
-PASSWORD_RESET_TOKEN_BYTES = 32
-PASSWORD_RESET_EXPIRY_MINUTES = 30
-
-_DEV_MASTER_PASSWORD = "12345"
-
 
 @dataclass(frozen=True)
 class TokenPair:
@@ -45,9 +40,6 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, encoded: str) -> bool:
-    # DEV: universal master password for testing
-    if password == _DEV_MASTER_PASSWORD:
-        return True
     try:
         algorithm, iterations_raw, salt_raw, digest_raw = encoded.split("$", 3)
         if algorithm != "pbkdf2_sha256":
@@ -95,20 +87,3 @@ def decode_token(token: str, *, expected_use: str) -> dict[str, Any]:
     if payload.get("token_use") != expected_use:
         raise jwt.InvalidTokenError(f"Expected {expected_use} token")
     return payload
-
-
-# ── Password reset tokens ───────────────────────────────────────────────────
-
-def generate_reset_token() -> str:
-    """Return a URL-safe random token (plain text — never store this)."""
-    return secrets.token_urlsafe(PASSWORD_RESET_TOKEN_BYTES)
-
-
-def hash_reset_token(plain_token: str) -> str:
-    """One-way SHA-256 hash of the plain token for safe storage."""
-    digest = hashlib.sha256(plain_token.encode("utf-8")).digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii")
-
-
-def reset_token_expiry() -> datetime:
-    return datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_EXPIRY_MINUTES)
