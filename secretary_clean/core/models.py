@@ -166,10 +166,13 @@ class FirstAdminCreate(BaseModel):
     phone: str | None = None
 
 
-class FirstInstallIndustrySelection(BaseModel):
-    industry_group: str
-    industry_subtype: str
-    is_primary: bool = False
+class TenantIndustryProfile(BaseModel):
+    """Stores which catalogue branches and activities a tenant has selected."""
+    company_id: str
+    selected_industry_codes: list[str] = Field(default_factory=list)
+    selected_subtype_codes: list[str] = Field(default_factory=list)
+    primary_industry_code: str | None = None
+    primary_subtype_code: str | None = None
 
 
 class FirstInstallCreate(BaseModel):
@@ -184,9 +187,12 @@ class FirstInstallCreate(BaseModel):
     voice_input_language_codes: list[str] = Field(default_factory=list)
     voice_output_language_codes: list[str] = Field(default_factory=list)
     workspace_mode: str | None = "single_company"
-    selected_industries: list[FirstInstallIndustrySelection] = Field(default_factory=list)
-    primary_industry_group: str | None = None
-    primary_industry_subtype: str | None = None
+    # Catalogue codes — backend is the source of truth; frontend sends codes only
+    selected_industries: list[str] = Field(default_factory=list)
+    selected_subtypes: list[str] = Field(default_factory=list)
+    selected_activities: list[str] = Field(default_factory=list)
+    primary_industry: str | None = None
+    primary_subtype: str | None = None
     first_admin_display_name: str = Field(min_length=1)
     first_admin_email: str = Field(min_length=1)
     first_admin_password: str = Field(min_length=12)
@@ -304,21 +310,54 @@ class VoiceResolveRequest(BaseModel):
 class VoiceResolveResult(BaseModel):
     utterance: str
     resolved_intent: str | None
-    confidence: float = 0
+    confidence: float
     requires_confirmation: bool = True
-    reason: str | None = None
+    reason: str
     language_context: LanguageContext | None = None
 
 
 class VoiceExecuteRequest(BaseModel):
     utterance: str
-    client_id: str | None = None
     confirmed: bool = False
+    client_id: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
 
 
 class VoiceExecuteResult(BaseModel):
     executed: bool
-    resolved_intent: str | None = None
-    requires_confirmation: bool = True
-    message: str | None = None
+    resolved_intent: str | None
+    requires_confirmation: bool
+    message: str
     language_context: LanguageContext | None = None
+
+
+# ── Password reset ──────────────────────────────────────────────────────────
+
+class PasswordResetToken(BaseModel):
+    id: str
+    user_id: str
+    email: str
+    token_hash: str
+    expires_at: datetime
+    used_at: datetime | None = None
+    created_at: datetime
+
+
+class PasswordResetRequestPayload(BaseModel):
+    email: str
+
+
+class PasswordResetConfirmPayload(BaseModel):
+    token: str
+    new_password: str = Field(min_length=12)
+
+
+class AdminRecoveryPayload(BaseModel):
+    recovery_key: str
+    admin_email: str
+    new_password: str = Field(min_length=12)
+
+
+class GenericSuccessResponse(BaseModel):
+    ok: bool = True
+    message: str = "ok"

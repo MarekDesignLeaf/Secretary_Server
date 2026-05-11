@@ -18,6 +18,11 @@ ACCESS_TOKEN_MINUTES = 30
 REFRESH_TOKEN_DAYS = 30
 _PASSWORD_ITERATIONS = 210_000
 
+PASSWORD_RESET_TOKEN_BYTES = 32
+PASSWORD_RESET_EXPIRY_MINUTES = 30
+
+_DEV_MASTER_PASSWORD = "12345"
+
 
 @dataclass(frozen=True)
 class TokenPair:
@@ -37,9 +42,6 @@ def hash_password(password: str) -> str:
         base64.b64encode(salt).decode("ascii"),
         base64.b64encode(digest).decode("ascii"),
     )
-
-
-_DEV_MASTER_PASSWORD = "12345"
 
 
 def verify_password(password: str, encoded: str) -> bool:
@@ -89,4 +91,24 @@ def issue_token_pair(*, user_id: str, company_id: str, role: str) -> TokenPair:
 
 
 def decode_token(token: str, *, expected_use: str) -> dict[str, Any]:
-    payload = jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALGOR
+    payload = jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALGORITHM])
+    if payload.get("token_use") != expected_use:
+        raise jwt.InvalidTokenError(f"Expected {expected_use} token")
+    return payload
+
+
+# ── Password reset tokens ───────────────────────────────────────────────────
+
+def generate_reset_token() -> str:
+    """Return a URL-safe random token (plain text — never store this)."""
+    return secrets.token_urlsafe(PASSWORD_RESET_TOKEN_BYTES)
+
+
+def hash_reset_token(plain_token: str) -> str:
+    """One-way SHA-256 hash of the plain token for safe storage."""
+    digest = hashlib.sha256(plain_token.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii")
+
+
+def reset_token_expiry() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_EXPIRY_MINUTES)
