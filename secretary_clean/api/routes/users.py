@@ -1,19 +1,88 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from secretary_clean.api.deps import current_user, get_repository
-from secretary_clean.core.models import UserAccount
+from secretary_clean.core.models import CreateUserRequest, UpdateUserRequest, UserAccount
 from secretary_clean.core.repository import InMemorySecretaryRepository
 
 router = APIRouter(prefix="/users", tags=["users"])
 
 
 @router.get("", response_model=list[UserAccount])
-def list_users(user: UserAccount = Depends(current_user), repository: InMemorySecretaryRepository = Depends(get_repository)):
+def list_users(
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
     return repository.list_users(user.company_id)
 
 
 @router.get("/roles")
 def list_roles(repository: InMemorySecretaryRepository = Depends(get_repository)):
     return repository.list_roles()
+
+
+@router.post("", response_model=UserAccount)
+def create_user(
+    payload: CreateUserRequest,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    if user.role.value not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    try:
+        return repository.create_user(
+            company_id=user.company_id,
+            email=payload.email,
+            password=payload.password,
+            display_name=payload.display_name,
+            role=payload.role,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            phone=payload.phone,
+            preferred_language_code=payload.preferred_language_code,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.put("/{user_id}", response_model=UserAccount)
+def update_user(
+    user_id: str,
+    payload: UpdateUserRequest,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    if user.role.value not in ("owner", "admin") and user.id != user_id:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    try:
+        return repository.update_user(
+            user_id,
+            user.company_id,
+            display_name=payload.display_name,
+            role=payload.role,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            phone=payload.phone,
+            preferred_language_code=payload.preferred_language_code,
+            is_active=payload.is_active,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/{user_id}")
+def delete_user(
+    user_id: str,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    if user.role.value not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    if user.id == user_id:
+        raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
+    try:
+        repository.delete_user(user_id, user.company_id)
+        return {"ok": True}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
