@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.metadata
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from secretary_clean.api.deps import get_repository
@@ -7,6 +9,26 @@ from secretary_clean.core.models import BootstrapStatus, FirstAdminCreate, First
 from secretary_clean.core.repository import InMemorySecretaryRepository
 
 router = APIRouter(prefix="/bootstrap", tags=["bootstrap"])
+
+# ---------------------------------------------------------------------------
+# Version endpoint — no auth required, used by Settings screen
+# ---------------------------------------------------------------------------
+
+# Separate router so we can mount it at /api/v1 without the /bootstrap prefix
+version_router = APIRouter(tags=["version"])
+
+@version_router.get("/version")
+def get_version():
+    """Return server version info. No authentication required."""
+    try:
+        ver = importlib.metadata.version("secretary-clean")
+    except importlib.metadata.PackageNotFoundError:
+        ver = "1.0.0"
+    return {
+        "server_version": ver,
+        "api_version": "v1",
+        "backend": "secretary_clean",
+    }
 
 
 @router.get("/status", response_model=BootstrapStatus)

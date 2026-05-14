@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from secretary_clean.api.routes import auth, backup, bootstrap, catalogue, company, crm, language, tenant_pricing, users, voice
+from secretary_clean.api.routes.bootstrap import version_router
 from secretary_clean.catalogue.source_parser import load_catalogue
 from secretary_clean.core.models import FirstInstallCreate
 from secretary_clean.core.repository import InMemorySecretaryRepository
@@ -127,6 +128,7 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(crm.router, prefix="/api/v1")
     app.include_router(voice.router, prefix="/api/v1")
     app.include_router(backup.router, prefix="/api/v1")
+    app.include_router(version_router, prefix="/api/v1")
     return app
 
 
