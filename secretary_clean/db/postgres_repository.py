@@ -1102,6 +1102,145 @@ class PostgresSecretaryRepository:
             preferred_language_code=preferred_language_code,
         )
 
+    # ------------------------------------------------------------------
+    # Biometrics
+    # ------------------------------------------------------------------
+
+    def save_biometric(
+        self,
+        bio_id: str,
+        user_id: str,
+        device_id: str,
+        biometric_hash: str,
+        label: str | None = None,
+    ) -> None:
+        """Upsert a biometric hash for a user/device pair."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clean_user_biometrics
+                        (id, user_id, device_id, biometric_hash, label, is_active, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, TRUE, now(), now())
+                    ON CONFLICT (user_id, device_id)
+                    DO UPDATE SET
+                        biometric_hash = EXCLUDED.biometric_hash,
+                        label = EXCLUDED.label,
+                        is_active = TRUE,
+                        updated_at = now()
+                    """,
+                    (bio_id, user_id, device_id, biometric_hash, label),
+                )
+            conn.commit()
+
+    def get_biometric_hashes(self, user_id: str) -> list[str]:
+        """Return all active biometric hashes for a user."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT biometric_hash FROM clean_user_biometrics "
+                    "WHERE user_id = %s AND is_active = TRUE",
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+        return [r["biometric_hash"] for r in rows]
+
+    def deactivate_biometric(self, user_id: str, device_id: str) -> bool:
+        """Deactivate a biometric entry. Returns True if a row was affected."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE clean_user_biometrics SET is_active = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND device_id = %s AND is_active = TRUE",
+                    (user_id, device_id),
+                )
+                affected = cur.rowcount
+            conn.commit()
+        return affected > 0
+
+    # ------------------------------------------------------------------
+    # Backup manifests
+    # ------------------------------------------------------------------
+
+    def save_backup_manifest(
+        self,
+        backup_id: str,
+        company_id: str,
+        created_by_user_id: str,
+        created_by_role: str,
+        backup_scope: str,
+        includes_db_reference: bool,
+        storage_location: str,
+        restore_token: str | None,
+        restore_token_expires_at,
+        payload: dict,
+    ) -> None:
+        import json as _json
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clean_backup_manifests
+                        (id, company_id, created_by_user_id, created_by_role,
+                         backup_scope, includes_db_reference, storage_location,
+                         restore_token, restore_token_expires_at, payload, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    """,
+                    (
+                        backup_id, company_id, created_by_user_id, created_by_role,
+                        backup_scope, includes_db_reference, storage_location,
+                        restore_token, restore_token_expires_at,
+                        psycopg2.extras.Json(payload),
+                    ),
+                )
+            conn.commit()
+
+    def list_backup_manifests(self, company_id: str) -> list[dict]:
+        """Return summary rows for all server-stored backups for a company."""
+        from secretary_clean.core.models import BackupRestoreInfo, BackupScope
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, company_id, created_by_role, backup_scope,
+                           includes_db_reference, created_at
+                    FROM clean_backup_manifests
+                    WHERE company_id = %s
+                    ORDER BY created_at DESC
+                    """,
+                    (company_id,),
+                )
+                rows = cur.fetchall()
+        results = []
+        for r in rows:
+            results.append(BackupRestoreInfo(
+                backup_id=str(r["id"]),
+                company_legal_name="",  # not stored in manifest header row
+                created_at=r["created_at"],
+                backup_scope=BackupScope(r["backup_scope"]),
+                includes_db_reference=bool(r["includes_db_reference"]),
+            ))
+        return results
+
+    def get_backup_manifest_by_token(self, token: str) -> dict | None:
+        """Return the full manifest row for a restore token."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, company_id, created_by_user_id, created_by_role,
+                           backup_scope, includes_db_reference,
+                           restore_token_expires_at, payload
+                    FROM clean_backup_manifests
+                    WHERE restore_token = %s
+                    """,
+                    (token,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
+
 
 # ------------------------------------------------------------------
 # Connection pool context manager

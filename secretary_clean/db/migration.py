@@ -44,6 +44,32 @@ CREATE TABLE IF NOT EXISTS clean_password_reset_tokens (
 
 CREATE INDEX IF NOT EXISTS clean_prt_token_hash_idx
     ON clean_password_reset_tokens(token_hash);
+
+CREATE TABLE IF NOT EXISTS clean_user_biometrics (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES clean_users(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    biometric_hash TEXT NOT NULL,
+    label TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, device_id)
+);
+
+CREATE TABLE IF NOT EXISTS clean_backup_manifests (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    created_by_user_id UUID NOT NULL REFERENCES clean_users(id),
+    created_by_role TEXT NOT NULL,
+    backup_scope TEXT NOT NULL,
+    includes_db_reference BOOLEAN NOT NULL DEFAULT FALSE,
+    storage_location TEXT NOT NULL,
+    restore_token TEXT UNIQUE,
+    restore_token_expires_at TIMESTAMPTZ,
+    payload JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 

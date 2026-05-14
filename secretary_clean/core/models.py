@@ -26,6 +26,8 @@ class Permission(str, Enum):
     crm_manage = "crm.manage"
     language_manage = "language.manage"
     voice_execute = "voice.execute"
+    backup_manage = "backup.manage"          # full backup incl. DB reference (admin/owner only)
+    backup_personal = "backup.personal"     # personal credential backup (all roles)
 
 
 ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
@@ -38,6 +40,8 @@ ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
         Permission.crm_manage,
         Permission.language_manage,
         Permission.voice_execute,
+        Permission.backup_manage,
+        Permission.backup_personal,
     },
     Role.manager: {
         Permission.catalogue_read,
@@ -45,9 +49,19 @@ ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
         Permission.crm_manage,
         Permission.language_manage,
         Permission.voice_execute,
+        Permission.backup_personal,
     },
-    Role.staff: {Permission.catalogue_read, Permission.crm_manage, Permission.voice_execute},
-    Role.accountant: {Permission.catalogue_read, Permission.crm_manage},
+    Role.staff: {
+        Permission.catalogue_read,
+        Permission.crm_manage,
+        Permission.voice_execute,
+        Permission.backup_personal,
+    },
+    Role.accountant: {
+        Permission.catalogue_read,
+        Permission.crm_manage,
+        Permission.backup_personal,
+    },
 }
 
 
@@ -313,3 +327,84 @@ class VoiceExecuteResult(BaseModel):
     requires_confirmation: bool
     message: str
     language_context: LanguageContext | None = None
+
+
+# ---------------------------------------------------------------------------
+# Biometrics
+# ---------------------------------------------------------------------------
+
+class BiometricRegisterRequest(BaseModel):
+    """Register a fingerprint hash for the calling user on a specific device."""
+    device_id: str = Field(min_length=1)
+    biometric_hash: str = Field(min_length=16, description="Salted SHA-256 of device biometric template")
+    label: str | None = None
+
+
+class BiometricEntry(BaseModel):
+    id: str
+    user_id: str
+    device_id: str
+    label: str | None = None
+    is_active: bool
+    created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Backup / Uninstall
+# ---------------------------------------------------------------------------
+
+class BackupScope(str, Enum):
+    full = "full"          # admin/owner: all users + DB reference
+    personal = "personal"  # regular user: own credentials + deletable data
+
+
+class BackupStorageLocation(str, Enum):
+    server = "server"
+    local = "local"
+    both = "both"
+
+
+class BackupCreateRequest(BaseModel):
+    """Request to create a pre-uninstall backup."""
+    storage_location: BackupStorageLocation = BackupStorageLocation.both
+    # The Android client sends a token to prove the device identity
+    device_id: str = Field(min_length=1)
+
+
+class BackupUserCredential(BaseModel):
+    """Minimal credential record included in a backup."""
+    user_id: str
+    email: str
+    display_name: str
+    role: str
+    biometric_hashes: list[str] = Field(default_factory=list)
+
+
+class BackupManifest(BaseModel):
+    """Backup payload returned to (and stored by) the Android client."""
+    backup_id: str
+    backup_version: str = "1.0"
+    created_at: datetime
+    created_by_user_id: str
+    created_by_role: str
+    backup_scope: BackupScope
+    company_id: str
+    company_legal_name: str
+    # Credentials — always includes caller's own; full scope adds all users
+    users: list[BackupUserCredential]
+    # Settings snapshot
+    settings: dict[str, Any] = Field(default_factory=dict)
+    # DB reference — non-null ONLY for backup_scope == 'full' (admin/owner)
+    db_reference: str | None = None
+    # Server download token for restore (only set when storage_location includes 'server')
+    restore_token: str | None = None
+    restore_token_expires_at: datetime | None = None
+
+
+class BackupRestoreInfo(BaseModel):
+    """Minimal info the Android app needs to start a restore flow."""
+    backup_id: str
+    company_legal_name: str
+    created_at: datetime
+    backup_scope: BackupScope
+    includes_db_reference: bool

@@ -348,3 +348,89 @@ class InMemorySecretaryRepository:
         if module not in self.crm:
             raise KeyError("Unknown CRM module")
         return [record for record in self.crm[module].values() if record.company_id == company_id]
+
+    # ------------------------------------------------------------------
+    # Biometrics (in-memory stubs)
+    # ------------------------------------------------------------------
+
+    def save_biometric(
+        self, bio_id: str, user_id: str, device_id: str, biometric_hash: str, label: str | None = None
+    ) -> None:
+        if not hasattr(self, "_biometrics"):
+            self._biometrics: dict[tuple, dict] = {}
+        self._biometrics[(user_id, device_id)] = {
+            "id": bio_id,
+            "user_id": user_id,
+            "device_id": device_id,
+            "biometric_hash": biometric_hash,
+            "label": label,
+            "is_active": True,
+        }
+
+    def get_biometric_hashes(self, user_id: str) -> list[str]:
+        if not hasattr(self, "_biometrics"):
+            return []
+        return [
+            v["biometric_hash"]
+            for (uid, _), v in self._biometrics.items()
+            if uid == user_id and v["is_active"]
+        ]
+
+    def deactivate_biometric(self, user_id: str, device_id: str) -> bool:
+        if not hasattr(self, "_biometrics"):
+            return False
+        key = (user_id, device_id)
+        if key in self._biometrics and self._biometrics[key]["is_active"]:
+            self._biometrics[key]["is_active"] = False
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Backup manifests (in-memory stubs)
+    # ------------------------------------------------------------------
+
+    def save_backup_manifest(
+        self, backup_id: str, company_id: str, created_by_user_id: str,
+        created_by_role: str, backup_scope: str, includes_db_reference: bool,
+        storage_location: str, restore_token: str | None, restore_token_expires_at,
+        payload: dict,
+    ) -> None:
+        if not hasattr(self, "_backup_manifests"):
+            self._backup_manifests: dict[str, dict] = {}
+        self._backup_manifests[backup_id] = {
+            "id": backup_id,
+            "company_id": company_id,
+            "created_by_user_id": created_by_user_id,
+            "created_by_role": created_by_role,
+            "backup_scope": backup_scope,
+            "includes_db_reference": includes_db_reference,
+            "storage_location": storage_location,
+            "restore_token": restore_token,
+            "restore_token_expires_at": restore_token_expires_at,
+            "payload": payload,
+            "created_at": datetime.now(timezone.utc),
+        }
+
+    def list_backup_manifests(self, company_id: str) -> list:
+        from .models import BackupRestoreInfo, BackupScope
+        if not hasattr(self, "_backup_manifests"):
+            return []
+        results = []
+        for row in self._backup_manifests.values():
+            if row["company_id"] == company_id:
+                results.append(BackupRestoreInfo(
+                    backup_id=row["id"],
+                    company_legal_name="",
+                    created_at=row["created_at"],
+                    backup_scope=BackupScope(row["backup_scope"]),
+                    includes_db_reference=row["includes_db_reference"],
+                ))
+        return results
+
+    def get_backup_manifest_by_token(self, token: str) -> dict | None:
+        if not hasattr(self, "_backup_manifests"):
+            return None
+        for row in self._backup_manifests.values():
+            if row.get("restore_token") == token:
+                return row
+        return None
