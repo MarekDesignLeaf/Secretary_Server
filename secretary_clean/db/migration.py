@@ -25,10 +25,13 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 
+# DDL that must run BEFORE schema.sql (extensions used by schema tables)
+_PRE_DDL = """
+CREATE EXTENSION IF NOT EXISTS citext;
+"""
+
 # Extra tables required by the Postgres repository that are not in schema.sql
 _EXTRA_DDL = """
-CREATE EXTENSION IF NOT EXISTS citext;
-
 CREATE TABLE IF NOT EXISTS clean_password_reset_tokens (
     id UUID PRIMARY KEY,
     user_id UUID NOT NULL,
@@ -95,10 +98,13 @@ def run_migrations(database_url: str) -> None:
 
     statements = _split_statements(cleaned)
 
-    # Append extra DDL
+    # Pre-DDL (extensions) must run before schema statements
+    pre_statements = _split_statements(_PRE_DDL)
+
+    # Extra tables not in schema.sql
     extra_statements = _split_statements(_rewrite_create_table(_rewrite_create_index(_EXTRA_DDL)))
 
-    all_statements = statements + extra_statements
+    all_statements = pre_statements + statements + extra_statements
 
     conn = psycopg2.connect(database_url)
     try:
