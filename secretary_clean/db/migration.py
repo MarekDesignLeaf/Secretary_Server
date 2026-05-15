@@ -138,26 +138,44 @@ def run_migrations(database_url: str) -> None:
     # ALTER statements for adding columns to existing tables (idempotent via IF NOT EXISTS)
     alter_statements = _split_statements(_ALTER_DDL)
 
-    all_statements = pre_statements + statements + extra_statements + alter_statements
+    main_statements = pre_statements + statements + extra_statements
 
+    # Phase 1: main schema in a single transaction
     conn = psycopg2.connect(database_url)
     try:
         conn.autocommit = False
         with conn.cursor() as cur:
-            for stmt in all_statements:
+            for stmt in main_statements:
                 stmt_preview = stmt[:80].replace("\n", " ")
                 try:
                     cur.execute(stmt)
                     logger.debug("OK: %s", stmt_preview)
                 except psycopg2.Error as exc:
-                    # Log and re-raise — caller decides whether to abort startup
                     logger.error("Migration statement failed: %s\nError: %s", stmt_preview, exc)
                     conn.rollback()
                     raise
         conn.commit()
-        logger.info("Database migrations completed successfully")
+        logger.info("Schema migration phase completed successfully")
     finally:
         conn.close()
+
+    # Phase 2: ALTER TABLE statements run independently with autocommit=True
+    # so they are never rolled back by errors in phase 1.
+    conn2 = psycopg2.connect(database_url)
+    try:
+        conn2.autocommit = True
+        with conn2.cursor() as cur:
+            for stmt in alter_statements:
+                stmt_preview = stmt[:80].replace("\n", " ")
+                try:
+                    cur.execute(stmt)
+                    logger.debug("ALTER OK: %s", stmt_preview)
+                except psycopg2.Error as exc:
+                    logger.error("ALTER migration failed: %s\nError: %s", stmt_preview, exc)
+                    raise
+        logger.info("ALTER migration phase completed successfully")
+    finally:
+        conn2.close()
 
 
 def _redact(url: str) -> str:
