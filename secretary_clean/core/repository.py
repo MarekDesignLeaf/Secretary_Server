@@ -198,6 +198,7 @@ class InMemorySecretaryRepository:
             first_name=first_name,
             last_name=last_name,
             phone=phone,
+            must_change_password=True,
         )
         self.users[user.id] = user
         self.password_hashes[user.id] = hash_password(password)
@@ -239,7 +240,17 @@ class InMemorySecretaryRepository:
         if not verify_password(current_password, self.password_hashes.get(user_id, "")):
             return False
         self.password_hashes[user_id] = hash_password(new_password)
+        updated = user.model_copy(update={"must_change_password": False})
+        self.users[user_id] = updated
         return True
+
+    def reset_user_password(self, user_id: str, new_password: str) -> None:
+        user = self.users.get(user_id)
+        if not user:
+            raise KeyError("User not found")
+        self.password_hashes[user_id] = hash_password(new_password)
+        updated = user.model_copy(update={"must_change_password": True})
+        self.users[user_id] = updated
 
     def list_roles(self) -> dict[str, list[str]]:
         return {role.value: sorted(permission.value for permission in permissions) for role, permissions in ROLE_PERMISSIONS.items()}

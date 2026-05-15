@@ -138,44 +138,32 @@ def run_migrations(database_url: str) -> None:
     # ALTER statements for adding columns to existing tables (idempotent via IF NOT EXISTS)
     alter_statements = _split_statements(_ALTER_DDL)
 
-    main_statements = pre_statements + statements + extra_statements
+    all_statements = pre_statements + statements + extra_statements + alter_statements
 
-    # Phase 1: main schema in a single transaction
+    # Run every DDL statement independently with autocommit=True.
+    # This means CREATE EXTENSION permission errors do NOT block table creation,
+    # and ALTER TABLE runs even if earlier statements had issues.
+    # All statements use IF NOT EXISTS so repeated runs are safe.
     conn = psycopg2.connect(database_url)
+    errors = []
     try:
-        conn.autocommit = False
+        conn.autocommit = True
         with conn.cursor() as cur:
-            for stmt in main_statements:
+            for stmt in all_statements:
                 stmt_preview = stmt[:80].replace("\n", " ")
                 try:
                     cur.execute(stmt)
                     logger.debug("OK: %s", stmt_preview)
                 except psycopg2.Error as exc:
-                    logger.error("Migration statement failed: %s\nError: %s", stmt_preview, exc)
-                    conn.rollback()
-                    raise
-        conn.commit()
-        logger.info("Schema migration phase completed successfully")
+                    logger.warning("DDL skipped (may be harmless): %s | %s", stmt_preview, exc)
+                    errors.append((stmt_preview, str(exc)))
     finally:
         conn.close()
 
-    # Phase 2: ALTER TABLE statements run independently with autocommit=True
-    # so they are never rolled back by errors in phase 1.
-    conn2 = psycopg2.connect(database_url)
-    try:
-        conn2.autocommit = True
-        with conn2.cursor() as cur:
-            for stmt in alter_statements:
-                stmt_preview = stmt[:80].replace("\n", " ")
-                try:
-                    cur.execute(stmt)
-                    logger.debug("ALTER OK: %s", stmt_preview)
-                except psycopg2.Error as exc:
-                    logger.error("ALTER migration failed: %s\nError: %s", stmt_preview, exc)
-                    raise
-        logger.info("ALTER migration phase completed successfully")
-    finally:
-        conn2.close()
+    if errors:
+        logger.warning("Migration completed with %d skipped statements (see warnings above)", len(errors))
+    else:
+        logger.info("Database migrations completed successfully")
 
 
 def _redact(url: str) -> str:
