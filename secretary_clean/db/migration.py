@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS clean_backup_manifests (
 );
 """
 
+# Column additions for existing tables (safe to run multiple times)
+_ALTER_DDL = """
+ALTER TABLE clean_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
+"""
+
 
 def _rewrite_create_table(sql: str) -> str:
     """Insert IF NOT EXISTS into CREATE TABLE statements that lack it."""
@@ -130,7 +135,10 @@ def run_migrations(database_url: str) -> None:
     # Extra tables not in schema.sql
     extra_statements = _split_statements(_rewrite_create_table(_rewrite_create_index(_EXTRA_DDL)))
 
-    all_statements = pre_statements + statements + extra_statements
+    # ALTER statements for adding columns to existing tables (idempotent via IF NOT EXISTS)
+    alter_statements = _split_statements(_ALTER_DDL)
+
+    all_statements = pre_statements + statements + extra_statements + alter_statements
 
     conn = psycopg2.connect(database_url)
     try:

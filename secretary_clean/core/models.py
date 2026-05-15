@@ -145,6 +145,26 @@ class UserAccount(BaseModel):
     last_name: str | None = None
     phone: str | None = None
     is_active: bool = True
+    must_change_password: bool = False
+
+
+class LoginResponse(BaseModel):
+    """Login response that includes both tokens and user profile."""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    id: str
+    company_id: str
+    email: str
+    display_name: str
+    role: Role
+    permissions: list[Permission]
+    preferred_language_code: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    phone: str | None = None
+    is_active: bool = True
+    must_change_password: bool = False
 
 
 class BootstrapStatus(BaseModel):
@@ -311,4 +331,126 @@ class TenantActivityPricing(BaseModel):
 
 class TenantActivityOverrideRequest(BaseModel):
     selected_pricing_method_code: str
-    rate: float |
+    rate: float | None = None
+    custom_name: str | None = None
+    enabled_additional_charge_codes: list[str] = Field(default_factory=list)
+
+
+class CRMRecord(BaseModel):
+    id: str
+    company_id: str
+    name: str
+    status: str = "open"
+    data: dict[str, Any] = Field(default_factory=dict)
+    preferred_language_code: str | None = None
+
+
+class VoiceResolveRequest(BaseModel):
+    utterance: str
+    company_id: str | None = None
+    client_id: str | None = None
+
+
+class VoiceResolveResult(BaseModel):
+    utterance: str
+    resolved_intent: str | None
+    confidence: float
+    requires_confirmation: bool = True
+    reason: str
+    language_context: LanguageContext | None = None
+
+
+class VoiceExecuteRequest(BaseModel):
+    utterance: str
+    confirmed: bool = False
+    client_id: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class VoiceExecuteResult(BaseModel):
+    executed: bool
+    resolved_intent: str | None
+    requires_confirmation: bool
+    message: str
+    language_context: LanguageContext | None = None
+
+
+# ---------------------------------------------------------------------------
+# Biometrics
+# ---------------------------------------------------------------------------
+
+class BiometricRegisterRequest(BaseModel):
+    """Register a fingerprint hash for the calling user on a specific device."""
+    device_id: str = Field(min_length=1)
+    biometric_hash: str = Field(min_length=16, description="Salted SHA-256 of device biometric template")
+    label: str | None = None
+
+
+class BiometricEntry(BaseModel):
+    id: str
+    user_id: str
+    device_id: str
+    label: str | None = None
+    is_active: bool
+    created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Backup / Uninstall
+# ---------------------------------------------------------------------------
+
+class BackupScope(str, Enum):
+    full = "full"          # admin/owner: all users + DB reference
+    personal = "personal"  # regular user: own credentials + deletable data
+
+
+class BackupStorageLocation(str, Enum):
+    server = "server"
+    local = "local"
+    both = "both"
+
+
+class BackupCreateRequest(BaseModel):
+    """Request to create a pre-uninstall backup."""
+    storage_location: BackupStorageLocation = BackupStorageLocation.both
+    # The Android client sends a token to prove the device identity
+    device_id: str = Field(min_length=1)
+
+
+class BackupUserCredential(BaseModel):
+    """Minimal credential record included in a backup."""
+    user_id: str
+    email: str
+    display_name: str
+    role: str
+    biometric_hashes: list[str] = Field(default_factory=list)
+
+
+class BackupManifest(BaseModel):
+    """Backup payload returned to (and stored by) the Android client."""
+    backup_id: str
+    backup_version: str = "1.0"
+    created_at: datetime
+    created_by_user_id: str
+    created_by_role: str
+    backup_scope: BackupScope
+    company_id: str
+    company_legal_name: str
+    # Credentials — always includes caller's own; full scope adds all users
+    users: list[BackupUserCredential]
+    # Settings snapshot
+    settings: dict[str, Any] = Field(default_factory=dict)
+    # DB reference — non-null ONLY for backup_scope == 'full' (admin/owner)
+    db_reference: str | None = None
+    # Server download token for restore (only set when storage_location includes 'server')
+    restore_token: str | None = None
+    restore_token_expires_at: datetime | None = None
+
+
+class BackupRestoreInfo(BaseModel):
+    """Minimal info the Android app needs to start a restore flow."""
+    backup_id: str
+    company_legal_name: str
+    created_at: datetime
+    backup_scope: BackupScope
+    includes_db_reference: bool

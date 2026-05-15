@@ -355,4 +355,152 @@ class InMemorySecretaryRepository:
     def get_client_language(self, company_id: str, client_id: str) -> ClientLanguageSettings:
         record = self.crm["clients"].get(client_id)
         if not record or record.company_id != company_id:
-            raise KeyError("Client not found"
+            raise KeyError("Client not found")
+        profile = self.get_tenant_operating_profile(company_id)
+        preferred = normalize_language_code(record.preferred_language_code, profile.default_customer_language_code)
+        return ClientLanguageSettings(
+            client_id=client_id,
+            preferred_language_code=preferred,
+            resolved_language_code=preferred,
+        )
+
+    def set_client_language(self, company_id: str, client_id: str, language_code: str) -> ClientLanguageSettings:
+        record = self.crm["clients"].get(client_id)
+        if not record or record.company_id != company_id:
+            raise KeyError("Client not found")
+        normalized = normalize_language_code(language_code, self.get_tenant_operating_profile(company_id).default_customer_language_code)
+        self.crm["clients"][client_id] = record.model_copy(update={"preferred_language_code": normalized})
+        return ClientLanguageSettings(
+            client_id=client_id,
+            preferred_language_code=normalized,
+            resolved_language_code=normalized,
+        )
+
+    def get_client_preferred_language_code(self, company_id: str, client_id: str | None) -> str | None:
+        if not client_id:
+            return None
+        record = self.crm["clients"].get(client_id)
+        if not record or record.company_id != company_id:
+            return None
+        return record.preferred_language_code
+
+    def list_users(self, company_id: str) -> list[UserAccount]:
+        return [user for user in self.users.values() if user.company_id == company_id]
+
+    def save_tenant_pricing(self, company_id: str, activity_code: str, request: TenantActivityOverrideRequest) -> TenantActivityPricing:
+        override = TenantActivityPricing(
+            company_id=company_id,
+            activity_code=activity_code,
+            selected_pricing_method_code=request.selected_pricing_method_code,
+            rate=request.rate,
+            custom_name=request.custom_name,
+            enabled_additional_charge_codes=request.enabled_additional_charge_codes,
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.tenant_pricing[(company_id, activity_code)] = override
+        return override
+
+    def reset_tenant_pricing(self, company_id: str, activity_code: str) -> bool:
+        self.tenant_pricing.pop((company_id, activity_code), None)
+        return True
+
+    def list_tenant_pricing(self, company_id: str) -> list[TenantActivityPricing]:
+        return [item for (tenant, _), item in self.tenant_pricing.items() if tenant == company_id]
+
+    def create_crm_record(self, module: str, company_id: str, name: str, data: dict) -> CRMRecord:
+        if module not in self.crm:
+            raise KeyError("Unknown CRM module")
+        record = CRMRecord(id=str(uuid4()), company_id=company_id, name=name, data=data)
+        self.crm[module][record.id] = record
+        return record
+
+    def list_crm_records(self, module: str, company_id: str) -> list[CRMRecord]:
+        if module not in self.crm:
+            raise KeyError("Unknown CRM module")
+        return [record for record in self.crm[module].values() if record.company_id == company_id]
+
+    # ------------------------------------------------------------------
+    # Biometrics (in-memory stubs)
+    # ------------------------------------------------------------------
+
+    def save_biometric(
+        self, bio_id: str, user_id: str, device_id: str, biometric_hash: str, label: str | None = None
+    ) -> None:
+        if not hasattr(self, "_biometrics"):
+            self._biometrics: dict[tuple, dict] = {}
+        self._biometrics[(user_id, device_id)] = {
+            "id": bio_id,
+            "user_id": user_id,
+            "device_id": device_id,
+            "biometric_hash": biometric_hash,
+            "label": label,
+            "is_active": True,
+        }
+
+    def get_biometric_hashes(self, user_id: str) -> list[str]:
+        if not hasattr(self, "_biometrics"):
+            return []
+        return [
+            v["biometric_hash"]
+            for (uid, _), v in self._biometrics.items()
+            if uid == user_id and v["is_active"]
+        ]
+
+    def deactivate_biometric(self, user_id: str, device_id: str) -> bool:
+        if not hasattr(self, "_biometrics"):
+            return False
+        key = (user_id, device_id)
+        if key in self._biometrics and self._biometrics[key]["is_active"]:
+            self._biometrics[key]["is_active"] = False
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Backup manifests (in-memory stubs)
+    # ------------------------------------------------------------------
+
+    def save_backup_manifest(
+        self, backup_id: str, company_id: str, created_by_user_id: str,
+        created_by_role: str, backup_scope: str, includes_db_reference: bool,
+        storage_location: str, restore_token: str | None, restore_token_expires_at,
+        payload: dict,
+    ) -> None:
+        if not hasattr(self, "_backup_manifests"):
+            self._backup_manifests: dict[str, dict] = {}
+        self._backup_manifests[backup_id] = {
+            "id": backup_id,
+            "company_id": company_id,
+            "created_by_user_id": created_by_user_id,
+            "created_by_role": created_by_role,
+            "backup_scope": backup_scope,
+            "includes_db_reference": includes_db_reference,
+            "storage_location": storage_location,
+            "restore_token": restore_token,
+            "restore_token_expires_at": restore_token_expires_at,
+            "payload": payload,
+            "created_at": datetime.now(timezone.utc),
+        }
+
+    def list_backup_manifests(self, company_id: str) -> list:
+        from .models import BackupRestoreInfo, BackupScope
+        if not hasattr(self, "_backup_manifests"):
+            return []
+        results = []
+        for row in self._backup_manifests.values():
+            if row["company_id"] == company_id:
+                results.append(BackupRestoreInfo(
+                    backup_id=row["id"],
+                    company_legal_name="",
+                    created_at=row["created_at"],
+                    backup_scope=BackupScope(row["backup_scope"]),
+                    includes_db_reference=row["includes_db_reference"],
+                ))
+        return results
+
+    def get_backup_manifest_by_token(self, token: str) -> dict | None:
+        if not hasattr(self, "_backup_manifests"):
+            return None
+        for row in self._backup_manifests.values():
+            if row.get("restore_token") == token:
+                return row
+        return None

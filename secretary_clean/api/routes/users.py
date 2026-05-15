@@ -86,3 +86,20 @@ def delete_user(
         return {"ok": True}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{user_id}/reset-password")
+def reset_user_password(
+    user_id: str,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Reset user password to default temp password '12345' and set must_change_password=True."""
+    if user.role.value not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    # Verify user belongs to same company
+    target = repository.get_user(user_id)
+    if not target or target.company_id != user.company_id:
+        raise HTTPException(status_code=404, detail="User not found")
+    repository.reset_user_password(user_id, "12345")
+    return {"ok": True}

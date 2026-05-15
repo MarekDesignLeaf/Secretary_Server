@@ -431,10 +431,11 @@ class PostgresSecretaryRepository:
                 cur.execute(
                     """INSERT INTO clean_users
                         (id, company_id, email, display_name, role, is_active,
-                         preferred_language_code, first_name, last_name, phone, password_hash)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                         preferred_language_code, first_name, last_name, phone, password_hash,
+                         must_change_password)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (user_id, company_id, normalized_email, display_name, user_role.value,
-                     True, norm_lang, first_name, last_name, phone, password_hash),
+                     True, norm_lang, first_name, last_name, phone, password_hash, True),
                 )
             conn.commit()
         return self._build_user_account(user_id)
@@ -491,9 +492,89 @@ class PostgresSecretaryRepository:
         new_hash = hash_password(new_password)
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE clean_users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
+                cur.execute(
+                    "UPDATE clean_users SET password_hash = %s, must_change_password = FALSE, updated_at = now() WHERE id = %s",
+                    (new_hash, user_id),
+                )
             conn.commit()
         return True
+
+    # ------------------------------------------------------------------
+    # Helper row mappers (restored — were accidentally removed)
+    # ------------------------------------------------------------------
+
+    def _build_user_account(self, user_id: str) -> UserAccount:
+        return self.get_user(user_id)
+
+    def _row_to_user(self, row: dict) -> UserAccount:
+        role = Role(row["role"])
+        return UserAccount(
+            id=str(row["id"]),
+            company_id=str(row["company_id"]),
+            email=row["email"],
+            display_name=row["display_name"],
+            role=role,
+            permissions=sorted(ROLE_PERMISSIONS[role]),
+            preferred_language_code=row.get("preferred_language_code"),
+            first_name=row.get("first_name"),
+            last_name=row.get("last_name"),
+            phone=row.get("phone"),
+            is_active=bool(row["is_active"]),
+            must_change_password=bool(row.get("must_change_password", False)),
+        )
+
+    def _row_to_company(self, row: dict) -> CompanyProfile:
+        return CompanyProfile(
+            id=str(row["id"]),
+            legal_name=row["legal_name"],
+            trading_name=row.get("trading_name"),
+            legal_type=row.get("legal_type"),
+            default_country=row["default_country"],
+            default_currency=row["default_currency"],
+            timezone=row["timezone"],
+            phone=row.get("phone"),
+            website=row.get("website"),
+            industry_group=row.get("industry_group"),
+            industry_subtype=row.get("industry_subtype"),
+        )
+
+    def _row_to_tenant_profile(self, row: dict) -> TenantOperatingProfile:
+        from secretary_clean.core.models import LanguageMode, VoiceLanguageStrategy
+        return TenantOperatingProfile(
+            company_id=str(row["company_id"]),
+            workspace_mode=row["workspace_mode"],
+            industry_group=row.get("industry_group"),
+            industry_subtype=row.get("industry_subtype"),
+            internal_language_mode=LanguageMode(row["internal_language_mode"]),
+            customer_language_mode=LanguageMode(row["customer_language_mode"]),
+            default_internal_language_code=row["default_internal_language_code"],
+            default_customer_language_code=row["default_customer_language_code"],
+            voice_input_strategy=VoiceLanguageStrategy(row["voice_input_strategy"]),
+            voice_output_strategy=VoiceLanguageStrategy(row["voice_output_strategy"]),
+            auto_translate_customer_to_internal=row["auto_translate_customer_to_internal"],
+            auto_translate_internal_to_customer=row["auto_translate_internal_to_customer"],
+        )
+
+    def _row_to_tenant_language(self, row: dict) -> TenantLanguage:
+        return TenantLanguage(
+            company_id=str(row["company_id"]),
+            language_code=row["language_code"],
+            language_scope=LanguageScope(row["language_scope"]),
+            is_enabled=bool(row["is_enabled"]),
+            is_default=bool(row["is_default"]),
+        )
+
+    def _row_to_crm_record(self, row: dict, module: str) -> CRMRecord:
+        data = row["data"] if isinstance(row["data"], dict) else {}
+        preferred_language_code = row.get("preferred_language_code") if module == "clients" else None
+        return CRMRecord(
+            id=str(row["id"]),
+            company_id=str(row["company_id"]),
+            name=row["name"],
+            status=row.get("status", "open"),
+            data=data,
+            preferred_language_code=preferred_language_code,
+        )
 
     def list_roles(self) -> dict[str, list[str]]:
         return {role.value: sorted(p.value for p in permissions) for role, permissions in ROLE_PERMISSIONS.items()}
@@ -1101,7 +1182,7 @@ class PostgresSecretaryRepository:
                 if cur.fetchone()["n"] == 0:
                     raise KeyError("User not found")
                 cur.execute(
-                    "UPDATE clean_users SET password_hash = %s, updated_at = now() WHERE id = %s",
+                    "UPDATE clean_users SET password_hash = %s, must_change_password = TRUE, updated_at = now() WHERE id = %s",
                     (hash_password(new_password), user_id),
                 )
             conn.commit()
@@ -1112,4 +1193,245 @@ class PostgresSecretaryRepository:
             raise KeyError("User not found")
         if user.role not in (Role.owner, Role.admin):
             raise PermissionError("Recovery is only available for owner/admin accounts")
-       
+        self.reset_user_password(user.id, new_password)
+        return user
+
+    # ------------------------------------------------------------------
+    # Private row-to-model helpers
+    # ------------------------------------------------------------------
+
+    def _build_user_account(self, user_id: str) -> UserAccount:
+        return self.get_user(user_id)
+
+    def _row_to_user(self, row: dict) -> UserAccount:
+        role = Role(row["role"])
+        return UserAccount(
+            id=str(row["id"]),
+            company_id=str(row["company_id"]),
+            email=row["email"],
+            display_name=row["display_name"],
+            role=role,
+            permissions=sorted(ROLE_PERMISSIONS[role]),
+            preferred_language_code=row.get("preferred_language_code"),
+            first_name=row.get("first_name"),
+            last_name=row.get("last_name"),
+            phone=row.get("phone"),
+            is_active=bool(row["is_active"]),
+        )
+
+    def _row_to_company(self, row: dict) -> CompanyProfile:
+        return CompanyProfile(
+            id=str(row["id"]),
+            legal_name=row["legal_name"],
+            trading_name=row.get("trading_name"),
+            legal_type=row.get("legal_type"),
+            default_country=row["default_country"],
+            default_currency=row["default_currency"],
+            timezone=row["timezone"],
+            phone=row.get("phone"),
+            website=row.get("website"),
+            industry_group=row.get("industry_group"),
+            industry_subtype=row.get("industry_subtype"),
+        )
+
+    def _row_to_tenant_profile(self, row: dict) -> TenantOperatingProfile:
+        from secretary_clean.core.models import LanguageMode, VoiceLanguageStrategy
+        return TenantOperatingProfile(
+            company_id=str(row["company_id"]),
+            workspace_mode=row["workspace_mode"],
+            industry_group=row.get("industry_group"),
+            industry_subtype=row.get("industry_subtype"),
+            internal_language_mode=LanguageMode(row["internal_language_mode"]),
+            customer_language_mode=LanguageMode(row["customer_language_mode"]),
+            default_internal_language_code=row["default_internal_language_code"],
+            default_customer_language_code=row["default_customer_language_code"],
+            voice_input_strategy=VoiceLanguageStrategy(row["voice_input_strategy"]),
+            voice_output_strategy=VoiceLanguageStrategy(row["voice_output_strategy"]),
+            auto_translate_customer_to_internal=row["auto_translate_customer_to_internal"],
+            auto_translate_internal_to_customer=row["auto_translate_internal_to_customer"],
+        )
+
+    def _row_to_tenant_language(self, row: dict) -> TenantLanguage:
+        return TenantLanguage(
+            company_id=str(row["company_id"]),
+            language_code=row["language_code"],
+            language_scope=LanguageScope(row["language_scope"]),
+            is_enabled=bool(row["is_enabled"]),
+            is_default=bool(row["is_default"]),
+        )
+
+    def _row_to_crm_record(self, row: dict, module: str) -> CRMRecord:
+        data = row["data"] if isinstance(row["data"], dict) else {}
+        preferred_language_code = row.get("preferred_language_code") if module == "clients" else None
+        return CRMRecord(
+            id=str(row["id"]),
+            company_id=str(row["company_id"]),
+            name=row["name"],
+            status=row.get("status", "open"),
+            data=data,
+            preferred_language_code=preferred_language_code,
+        )
+
+    # ------------------------------------------------------------------
+    # Biometrics
+    # ------------------------------------------------------------------
+
+    def save_biometric(
+        self,
+        bio_id: str,
+        user_id: str,
+        device_id: str,
+        biometric_hash: str,
+        label: str | None = None,
+    ) -> None:
+        """Upsert a biometric hash for a user/device pair."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clean_user_biometrics
+                        (id, user_id, device_id, biometric_hash, label, is_active, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, TRUE, now(), now())
+                    ON CONFLICT (user_id, device_id)
+                    DO UPDATE SET
+                        biometric_hash = EXCLUDED.biometric_hash,
+                        label = EXCLUDED.label,
+                        is_active = TRUE,
+                        updated_at = now()
+                    """,
+                    (bio_id, user_id, device_id, biometric_hash, label),
+                )
+            conn.commit()
+
+    def get_biometric_hashes(self, user_id: str) -> list[str]:
+        """Return all active biometric hashes for a user."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT biometric_hash FROM clean_user_biometrics "
+                    "WHERE user_id = %s AND is_active = TRUE",
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+        return [r["biometric_hash"] for r in rows]
+
+    def deactivate_biometric(self, user_id: str, device_id: str) -> bool:
+        """Deactivate a biometric entry. Returns True if a row was affected."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE clean_user_biometrics SET is_active = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND device_id = %s AND is_active = TRUE",
+                    (user_id, device_id),
+                )
+                affected = cur.rowcount
+            conn.commit()
+        return affected > 0
+
+    # ------------------------------------------------------------------
+    # Backup manifests
+    # ------------------------------------------------------------------
+
+    def save_backup_manifest(
+        self,
+        backup_id: str,
+        company_id: str,
+        created_by_user_id: str,
+        created_by_role: str,
+        backup_scope: str,
+        includes_db_reference: bool,
+        storage_location: str,
+        restore_token: str | None,
+        restore_token_expires_at,
+        payload: dict,
+    ) -> None:
+        import json as _json
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clean_backup_manifests
+                        (id, company_id, created_by_user_id, created_by_role,
+                         backup_scope, includes_db_reference, storage_location,
+                         restore_token, restore_token_expires_at, payload, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    """,
+                    (
+                        backup_id, company_id, created_by_user_id, created_by_role,
+                        backup_scope, includes_db_reference, storage_location,
+                        restore_token, restore_token_expires_at,
+                        psycopg2.extras.Json(payload),
+                    ),
+                )
+            conn.commit()
+
+    def list_backup_manifests(self, company_id: str) -> list[dict]:
+        """Return summary rows for all server-stored backups for a company."""
+        from secretary_clean.core.models import BackupRestoreInfo, BackupScope
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, company_id, created_by_role, backup_scope,
+                           includes_db_reference, created_at
+                    FROM clean_backup_manifests
+                    WHERE company_id = %s
+                    ORDER BY created_at DESC
+                    """,
+                    (company_id,),
+                )
+                rows = cur.fetchall()
+        results = []
+        for r in rows:
+            results.append(BackupRestoreInfo(
+                backup_id=str(r["id"]),
+                company_legal_name="",  # not stored in manifest header row
+                created_at=r["created_at"],
+                backup_scope=BackupScope(r["backup_scope"]),
+                includes_db_reference=bool(r["includes_db_reference"]),
+            ))
+        return results
+
+    def get_backup_manifest_by_token(self, token: str) -> dict | None:
+        """Return the full manifest row for a restore token."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, company_id, created_by_user_id, created_by_role,
+                           backup_scope, includes_db_reference,
+                           restore_token_expires_at, payload
+                    FROM clean_backup_manifests
+                    WHERE restore_token = %s
+                    """,
+                    (token,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+
+# ------------------------------------------------------------------
+# Connection pool context manager
+# ------------------------------------------------------------------
+
+class _PooledConnection:
+    """Simple context manager that checks a connection out of the pool and returns it."""
+
+    def __init__(self, pool: ThreadedConnectionPool) -> None:
+        self._pool = pool
+        self._conn = None
+
+    def __enter__(self):
+        self._conn = self._pool.getconn()
+        return self._conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        self._pool.putconn(self._conn)
+        return False

@@ -8,6 +8,7 @@ from secretary_clean.core.models import (
     ChangePasswordRequest,
     CreateUserRequest,
     LoginRequest,
+    LoginResponse,
     RefreshRequest,
     UserAccount,
 )
@@ -16,13 +17,32 @@ from secretary_clean.core.security import TokenPair, decode_token, issue_token_p
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+_DEFAULT_TEMP_PASSWORD = "12345"
 
-@router.post("/login", response_model=TokenPair)
+
+@router.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest, repository: InMemorySecretaryRepository = Depends(get_repository)):
     user = repository.authenticate(payload.email, payload.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    return issue_token_pair(user_id=user.id, company_id=user.company_id, role=user.role.value)
+    tokens = issue_token_pair(user_id=user.id, company_id=user.company_id, role=user.role.value)
+    return LoginResponse(
+        access_token=tokens.access_token,
+        refresh_token=tokens.refresh_token,
+        token_type=tokens.token_type,
+        id=user.id,
+        company_id=user.company_id,
+        email=user.email,
+        display_name=user.display_name,
+        role=user.role,
+        permissions=user.permissions,
+        preferred_language_code=user.preferred_language_code,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        phone=user.phone,
+        is_active=user.is_active,
+        must_change_password=user.must_change_password,
+    )
 
 
 @router.post("/refresh", response_model=TokenPair)
@@ -85,6 +105,12 @@ def change_password(
 
 
 @router.get("/first-login-users")
-def first_login_users():
-    """Compatibility stub — returns empty list on clean backend."""
-    return []
+def first_login_users(
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Return users that still have must_change_password=True."""
+    if user.role.value not in ("owner", "admin"):
+        return []
+    all_users = repository.list_users(user.company_id)
+    return [{"id": u.id, "email": u.email, "display_name": u.display_name} for u in all_users if u.must_change_password]
