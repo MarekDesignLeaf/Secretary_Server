@@ -1217,7 +1217,42 @@ class PostgresSecretaryRepository:
             last_name=row.get("last_name"),
             phone=row.get("phone"),
             is_active=bool(row["is_active"]),
+            must_change_password=bool(row.get("must_change_password", False)),
         )
+
+    # ------------------------------------------------------------------
+    # Wipe all data (factory reset)
+    # ------------------------------------------------------------------
+
+    def wipe_all_data(self) -> None:
+        """Truncate all clean_* tables to allow a fresh onboarding.
+        Only called when the ALLOW_WIPE environment variable is set to 'true'.
+        """
+        tables = [
+            "clean_backup_manifests",
+            "clean_user_biometrics",
+            "clean_password_reset_tokens",
+            "clean_clients",
+            "clean_jobs",
+            "clean_tasks",
+            "clean_quotes",
+            "clean_invoices",
+            "clean_communications",
+            "clean_work_reports",
+            "tenant_activity_pricing",
+            "tenant_language_settings",
+            "clean_tenant_configuration",
+            "clean_company_operating_settings",
+            "tenant_operating_profile",
+            "clean_users",
+            "clean_companies",
+        ]
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                for table in tables:
+                    cur.execute(f"TRUNCATE TABLE {table} CASCADE")  # noqa: S608
+            conn.commit()
+        logger.info("wipe_all_data: all clean_* tables truncated")
 
     def _row_to_company(self, row: dict) -> CompanyProfile:
         return CompanyProfile(

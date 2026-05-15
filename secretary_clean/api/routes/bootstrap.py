@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import os
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -69,3 +70,19 @@ def create_first_install(payload: FirstInstallCreate, repository: InMemorySecret
         return repository.create_first_install(payload)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/wipe")
+def wipe_all_data(repository: InMemorySecretaryRepository = Depends(get_repository)):
+    """Wipe ALL company/user data for a clean factory reset.
+
+    Only works when the ALLOW_WIPE environment variable is set to 'true' on the server.
+    After wiping, the app will go back to the first-install onboarding flow.
+    """
+    if os.getenv("ALLOW_WIPE", "").lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail="Factory reset is not enabled on this server. Set ALLOW_WIPE=true to enable.",
+        )
+    repository.wipe_all_data()
+    return repository.bootstrap_status()
