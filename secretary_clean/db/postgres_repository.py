@@ -1099,8 +1099,9 @@ class PostgresSecretaryRepository:
     # ------------------------------------------------------------------
 
     def wipe_all_data(self) -> None:
-        """Delete ALL tenant/user/company data. Preserves catalogue tables (industries, activities, etc).
-        After this call GET /bootstrap/status returns is_ready=False."""
+        """Delete ALL tenant/user/company data. Preserves catalogue tables.
+        After this call GET /bootstrap/status returns is_ready=False.
+        Only truncates tables that actually exist — safe against schema differences."""
         candidates = [
             "clean_tenant_activity_pricing",
             "clean_backup_manifests",
@@ -1124,7 +1125,6 @@ class PostgresSecretaryRepository:
         ]
         with self._conn() as conn:
             with conn.cursor() as cur:
-                # Only truncate tables that actually exist in this DB
                 cur.execute(
                     "SELECT table_name FROM information_schema.tables "
                     "WHERE table_schema = 'public' AND table_name = ANY(%s)",
@@ -1136,20 +1136,8 @@ class PostgresSecretaryRepository:
                         cur.execute(f"TRUNCATE TABLE {table} CASCADE")  # noqa: S608
                     else:
                         logger.warning("wipe_all_data: table %s not found, skipping", table)
-                # Reset non-catalogue sequences
-                cur.execute("""
-                    SELECT sequence_name FROM information_schema.sequences
-                    WHERE sequence_schema = 'public'
-                    AND sequence_name NOT LIKE '%industry%'
-                    AND sequence_name NOT LIKE '%activity%'
-                    AND sequence_name NOT LIKE '%work_subtype%'
-                    AND sequence_name NOT LIKE '%pricing_method%'
-                    AND sequence_name NOT LIKE '%additional_charge%'
-                    AND sequence_name NOT LIKE '%language_catalog%'
-                """)
-                for (seq,) in cur.fetchall():
-                    cur.execute(f"ALTER SEQUENCE {seq} RESTART WITH 1")  # noqa: S608
             conn.commit()
+        logger.info("wipe_all_data: done. wiped=%s", [t for t in candidates if t in existing])
 
     # ------------------------------------------------------------------
     # Reset user password (admin action)
