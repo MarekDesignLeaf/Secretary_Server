@@ -84,5 +84,8 @@ def wipe_all_data(repository: InMemorySecretaryRepository = Depends(get_reposito
             status_code=403,
             detail="Factory reset is not enabled on this server. Set ALLOW_WIPE=true to enable.",
         )
-    repository.wipe_all_data()
-    return repository.bootstrap_status()
+    try:
+        repository.wipe_all_data()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Wipe failed: {exc}") from exc
+    return {"ok": True, "is_ready": False}
