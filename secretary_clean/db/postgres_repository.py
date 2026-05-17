@@ -1095,6 +1095,81 @@ class PostgresSecretaryRepository:
         return [self._row_to_crm_record(r, module) for r in rows]
 
     # ------------------------------------------------------------------
+    # Wipe
+    # ------------------------------------------------------------------
+
+    def wipe_all_data(self) -> None:
+        """Delete ALL tenant/user/company data. Preserves catalogue tables (industries, activities, etc).
+        After this call GET /bootstrap/status returns is_ready=False."""
+        candidates = [
+            "clean_tenant_activity_pricing",
+            "clean_backup_manifests",
+            "clean_user_biometrics",
+            "clean_password_reset_tokens",
+            "clean_refresh_tokens",
+            "clean_communications",
+            "clean_work_reports",
+            "clean_invoices",
+            "clean_quotes",
+            "clean_tasks",
+            "clean_jobs",
+            "clean_clients",
+            "clean_permissions",
+            "clean_users",
+            "tenant_languages",
+            "clean_tenant_configuration",
+            "tenant_operating_profile",
+            "clean_company_operating_settings",
+            "clean_companies",
+        ]
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                # Only truncate tables that actually exist in this DB
+                cur.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = ANY(%s)",
+                    (candidates,),
+                )
+                existing = {row[0] for row in cur.fetchall()}
+                for table in candidates:
+                    if table in existing:
+                        cur.execute(f"TRUNCATE TABLE {table} CASCADE")  # noqa: S608
+                    else:
+                        logger.warning("wipe_all_data: table %s not found, skipping", table)
+                # Reset non-catalogue sequences
+                cur.execute("""
+                    SELECT sequence_name FROM information_schema.sequences
+                    WHERE sequence_schema = 'public'
+                    AND sequence_name NOT LIKE '%industry%'
+                    AND sequence_name NOT LIKE '%activity%'
+                    AND sequence_name NOT LIKE '%work_subtype%'
+                    AND sequence_name NOT LIKE '%pricing_method%'
+                    AND sequence_name NOT LIKE '%additional_charge%'
+                    AND sequence_name NOT LIKE '%language_catalog%'
+                """)
+                for (seq,) in cur.fetchall():
+                    cur.execute(f"ALTER SEQUENCE {seq} RESTART WITH 1")  # noqa: S608
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # Reset user password (admin action)
+    # ------------------------------------------------------------------
+
+    def reset_user_password(self, user_id: str, new_password: str) -> None:
+        from secretary_clean.core.security import hash_password
+        user = self.get_user(user_id)
+        if not user:
+            raise KeyError("User not found")
+        new_hash = hash_password(new_password)
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE clean_users SET password_hash = %s, must_change_password = TRUE WHERE id = %s",
+                    (new_hash, user_id),
+                )
+            conn.commit()
+
+    # ------------------------------------------------------------------
     # Password reset
     # ------------------------------------------------------------------
 
@@ -1220,39 +1295,7 @@ class PostgresSecretaryRepository:
             must_change_password=bool(row.get("must_change_password", False)),
         )
 
-    # ------------------------------------------------------------------
-    # Wipe all data (factory reset)
-    # ------------------------------------------------------------------
-
-    def wipe_all_data(self) -> None:
-        """Truncate all clean_* tables to allow a fresh onboarding.
-        Only called when the ALLOW_WIPE environment variable is set to 'true'.
-        """
-        tables = [
-            "clean_backup_manifests",
-            "clean_user_biometrics",
-            "clean_password_reset_tokens",
-            "clean_clients",
-            "clean_jobs",
-            "clean_tasks",
-            "clean_quotes",
-            "clean_invoices",
-            "clean_communications",
-            "clean_work_reports",
-            "tenant_activity_pricing",
-            "tenant_language_settings",
-            "clean_tenant_configuration",
-            "clean_company_operating_settings",
-            "tenant_operating_profile",
-            "clean_users",
-            "clean_companies",
-        ]
-        with self._conn() as conn:
-            with conn.cursor() as cur:
-                for table in tables:
-                    cur.execute(f"TRUNCATE TABLE {table} CASCADE")  # noqa: S608
-            conn.commit()
-        logger.info("wipe_all_data: all clean_* tables truncated")
+    # duplicate wipe_all_data removed — canonical definition is at line ~1101
 
     def _row_to_company(self, row: dict) -> CompanyProfile:
         return CompanyProfile(
