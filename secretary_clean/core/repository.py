@@ -314,6 +314,20 @@ class InMemorySecretaryRepository:
         )
         return identity
 
+    def update_company_industry(self, company_id: str, industry_group: str | None, industry_subtype: str | None) -> TenantOperatingProfile:
+        if company_id not in self.companies:
+            raise KeyError("Company not found")
+        current = self.get_tenant_operating_profile(company_id)
+        updated = current.model_copy(update={
+            "industry_group": industry_group,
+            "industry_subtype": industry_subtype,
+        })
+        self.tenant_operating_profiles[company_id] = updated
+        cfg = self.tenant_configuration.setdefault(company_id, {})
+        cfg["industry_group"] = industry_group
+        cfg["industry_subtype"] = industry_subtype
+        return updated
+
     def get_tenant_operating_profile(self, company_id: str) -> TenantOperatingProfile:
         if company_id not in self.companies:
             raise KeyError("Company not found")

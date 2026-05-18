@@ -261,6 +261,10 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class ResetPasswordRequest(BaseModel):
+    new_password: str
+
+
 class LanguageDefinition(BaseModel):
     code: str
     name: str

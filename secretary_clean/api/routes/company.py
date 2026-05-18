@@ -3,7 +3,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from secretary_clean.api.deps import current_user, get_repository
+from pydantic import BaseModel
+
 from secretary_clean.core.models import CompanyLegalIdentity, CompanyOperatingSettings, CompanyProfile, TenantOperatingProfile, UserAccount
+
+
+class IndustryUpdate(BaseModel):
+    industry_group: str | None = None
+    industry_subtype: str | None = None
 from secretary_clean.core.repository import InMemorySecretaryRepository
 
 router = APIRouter(prefix="/company", tags=["company"])
@@ -58,5 +65,18 @@ def update_operating_settings(payload: CompanyOperatingSettings, user: UserAccou
 def get_operating_profile(user: UserAccount = Depends(current_user), repository: InMemorySecretaryRepository = Depends(get_repository)):
     try:
         return repository.get_tenant_operating_profile(user.company_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Company not found") from exc
+
+
+@router.put("/industry", response_model=TenantOperatingProfile)
+def update_industry(payload: IndustryUpdate, user: UserAccount = Depends(current_user), repository: InMemorySecretaryRepository = Depends(get_repository)):
+    """Update the company's industry group and subtype after first install."""
+    try:
+        return repository.update_company_industry(
+            user.company_id,
+            industry_group=payload.industry_group,
+            industry_subtype=payload.industry_subtype,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Company not found") from exc

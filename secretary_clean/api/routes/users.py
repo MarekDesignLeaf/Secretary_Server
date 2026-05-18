@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from secretary_clean.api.deps import current_user, get_repository
-from secretary_clean.core.models import CreateUserRequest, UpdateUserRequest, UserAccount
+from secretary_clean.core.models import CreateUserRequest, ResetPasswordRequest, UpdateUserRequest, UserAccount
 from secretary_clean.core.repository import InMemorySecretaryRepository
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -83,6 +83,22 @@ def delete_user(
         raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
     try:
         repository.delete_user(user_id, user.company_id)
+        return {"ok": True}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{user_id}/reset-password")
+def reset_user_password(
+    user_id: str,
+    payload: ResetPasswordRequest,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    if user.role.value not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    try:
+        repository.reset_user_password(user_id, payload.new_password)
         return {"ok": True}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
