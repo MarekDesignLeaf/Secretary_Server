@@ -122,7 +122,7 @@ class InMemorySecretaryRepository:
         self.password_hashes[user.id] = hash_password(password)
         return user
 
-    def create_first_install(self, payload: FirstInstallCreate) -> FirstInstallResult:
+    def create_first_install(self, payload: FirstInstallCreate, *, activity_defaults: dict | None = None) -> FirstInstallResult:
         if self.companies:
             raise ValueError("First company already exists")
         if any(user.role == Role.owner for user in self.users.values()):
@@ -251,6 +251,19 @@ class InMemorySecretaryRepository:
         self.password_hashes[user_id] = hash_password(new_password)
         updated = user.model_copy(update={"must_change_password": True})
         self.users[user_id] = updated
+
+    def wipe_all_data(self) -> None:
+        """Delete ALL tenant/user/company data. After this call bootstrap_status returns is_ready=False."""
+        self.companies.clear()
+        self.company_settings.clear()
+        self.tenant_operating_profiles.clear()
+        self.tenant_languages.clear()
+        self.tenant_configuration.clear()
+        self.users.clear()
+        self.password_hashes.clear()
+        self.tenant_pricing.clear()
+        for module_dict in self.crm.values():
+            module_dict.clear()
 
     def list_roles(self) -> dict[str, list[str]]:
         return {role.value: sorted(permission.value for permission in permissions) for role, permissions in ROLE_PERMISSIONS.items()}

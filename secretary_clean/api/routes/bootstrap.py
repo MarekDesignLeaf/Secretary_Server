@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import os
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from secretary_clean.api.deps import get_repository
 from secretary_clean.core.models import BootstrapStatus, FirstAdminCreate, FirstCompanyCreate, FirstInstallCreate, FirstInstallResult, UserAccount
@@ -65,9 +65,26 @@ def create_first_admin(payload: FirstAdminCreate, repository: InMemorySecretaryR
 
 
 @router.post("/first-install", response_model=FirstInstallResult)
-def create_first_install(payload: FirstInstallCreate, repository: InMemorySecretaryRepository = Depends(get_repository)):
+def create_first_install(
+    request: Request,
+    payload: FirstInstallCreate,
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
     try:
-        return repository.create_first_install(payload)
+        # Build activity_defaults from in-memory catalogue so postgres repo can seed pricing
+        activity_defaults: dict[str, str] = {}
+        catalogue = getattr(getattr(request, "app", None), "state", None)
+        if catalogue:
+            cat = getattr(catalogue, "catalogue", None)
+            if cat:
+                for industry in getattr(cat, "industries", []):
+                    for subtype in getattr(industry, "subtypes", []):
+                        for activity in getattr(subtype, "activities", []):
+                            code = getattr(activity, "code", None)
+                            method = getattr(activity, "default_pricing_method_code", None)
+                            if code and method:
+                                activity_defaults[code] = method
+        return repository.create_first_install(payload, activity_defaults=activity_defaults)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
