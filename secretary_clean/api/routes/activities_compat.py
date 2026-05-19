@@ -151,20 +151,19 @@ def get_tenant_activity_pricing(
                 continue
             for act in sub.activities:
                 override = existing.get(act.code)
-                if override:
-                    results.append({
-                        "template_id": _cid(act.code),
-                        "activity_code": act.code,
-                        "pricing_method": override.selected_pricing_method_code,
-                        "rate": override.rate if override.rate is not None else 0.0,
-                        "custom_name": override.custom_name or "",
-                        "is_active": override.is_active,
-                        "enabled_additional_charge_codes": override.enabled_additional_charge_codes,
-                        # Legacy fields expected by Android edit dialog:
-                        "notes": "",
-                        "voice_aliases": [],
-                        "supplementary": {},
-                    })
+                results.append({
+                    "template_id": _cid(act.code),
+                    "activity_code": act.code,
+                    "pricing_method": override.selected_pricing_method_code if override else act.default_pricing_method_code,
+                    "rate": (override.rate if override.rate is not None else 0.0) if override else 0.0,
+                    "custom_name": override.custom_name or "" if override else "",
+                    "is_active": override.is_active if override else True,
+                    "enabled_additional_charge_codes": override.enabled_additional_charge_codes if override else [],
+                    # Legacy fields expected by Android edit dialog:
+                    "notes": "",
+                    "voice_aliases": [],
+                    "supplementary": {},
+                })
     return results
 
 
