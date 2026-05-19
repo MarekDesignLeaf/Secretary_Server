@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS clean_backup_manifests (
 # Column additions for existing tables (safe to run multiple times)
 _ALTER_DDL = """
 ALTER TABLE clean_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE clean_companies ADD COLUMN IF NOT EXISTS industry_group TEXT;
+ALTER TABLE clean_companies ADD COLUMN IF NOT EXISTS industry_subtype TEXT;
+ALTER TABLE tenant_operating_profile ADD COLUMN IF NOT EXISTS industry_group TEXT;
+ALTER TABLE tenant_operating_profile ADD COLUMN IF NOT EXISTS industry_subtype TEXT;
+ALTER TABLE clean_tenant_configuration ADD COLUMN IF NOT EXISTS industry_group TEXT;
+ALTER TABLE clean_tenant_configuration ADD COLUMN IF NOT EXISTS industry_subtype TEXT;
 """
 
 

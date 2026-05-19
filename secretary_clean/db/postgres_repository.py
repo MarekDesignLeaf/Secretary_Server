@@ -744,6 +744,34 @@ class PostgresSecretaryRepository:
             return TenantOperatingProfile(company_id=company_id)
         return self._row_to_tenant_profile(row)
 
+    def update_company_industry(
+        self, company_id: str, industry_group: str | None, industry_subtype: str | None
+    ) -> TenantOperatingProfile:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM clean_companies WHERE id = %s", (company_id,))
+                if cur.fetchone()["n"] == 0:
+                    raise KeyError("Company not found")
+                cur.execute(
+                    """
+                    UPDATE clean_companies
+                    SET industry_group = %s, industry_subtype = %s, updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (industry_group, industry_subtype, company_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO tenant_operating_profile (company_id, industry_group, industry_subtype)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (company_id) DO UPDATE SET
+                        industry_group = EXCLUDED.industry_group,
+                        industry_subtype = EXCLUDED.industry_subtype
+                    """,
+                    (company_id, industry_group, industry_subtype),
+                )
+        return self.get_tenant_operating_profile(company_id)
+
     def update_tenant_operating_profile(
         self, company_id: str, settings: LanguageSettings
     ) -> TenantOperatingProfile:
