@@ -138,10 +138,10 @@ class InMemorySecretaryRepository:
                 phone=payload.phone,
                 website=payload.website,
                 workspace_mode=payload.workspace_mode,
-                industry_group=payload.industry_group,
-                industry_subtype=payload.industry_subtype,
-                default_internal_language_code=payload.internal_company_language,
-                default_customer_language_code=payload.default_customer_language,
+                industry_group=payload.primary_industry or (payload.selected_industries[0] if payload.selected_industries else payload.industry_group),
+                industry_subtype=payload.primary_subtype or (payload.selected_subtypes[0] if payload.selected_subtypes else payload.industry_subtype),
+                default_internal_language_code=payload.default_internal_language_code,
+                default_customer_language_code=payload.default_customer_language_code,
             )
         )
         admin = self.create_first_admin(
@@ -149,7 +149,7 @@ class InMemorySecretaryRepository:
             email=payload.first_admin_email,
             display_name=payload.first_admin_display_name,
             password=payload.first_admin_password,
-            preferred_language_code=payload.internal_company_language,
+            preferred_language_code=payload.default_internal_language_code,
             first_name=payload.first_admin_first_name,
             last_name=payload.first_admin_last_name,
             phone=payload.phone,

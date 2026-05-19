@@ -292,10 +292,10 @@ class PostgresSecretaryRepository:
                     raise ValueError("First admin already exists")
 
         industry_group = payload.primary_industry or (
-            payload.selected_industries[0] if payload.selected_industries else None
+            payload.selected_industries[0] if payload.selected_industries else payload.industry_group
         )
         industry_subtype = payload.primary_subtype or (
-            payload.selected_subtypes[0] if payload.selected_subtypes else None
+            payload.selected_subtypes[0] if payload.selected_subtypes else payload.industry_subtype
         )
 
         company = self.create_first_company(
@@ -770,6 +770,7 @@ class PostgresSecretaryRepository:
                     """,
                     (company_id, industry_group, industry_subtype),
                 )
+            conn.commit()
         return self.get_tenant_operating_profile(company_id)
 
     def update_tenant_operating_profile(
@@ -1168,24 +1169,6 @@ class PostgresSecretaryRepository:
         logger.info("wipe_all_data: done. wiped=%s", [t for t in candidates if t in existing])
 
     # ------------------------------------------------------------------
-    # Reset user password (admin action)
-    # ------------------------------------------------------------------
-
-    def reset_user_password(self, user_id: str, new_password: str) -> None:
-        from secretary_clean.core.security import hash_password
-        user = self.get_user(user_id)
-        if not user:
-            raise KeyError("User not found")
-        new_hash = hash_password(new_password)
-        with self._conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE clean_users SET password_hash = %s, must_change_password = TRUE WHERE id = %s",
-                    (new_hash, user_id),
-                )
-            conn.commit()
-
-    # ------------------------------------------------------------------
     # Password reset
     # ------------------------------------------------------------------
 
@@ -1286,85 +1269,6 @@ class PostgresSecretaryRepository:
             raise PermissionError("Recovery is only available for owner/admin accounts")
         self.reset_user_password(user.id, new_password)
         return user
-
-    # ------------------------------------------------------------------
-    # Private row-to-model helpers
-    # ------------------------------------------------------------------
-
-    def _build_user_account(self, user_id: str) -> UserAccount:
-        return self.get_user(user_id)
-
-    def _row_to_user(self, row: dict) -> UserAccount:
-        role = Role(row["role"])
-        return UserAccount(
-            id=str(row["id"]),
-            company_id=str(row["company_id"]),
-            email=row["email"],
-            display_name=row["display_name"],
-            role=role,
-            permissions=sorted(ROLE_PERMISSIONS[role]),
-            preferred_language_code=row.get("preferred_language_code"),
-            first_name=row.get("first_name"),
-            last_name=row.get("last_name"),
-            phone=row.get("phone"),
-            is_active=bool(row["is_active"]),
-            must_change_password=bool(row.get("must_change_password", False)),
-        )
-
-    # duplicate wipe_all_data removed — canonical definition is at line ~1101
-
-    def _row_to_company(self, row: dict) -> CompanyProfile:
-        return CompanyProfile(
-            id=str(row["id"]),
-            legal_name=row["legal_name"],
-            trading_name=row.get("trading_name"),
-            legal_type=row.get("legal_type"),
-            default_country=row["default_country"],
-            default_currency=row["default_currency"],
-            timezone=row["timezone"],
-            phone=row.get("phone"),
-            website=row.get("website"),
-            industry_group=row.get("industry_group"),
-            industry_subtype=row.get("industry_subtype"),
-        )
-
-    def _row_to_tenant_profile(self, row: dict) -> TenantOperatingProfile:
-        from secretary_clean.core.models import LanguageMode, VoiceLanguageStrategy
-        return TenantOperatingProfile(
-            company_id=str(row["company_id"]),
-            workspace_mode=row["workspace_mode"],
-            industry_group=row.get("industry_group"),
-            industry_subtype=row.get("industry_subtype"),
-            internal_language_mode=LanguageMode(row["internal_language_mode"]),
-            customer_language_mode=LanguageMode(row["customer_language_mode"]),
-            default_internal_language_code=row["default_internal_language_code"],
-            default_customer_language_code=row["default_customer_language_code"],
-            voice_input_strategy=VoiceLanguageStrategy(row["voice_input_strategy"]),
-            voice_output_strategy=VoiceLanguageStrategy(row["voice_output_strategy"]),
-            auto_translate_customer_to_internal=row["auto_translate_customer_to_internal"],
-            auto_translate_internal_to_customer=row["auto_translate_internal_to_customer"],
-        )
-
-    def _row_to_tenant_language(self, row: dict) -> TenantLanguage:
-        return TenantLanguage(
-            company_id=str(row["company_id"]),
-            language_code=row["language_code"],
-            language_scope=LanguageScope(row["language_scope"]),
-            is_enabled=bool(row["is_enabled"]),
-            is_default=bool(row["is_default"]),
-        )
-
-    def _row_to_crm_record(self, row: dict, module: str) -> CRMRecord:
-        data = row["data"] if isinstance(row["data"], dict) else {}
-        preferred_language_code = row.get("preferred_language_code") if module == "clients" else None
-        return CRMRecord(
-            id=str(row["id"]),
-            company_id=str(row["company_id"]),
-            name=row["name"],
-            status=row.get("status", "open"),
-            data=data,
-            preferred_language_code=preferred_language_code,
-        )
 
     # ------------------------------------------------------------------
     # Biometrics

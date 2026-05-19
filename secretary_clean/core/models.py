@@ -206,11 +206,23 @@ class FirstInstallCreate(BaseModel):
     country: str = "GB"
     timezone: str = "Europe/London"
     currency: str = "GBP"
-    internal_company_language: str = "en-GB"
-    default_customer_language: str = "en-GB"
+    # Language codes (BCP-47 or short codes normalized by server)
+    default_internal_language_code: str = "en-GB"
+    default_customer_language_code: str = "en-GB"
     workspace_mode: str = "single_company"
+    # Catalogue-code-based industry selections (Android sends codes; server owns catalogue)
+    primary_industry: str | None = None
+    primary_subtype: str | None = None
+    selected_industries: list[str] = Field(default_factory=list)
+    selected_subtypes: list[str] = Field(default_factory=list)
+    selected_activities: list[str] = Field(default_factory=list)
+    # Legacy single-industry fields (kept for backward compat; prefer primary_industry)
     industry_group: str | None = None
     industry_subtype: str | None = None
+    # Language lists (optional extras from frontend)
+    selected_languages: list[str] = Field(default_factory=list)
+    voice_input_language_codes: list[str] = Field(default_factory=list)
+    voice_output_language_codes: list[str] = Field(default_factory=list)
     first_admin_display_name: str = Field(min_length=1)
     first_admin_email: str = Field(min_length=1)
     first_admin_password: str = Field(min_length=12)
