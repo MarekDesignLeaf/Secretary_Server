@@ -144,8 +144,16 @@ def get_tenant_activity_pricing(
     the company context.
     """
     existing = {p.activity_code: p for p in repository.list_tenant_pricing(user.company_id)}
+
+    # Filter by the company's industry_group so the list matches what the user sees
+    # in the company profile. Fall back to all industries if not set.
+    profile = repository.get_tenant_operating_profile(user.company_id)
+    industry_filter = profile.industry_group if profile else None
+
     results = []
     for ind in request.app.state.catalogue.industries:
+        if industry_filter and ind.code != industry_filter:
+            continue
         for sub in ind.subtypes:
             if subtype_code and sub.code != subtype_code:
                 continue
@@ -154,12 +162,14 @@ def get_tenant_activity_pricing(
                 results.append({
                     "template_id": _cid(act.code),
                     "activity_code": act.code,
+                    "name": act.name,
+                    "industry_code": ind.code,
+                    "subtype_code": sub.code,
                     "pricing_method": override.selected_pricing_method_code if override else act.default_pricing_method_code,
                     "rate": (override.rate if override.rate is not None else 0.0) if override else 0.0,
                     "custom_name": override.custom_name or "" if override else "",
                     "is_active": override.is_active if override else True,
                     "enabled_additional_charge_codes": override.enabled_additional_charge_codes if override else [],
-                    # Legacy fields expected by Android edit dialog:
                     "notes": "",
                     "voice_aliases": [],
                     "supplementary": {},
