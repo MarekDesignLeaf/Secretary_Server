@@ -16,11 +16,13 @@ from .models import (
     CompanyOperatingSettings,
     CompanyProfile,
     CRMRecord,
+    CRMUpdateRequest,
     FirstCompanyCreate,
     FirstInstallCreate,
     FirstInstallResult,
     LanguageScope,
     LanguageSettings,
+    NoteCreateRequest,
     Permission,
     Role,
     ROLE_PERMISSIONS,
@@ -456,6 +458,64 @@ class InMemorySecretaryRepository:
         if module not in self.crm:
             raise KeyError("Unknown CRM module")
         return [record for record in self.crm[module].values() if record.company_id == company_id]
+
+    def get_crm_record(self, module: str, record_id: str, company_id: str) -> CRMRecord | None:
+        if module not in self.crm:
+            raise KeyError("Unknown CRM module")
+        record = self.crm[module].get(record_id)
+        if record and record.company_id == company_id:
+            return record
+        return None
+
+    def update_crm_record(self, module: str, record_id: str, company_id: str, payload: CRMUpdateRequest) -> CRMRecord:
+        if module not in self.crm:
+            raise KeyError("Unknown CRM module")
+        record = self.crm[module].get(record_id)
+        if not record or record.company_id != company_id:
+            raise KeyError("Record not found")
+        updates: dict = {}
+        if payload.name is not None:
+            updates["name"] = payload.name
+        if payload.status is not None:
+            updates["status"] = payload.status
+        if payload.data is not None:
+            merged = {**record.data, **payload.data}
+            updates["data"] = merged
+        updates["updated_at"] = datetime.now(timezone.utc)
+        updated = record.model_copy(update=updates)
+        self.crm[module][record_id] = updated
+        return updated
+
+    def delete_crm_record(self, module: str, record_id: str, company_id: str) -> bool:
+        """Soft-delete: sets status='deleted' and updated_at. Never hard-deletes."""
+        if module not in self.crm:
+            raise KeyError("Unknown CRM module")
+        record = self.crm[module].get(record_id)
+        if not record or record.company_id != company_id:
+            raise KeyError("Record not found")
+        updated = record.model_copy(update={"status": "deleted", "updated_at": datetime.now(timezone.utc)})
+        self.crm[module][record_id] = updated
+        return True
+
+    def add_crm_note(self, module: str, record_id: str, company_id: str, note: NoteCreateRequest, author_id: str) -> CRMRecord:
+        """Append a timestamped note to data['notes'] list."""
+        if module not in self.crm:
+            raise KeyError("Unknown CRM module")
+        record = self.crm[module].get(record_id)
+        if not record or record.company_id != company_id:
+            raise KeyError("Record not found")
+        notes = list(record.data.get("notes", []))
+        notes.append({
+            "id": str(uuid4()),
+            "content": note.content,
+            "author_id": author_id,
+            "author_name": note.author_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        merged_data = {**record.data, "notes": notes}
+        updated = record.model_copy(update={"data": merged_data, "updated_at": datetime.now(timezone.utc)})
+        self.crm[module][record_id] = updated
+        return updated
 
     # ------------------------------------------------------------------
     # Biometrics (in-memory stubs)

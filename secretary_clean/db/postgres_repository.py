@@ -23,12 +23,15 @@ from secretary_clean.core.models import (
     CompanyLegalIdentity,
     CompanyOperatingSettings,
     CompanyProfile,
+    CRMCreateRequest,
     CRMRecord,
+    CRMUpdateRequest,
     FirstCompanyCreate,
     FirstInstallCreate,
     FirstInstallResult,
     LanguageScope,
     LanguageSettings,
+    NoteCreateRequest,
     PasswordResetToken,
     Permission,
     Role,
@@ -574,6 +577,8 @@ class PostgresSecretaryRepository:
             status=row.get("status", "open"),
             data=data,
             preferred_language_code=preferred_language_code,
+            created_at=_ensure_utc(row.get("created_at")),
+            updated_at=_ensure_utc(row.get("updated_at")),
         )
 
     def list_roles(self) -> dict[str, list[str]]:
@@ -1117,11 +1122,112 @@ class PostgresSecretaryRepository:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT * FROM {table} WHERE company_id = %s ORDER BY created_at",
+                    f"SELECT * FROM {table} WHERE company_id = %s AND status != 'deleted' ORDER BY created_at",
                     (company_id,),
                 )
                 rows = cur.fetchall()
         return [self._row_to_crm_record(r, module) for r in rows]
+
+    def get_crm_record(self, module: str, record_id: str, company_id: str) -> CRMRecord | None:
+        if module not in _VALID_CRM_MODULES:
+            raise KeyError("Unknown CRM module")
+        table = _CRM_TABLES[module]
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT * FROM {table} WHERE id = %s AND company_id = %s",
+                    (record_id, company_id),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return self._row_to_crm_record(row, module)
+
+    def update_crm_record(self, module: str, record_id: str, company_id: str, payload: CRMUpdateRequest) -> CRMRecord:
+        if module not in _VALID_CRM_MODULES:
+            raise KeyError("Unknown CRM module")
+        table = _CRM_TABLES[module]
+        # Fetch current record first (tenant-safe)
+        existing = self.get_crm_record(module, record_id, company_id)
+        if not existing:
+            raise KeyError("Record not found")
+        set_clauses = []
+        params: list = []
+        if payload.name is not None:
+            set_clauses.append("name = %s")
+            params.append(payload.name)
+        if payload.status is not None:
+            set_clauses.append("status = %s")
+            params.append(payload.status)
+        if payload.data is not None:
+            # Merge: existing data || new data (jsonb merge)
+            set_clauses.append("data = data || %s::jsonb")
+            params.append(json.dumps(payload.data))
+        set_clauses.append("updated_at = now()")
+        params.extend([record_id, company_id])
+        set_sql = ", ".join(set_clauses)
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {table} SET {set_sql} WHERE id = %s AND company_id = %s RETURNING *",
+                    params,
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return self._row_to_crm_record(row, module)
+
+    def delete_crm_record(self, module: str, record_id: str, company_id: str) -> bool:
+        """Soft-delete: sets status='deleted'. Never hard-deletes for audit safety."""
+        if module not in _VALID_CRM_MODULES:
+            raise KeyError("Unknown CRM module")
+        table = _CRM_TABLES[module]
+        existing = self.get_crm_record(module, record_id, company_id)
+        if not existing:
+            raise KeyError("Record not found")
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {table} SET status = 'deleted', updated_at = now() WHERE id = %s AND company_id = %s",
+                    (record_id, company_id),
+                )
+            conn.commit()
+        return True
+
+    def add_crm_note(self, module: str, record_id: str, company_id: str, note: NoteCreateRequest, author_id: str) -> CRMRecord:
+        """Append a timestamped note to data['notes'] array in JSONB."""
+        if module not in _VALID_CRM_MODULES:
+            raise KeyError("Unknown CRM module")
+        table = _CRM_TABLES[module]
+        existing = self.get_crm_record(module, record_id, company_id)
+        if not existing:
+            raise KeyError("Record not found")
+        note_entry = {
+            "id": str(uuid4()),
+            "content": note.content,
+            "author_id": author_id,
+            "author_name": note.author_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                # Append to notes array within JSONB, creating it if absent
+                cur.execute(
+                    f"""
+                    UPDATE {table}
+                    SET data = jsonb_set(
+                        data,
+                        '{{notes}}',
+                        coalesce(data->'notes', '[]'::jsonb) || %s::jsonb
+                    ),
+                    updated_at = now()
+                    WHERE id = %s AND company_id = %s
+                    RETURNING *
+                    """,
+                    (json.dumps([note_entry]), record_id, company_id),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return self._row_to_crm_record(row, module)
 
     # ------------------------------------------------------------------
     # Wipe

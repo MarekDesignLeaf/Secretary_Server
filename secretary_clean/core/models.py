@@ -359,6 +359,27 @@ class CRMRecord(BaseModel):
     status: str = "open"
     data: dict[str, Any] = Field(default_factory=dict)
     preferred_language_code: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class CRMCreateRequest(BaseModel):
+    """Generic create payload for any CRM module record."""
+    name: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class CRMUpdateRequest(BaseModel):
+    """Generic update payload for any CRM module record."""
+    name: str | None = None
+    status: str | None = None
+    data: dict[str, Any] | None = None
+
+
+class NoteCreateRequest(BaseModel):
+    """Append a timestamped note to a CRM record's data['notes'] list."""
+    content: str = Field(min_length=1)
+    author_name: str | None = None
 
 
 class VoiceResolveRequest(BaseModel):
