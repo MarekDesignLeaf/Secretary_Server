@@ -26,8 +26,8 @@ class Permission(str, Enum):
     crm_manage = "crm.manage"
     language_manage = "language.manage"
     voice_execute = "voice.execute"
-    backup_manage = "backup.manage"          # full backup incl. DB reference (admin/owner only)
-    backup_personal = "backup.personal"     # personal credential backup (all roles)
+    backup_manage = "backup.manage"
+    backup_personal = "backup.personal"
 
 
 ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
@@ -206,20 +206,16 @@ class FirstInstallCreate(BaseModel):
     country: str = "GB"
     timezone: str = "Europe/London"
     currency: str = "GBP"
-    # Language codes (BCP-47 or short codes normalized by server)
     default_internal_language_code: str = "en-GB"
     default_customer_language_code: str = "en-GB"
     workspace_mode: str = "single_company"
-    # Catalogue-code-based industry selections (Android sends codes; server owns catalogue)
     primary_industry: str | None = None
     primary_subtype: str | None = None
     selected_industries: list[str] = Field(default_factory=list)
     selected_subtypes: list[str] = Field(default_factory=list)
     selected_activities: list[str] = Field(default_factory=list)
-    # Legacy single-industry fields (kept for backward compat; prefer primary_industry)
     industry_group: str | None = None
     industry_subtype: str | None = None
-    # Language lists (optional extras from frontend)
     selected_languages: list[str] = Field(default_factory=list)
     voice_input_language_codes: list[str] = Field(default_factory=list)
     voice_output_language_codes: list[str] = Field(default_factory=list)
@@ -275,6 +271,25 @@ class ChangePasswordRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     new_password: str
+
+
+class PasswordResetToken(BaseModel):
+    id: str
+    user_id: str
+    email: str
+    token_hash: str
+    expires_at: datetime
+    used_at: datetime | None = None
+    created_at: datetime
+
+
+class TenantIndustryProfile(BaseModel):
+    company_id: str
+    primary_industry: str | None = None
+    primary_subtype: str | None = None
+    selected_industries: list[str] = Field(default_factory=list)
+    selected_subtypes: list[str] = Field(default_factory=list)
+    selected_activities: list[str] = Field(default_factory=list)
 
 
 class LanguageDefinition(BaseModel):
@@ -377,9 +392,57 @@ class CRMUpdateRequest(BaseModel):
 
 
 class NoteCreateRequest(BaseModel):
-    """Append a timestamped note to a CRM record's data['notes'] list."""
+    """Append a timestamped note to a CRM record data notes list."""
     content: str = Field(min_length=1)
     author_name: str | None = None
+
+
+class WorkReportWorker(BaseModel):
+    worker_name: str
+    hours: float = 0
+    hourly_rate: float = 0
+
+
+class WorkReportEntry(BaseModel):
+    """A single line item in a work report (type of work performed)."""
+    entry_type: str = "work"
+    hours: float = 0
+    unit_rate: float = 0
+    description: str | None = None
+
+
+class WorkReportMaterial(BaseModel):
+    material_name: str
+    quantity: float = 1
+    unit_price: float = 0
+
+
+class WorkReportWaste(BaseModel):
+    description: str = "waste disposal"
+    quantity: float = 1
+    unit_price: float = 0
+
+
+class WorkReportCreate(BaseModel):
+    """Request body for POST /work-reports."""
+    job_id: str | None = None
+    client_id: str | None = None
+    work_date: str | None = None
+    total_hours: float = 0
+    total_price: float = 0
+    currency: str = "GBP"
+    notes: str | None = None
+    input_type: str = "manual"
+    workers: list[WorkReportWorker] = Field(default_factory=list)
+    entries: list[WorkReportEntry] = Field(default_factory=list)
+    materials: list[WorkReportMaterial] = Field(default_factory=list)
+    waste: list[WorkReportWaste] = Field(default_factory=list)
+
+
+class InvoiceFromWorkReportRequest(BaseModel):
+    """Request body for POST /crm/invoices/from-work-report."""
+    work_report_id: str
+    due_date: str | None = None
 
 
 class VoiceResolveRequest(BaseModel):
@@ -412,10 +475,6 @@ class VoiceExecuteResult(BaseModel):
     language_context: LanguageContext | None = None
 
 
-# ---------------------------------------------------------------------------
-# Biometrics
-# ---------------------------------------------------------------------------
-
 class BiometricRegisterRequest(BaseModel):
     """Register a fingerprint hash for the calling user on a specific device."""
     device_id: str = Field(min_length=1)
@@ -432,13 +491,9 @@ class BiometricEntry(BaseModel):
     created_at: datetime
 
 
-# ---------------------------------------------------------------------------
-# Backup / Uninstall
-# ---------------------------------------------------------------------------
-
 class BackupScope(str, Enum):
-    full = "full"          # admin/owner: all users + DB reference
-    personal = "personal"  # regular user: own credentials + deletable data
+    full = "full"
+    personal = "personal"
 
 
 class BackupStorageLocation(str, Enum):
@@ -450,7 +505,6 @@ class BackupStorageLocation(str, Enum):
 class BackupCreateRequest(BaseModel):
     """Request to create a pre-uninstall backup."""
     storage_location: BackupStorageLocation = BackupStorageLocation.both
-    # The Android client sends a token to prove the device identity
     device_id: str = Field(min_length=1)
 
 
@@ -473,13 +527,9 @@ class BackupManifest(BaseModel):
     backup_scope: BackupScope
     company_id: str
     company_legal_name: str
-    # Credentials — always includes caller's own; full scope adds all users
     users: list[BackupUserCredential]
-    # Settings snapshot
     settings: dict[str, Any] = Field(default_factory=dict)
-    # DB reference — non-null ONLY for backup_scope == 'full' (admin/owner)
     db_reference: str | None = None
-    # Server download token for restore (only set when storage_location includes 'server')
     restore_token: str | None = None
     restore_token_expires_at: datetime | None = None
 

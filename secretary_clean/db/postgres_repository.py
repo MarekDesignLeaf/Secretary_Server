@@ -29,6 +29,7 @@ from secretary_clean.core.models import (
     FirstCompanyCreate,
     FirstInstallCreate,
     FirstInstallResult,
+    InvoiceFromWorkReportRequest,
     LanguageScope,
     LanguageSettings,
     NoteCreateRequest,
@@ -43,6 +44,7 @@ from secretary_clean.core.models import (
     TenantLanguageChoice,
     TenantOperatingProfile,
     UserAccount,
+    WorkReportCreate,
 )
 from secretary_clean.core.security import (
     hash_password,
@@ -1230,6 +1232,129 @@ class PostgresSecretaryRepository:
         return self._row_to_crm_record(row, module)
 
     # ------------------------------------------------------------------
+    # Work Reports
+    # ------------------------------------------------------------------
+
+    def create_work_report(self, company_id: str, payload: WorkReportCreate) -> CRMRecord:
+        data = payload.model_dump()
+        work_date = data.get("work_date") or datetime.now(timezone.utc).date().isoformat()
+        name = f"Work Report {work_date}"
+        data["invoiced"] = False
+        record_id = str(uuid4())
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_work_reports (id, company_id, name, status, data) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (record_id, company_id, name, "open", json.dumps(data)),
+                )
+            conn.commit()
+        return self.get_crm_record("work_reports", record_id, company_id)
+
+    def list_work_reports(self, company_id: str) -> list[CRMRecord]:
+        return self.list_crm_records("work_reports", company_id)
+
+    def get_work_report(self, record_id: str, company_id: str) -> CRMRecord | None:
+        return self.get_crm_record("work_reports", record_id, company_id)
+
+    def create_invoice_from_work_report(
+        self, company_id: str, request: InvoiceFromWorkReportRequest, user_id: str
+    ) -> CRMRecord:
+        from datetime import date, timedelta
+        wr = self.get_work_report(request.work_report_id, company_id)
+        if not wr:
+            raise KeyError("Work report not found")
+        if wr.data.get("invoiced"):
+            raise ValueError("Work report already invoiced")
+
+        entries = wr.data.get("entries", [])
+        materials = wr.data.get("materials", [])
+        waste = wr.data.get("waste", [])
+
+        line_items = []
+        calculated_total = 0.0
+        for e in entries:
+            hours = float(e.get("hours", 0))
+            rate = float(e.get("unit_rate", 0))
+            subtotal = hours * rate
+            calculated_total += subtotal
+            line_items.append({
+                "description": e.get("description") or e.get("entry_type", "work"),
+                "quantity": hours,
+                "unit_price": rate,
+                "subtotal": subtotal,
+            })
+        for m in materials:
+            qty = float(m.get("quantity", 1))
+            price = float(m.get("unit_price", 0))
+            subtotal = qty * price
+            calculated_total += subtotal
+            line_items.append({
+                "description": m.get("material_name", "Material"),
+                "quantity": qty,
+                "unit_price": price,
+                "subtotal": subtotal,
+            })
+        for w in waste:
+            qty = float(w.get("quantity", 1))
+            price = float(w.get("unit_price", 0))
+            subtotal = qty * price
+            calculated_total += subtotal
+            line_items.append({
+                "description": w.get("description", "Waste disposal"),
+                "quantity": qty,
+                "unit_price": price,
+                "subtotal": subtotal,
+            })
+
+        due_date = request.due_date or (date.today() + timedelta(days=30)).isoformat()
+        total = wr.data.get("total_price") or calculated_total
+        client_id = wr.data.get("client_id")
+
+        # Try to resolve client name
+        client_name = ""
+        if client_id:
+            client_rec = self.get_crm_record("clients", client_id, company_id)
+            if client_rec:
+                client_name = f" - {client_rec.name}"
+
+        invoice_data = {
+            "work_report_id": wr.id,
+            "client_id": client_id,
+            "job_id": wr.data.get("job_id"),
+            "line_items": line_items,
+            "total": total,
+            "currency": wr.data.get("currency", "GBP"),
+            "due_date": due_date,
+            "created_by": user_id,
+        }
+
+        invoice_name = f"Invoice{client_name} ({wr.data.get('work_date', 'N/A')})"
+        invoice_id = str(uuid4())
+
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                # Create invoice
+                cur.execute(
+                    "INSERT INTO clean_invoices (id, company_id, name, status, data) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (invoice_id, company_id, invoice_name, "draft", json.dumps(invoice_data)),
+                )
+                # Mark work report as invoiced
+                cur.execute(
+                    """
+                    UPDATE clean_work_reports
+                    SET data = data || %s::jsonb, updated_at = now()
+                    WHERE id = %s AND company_id = %s
+                    """,
+                    (json.dumps({"invoiced": True, "invoice_id": invoice_id}),
+                     wr.id, company_id),
+                )
+            conn.commit()
+
+        return self.get_crm_record("invoices", invoice_id, company_id)
+
+    # ------------------------------------------------------------------
     # Wipe
     # ------------------------------------------------------------------
 
@@ -1278,6 +1403,10 @@ class PostgresSecretaryRepository:
     # Password reset
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Password reset
+    # ------------------------------------------------------------------
+
     def create_password_reset_token(
         self, user: UserAccount, plain_token: str
     ) -> PasswordResetToken:
@@ -1285,11 +1414,6 @@ class PostgresSecretaryRepository:
         token_hash = hash_reset_token(plain_token)
         expires_at = reset_token_expiry()
         created_at = datetime.now(timezone.utc)
-        # Store tokens in a simple table if it exists, otherwise use a lightweight
-        # in-memory fallback tracked per connection. Since schema.sql has no
-        # password_reset_tokens table we use clean_voice_command_logs as storage
-        # is optional. Instead we persist to an in-memory dict in this process.
-        # For production correctness we upsert into a helper table created by migration.
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1489,7 +1613,7 @@ class PostgresSecretaryRepository:
         for r in rows:
             results.append(BackupRestoreInfo(
                 backup_id=str(r["id"]),
-                company_legal_name="",  # not stored in manifest header row
+                company_legal_name="",
                 created_at=r["created_at"],
                 backup_scope=BackupScope(r["backup_scope"]),
                 includes_db_reference=bool(r["includes_db_reference"]),

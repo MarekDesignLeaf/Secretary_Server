@@ -20,6 +20,7 @@ from .models import (
     FirstCompanyCreate,
     FirstInstallCreate,
     FirstInstallResult,
+    InvoiceFromWorkReportRequest,
     LanguageScope,
     LanguageSettings,
     NoteCreateRequest,
@@ -32,6 +33,7 @@ from .models import (
     TenantLanguageChoice,
     TenantOperatingProfile,
     UserAccount,
+    WorkReportCreate,
 )
 from .language import normalize_language_code
 from .security import hash_password, verify_password
@@ -516,6 +518,130 @@ class InMemorySecretaryRepository:
         updated = record.model_copy(update={"data": merged_data, "updated_at": datetime.now(timezone.utc)})
         self.crm[module][record_id] = updated
         return updated
+
+    # ------------------------------------------------------------------
+    # Work Reports
+    # ------------------------------------------------------------------
+
+    def create_work_report(self, company_id: str, payload: WorkReportCreate) -> CRMRecord:
+        data = payload.model_dump()
+        work_date = data.get("work_date") or datetime.now(timezone.utc).date().isoformat()
+        name = f"Work Report {work_date}"
+        data["invoiced"] = False
+        record = CRMRecord(
+            id=str(uuid4()),
+            company_id=company_id,
+            name=name,
+            status="open",
+            data=data,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.crm["work_reports"][record.id] = record
+        return record
+
+    def list_work_reports(self, company_id: str) -> list[CRMRecord]:
+        return [
+            r for r in self.crm["work_reports"].values()
+            if r.company_id == company_id and r.status != "deleted"
+        ]
+
+    def get_work_report(self, record_id: str, company_id: str) -> CRMRecord | None:
+        record = self.crm["work_reports"].get(record_id)
+        if record and record.company_id == company_id:
+            return record
+        return None
+
+    def create_invoice_from_work_report(
+        self, company_id: str, request: InvoiceFromWorkReportRequest, user_id: str
+    ) -> CRMRecord:
+        from datetime import date, timedelta
+        wr = self.get_work_report(request.work_report_id, company_id)
+        if not wr:
+            raise KeyError("Work report not found")
+        if wr.data.get("invoiced"):
+            raise ValueError("Work report already invoiced")
+
+        entries = wr.data.get("entries", [])
+        materials = wr.data.get("materials", [])
+        waste = wr.data.get("waste", [])
+
+        line_items = []
+        calculated_total = 0.0
+        for e in entries:
+            hours = float(e.get("hours", 0))
+            rate = float(e.get("unit_rate", 0))
+            subtotal = hours * rate
+            calculated_total += subtotal
+            line_items.append({
+                "description": e.get("description") or e.get("entry_type", "work"),
+                "quantity": hours,
+                "unit_price": rate,
+                "subtotal": subtotal,
+            })
+        for m in materials:
+            qty = float(m.get("quantity", 1))
+            price = float(m.get("unit_price", 0))
+            subtotal = qty * price
+            calculated_total += subtotal
+            line_items.append({
+                "description": m.get("material_name", "Material"),
+                "quantity": qty,
+                "unit_price": price,
+                "subtotal": subtotal,
+            })
+        for w in waste:
+            qty = float(w.get("quantity", 1))
+            price = float(w.get("unit_price", 0))
+            subtotal = qty * price
+            calculated_total += subtotal
+            line_items.append({
+                "description": w.get("description", "Waste disposal"),
+                "quantity": qty,
+                "unit_price": price,
+                "subtotal": subtotal,
+            })
+
+        due_date = request.due_date or (date.today() + timedelta(days=30)).isoformat()
+        total = wr.data.get("total_price") or calculated_total
+        client_id = wr.data.get("client_id")
+
+        client_name = ""
+        if client_id:
+            client_rec = self.crm["clients"].get(client_id)
+            if client_rec:
+                client_name = f" - {client_rec.name}"
+
+        invoice_data = {
+            "work_report_id": wr.id,
+            "client_id": client_id,
+            "job_id": wr.data.get("job_id"),
+            "line_items": line_items,
+            "total": total,
+            "currency": wr.data.get("currency", "GBP"),
+            "due_date": due_date,
+            "created_by": user_id,
+        }
+
+        invoice_name = f"Invoice{client_name} ({wr.data.get('work_date', 'N/A')})"
+        invoice = CRMRecord(
+            id=str(uuid4()),
+            company_id=company_id,
+            name=invoice_name,
+            status="draft",
+            data=invoice_data,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.crm["invoices"][invoice.id] = invoice
+
+        updated_data = {**wr.data, "invoiced": True, "invoice_id": invoice.id}
+        updated_wr = wr.model_copy(update={
+            "data": updated_data,
+            "updated_at": datetime.now(timezone.utc),
+        })
+        self.crm["work_reports"][wr.id] = updated_wr
+        return invoice
 
     # ------------------------------------------------------------------
     # Biometrics (in-memory stubs)
