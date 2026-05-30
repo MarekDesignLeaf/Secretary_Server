@@ -87,3 +87,8 @@ def decode_token(token: str, *, expected_use: str) -> dict[str, Any]:
     if payload.get("token_use") != expected_use:
         raise jwt.InvalidTokenError(f"Expected {expected_use} token")
     return payload
+
+
+def hash_reset_token(plain_token: str) -> str:
+    """Return a SHA-256 hex digest of a plain reset token for safe DB storage."""
+    return hashlib.sha256(plain_token.encode("utf-8")).hexdigest()
