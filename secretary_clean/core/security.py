@@ -92,3 +92,8 @@ def decode_token(token: str, *, expected_use: str) -> dict[str, Any]:
 def hash_reset_token(plain_token: str) -> str:
     """Return a SHA-256 hex digest of a plain reset token for safe DB storage."""
     return hashlib.sha256(plain_token.encode("utf-8")).hexdigest()
+
+
+def reset_token_expiry(minutes: int = 60) -> datetime:
+    """Return a UTC datetime that is *minutes* from now — used as token expiry."""
+    return datetime.now(timezone.utc) + timedelta(minutes=minutes)
