@@ -19,16 +19,22 @@ router = APIRouter(prefix="/bootstrap", tags=["bootstrap"])
 version_router = APIRouter(tags=["version"])
 
 @version_router.get("/version")
-def get_version():
+def get_version(request: Request):
     """Return server version info. No authentication required."""
     try:
         ver = importlib.metadata.version("secretary-clean")
     except importlib.metadata.PackageNotFoundError:
         ver = "1.0.0"
+    repo = getattr(request.app.state, "repository", None)
+    storage = "postgresql" if repo and "Postgres" in type(repo).__name__ else "in_memory"
+    db_url_set = bool(os.environ.get("DATABASE_URL"))
     return {
         "server_version": ver,
         "api_version": "v1",
         "backend": "secretary_clean",
+        "storage_type": storage,
+        "database_url_set": db_url_set,
+        "warning": None if storage == "postgresql" else "DATABASE_URL not configured — data will be lost on restart!",
     }
 
 
