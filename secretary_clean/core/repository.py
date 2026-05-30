@@ -562,12 +562,27 @@ class InMemorySecretaryRepository:
         if wr.data.get("invoiced"):
             raise ValueError("Work report already invoiced")
 
+        workers_data = wr.data.get("workers", [])
         entries = wr.data.get("entries", [])
         materials = wr.data.get("materials", [])
         waste = wr.data.get("waste", [])
 
         line_items = []
         calculated_total = 0.0
+
+        # Workers (from voice or manual work reports)
+        for w in workers_data:
+            hours = float(w.get("hours", 0))
+            rate = float(w.get("hourly_rate", 0))
+            subtotal = round(hours * rate, 2)
+            calculated_total += subtotal
+            if hours > 0:
+                line_items.append({
+                    "description": f"Labour – {w.get('worker_name', 'Worker')}",
+                    "quantity": hours,
+                    "unit_price": rate,
+                    "subtotal": subtotal,
+                })
         for e in entries:
             hours = float(e.get("hours", 0))
             rate = float(e.get("unit_rate", 0))
