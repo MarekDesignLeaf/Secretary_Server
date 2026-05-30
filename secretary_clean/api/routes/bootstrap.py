@@ -28,12 +28,14 @@ def get_version(request: Request):
     repo = getattr(request.app.state, "repository", None)
     storage = "postgresql" if repo and "Postgres" in type(repo).__name__ else "in_memory"
     db_url_set = bool(os.environ.get("DATABASE_URL"))
+    from secretary_clean.app import _postgres_error
     return {
         "server_version": ver,
         "api_version": "v1",
         "backend": "secretary_clean",
         "storage_type": storage,
         "database_url_set": db_url_set,
+        "postgres_error": _postgres_error,
         "warning": None if storage == "postgresql" else "DATABASE_URL not configured — data will be lost on restart!",
     }
 

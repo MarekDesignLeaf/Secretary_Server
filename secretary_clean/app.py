@@ -31,16 +31,31 @@ from secretary_clean.core.repository import InMemorySecretaryRepository
 log = logging.getLogger(__name__)
 
 
+_postgres_error: str | None = None
+
+
+def _patch_ssl(url: str) -> str:
+    """Add sslmode=require if not already present (Railway SSL postgres needs it)."""
+    if "sslmode" not in url:
+        sep = "&" if "?" in url else "?"
+        return url + sep + "sslmode=require"
+    return url
+
+
 def _default_repository():
+    global _postgres_error
     database_url = os.getenv("DATABASE_URL")
     if database_url:
+        patched_url = _patch_ssl(database_url)
         try:
             from secretary_clean.db.migration import run_migrations
             from secretary_clean.db.postgres_repository import PostgresSecretaryRepository
-            run_migrations(database_url)
+            run_migrations(patched_url)
             log.info("Using PostgresSecretaryRepository")
-            return PostgresSecretaryRepository(database_url)
+            _postgres_error = None
+            return PostgresSecretaryRepository(patched_url)
         except Exception as exc:
+            _postgres_error = str(exc)
             log.error(
                 "Failed to connect/migrate PostgreSQL (%s); falling back to in-memory repository",
                 exc,
