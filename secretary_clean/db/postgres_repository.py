@@ -1275,17 +1275,47 @@ class PostgresSecretaryRepository:
         line_items = []
         calculated_total = 0.0
 
+
+        # ── resolve tenant default labour rate ───────────────────────────────
+        tenant_labour_rate: float | None = None
+        try:
+            all_pricing = self.list_tenant_pricing(company_id)
+            # Priority: exact 'labour'/'labor' code, then any 'hourly' method
+            _LABOUR_CODES = {"labour", "labor", "general_labour", "hourly_labour", "default_labour"}
+            for tp in all_pricing:
+                if tp.activity_code.lower() in _LABOUR_CODES and tp.rate and tp.rate > 0:
+                    tenant_labour_rate = float(tp.rate)
+                    break
+            if tenant_labour_rate is None:
+                for tp in all_pricing:
+                    if "hourly" in tp.selected_pricing_method_code.lower() and tp.rate and tp.rate > 0:
+                        tenant_labour_rate = float(tp.rate)
+                        break
+        except Exception:
+            pass
+
+        pricing_warnings: list[str] = []
         # Workers (from voice or manual work reports)
         for w in workers_data:
             hours = float(w.get("hours", 0))
-            rate = float(w.get("hourly_rate", 0))
-            subtotal = round(hours * rate, 2)
+            raw_rate = float(w.get("hourly_rate", 0))
+            # Rate resolution: 1) worker.hourly_rate  2) tenant labour rate  3) 0.0 + warning
+            if raw_rate > 0:
+                resolved_rate = raw_rate
+            elif tenant_labour_rate is not None:
+                resolved_rate = tenant_labour_rate
+            else:
+                resolved_rate = 0.0
+                pricing_warnings.append(
+                    f"No hourly rate for {w.get('worker_name', 'Worker')} — set via tenant pricing"
+                )
+            subtotal = round(hours * resolved_rate, 2)
             calculated_total += subtotal
             if hours > 0:
                 line_items.append({
                     "description": f"Labour – {w.get('worker_name', 'Worker')}",
                     "quantity": hours,
-                    "unit_price": rate,
+                    "unit_price": resolved_rate,
                     "subtotal": subtotal,
                 })
         for e in entries:
@@ -1334,6 +1364,7 @@ class PostgresSecretaryRepository:
                 client_name = f" - {client_rec.name}"
 
         invoice_data = {
+            "pricing_warnings": pricing_warnings,
             "work_report_id": wr.id,
             "client_id": client_id,
             "job_id": wr.data.get("job_id"),
