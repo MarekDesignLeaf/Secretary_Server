@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from secretary_clean.api.routes import activities_compat, auth, backup, bootstrap, catalogue, company, crm, language, tenant_pricing, users, voice, work_reports
+from secretary_clean.api.routes import activities_compat, auth, backup, bootstrap, catalogue, company, crm, language, tenant_pricing, users, voice, voice_session, work_reports
 from secretary_clean.api.routes.bootstrap import version_router
 from secretary_clean.catalogue.source_parser import load_catalogue
 from secretary_clean.core.models import FirstInstallCreate
@@ -128,6 +128,7 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(crm.router, prefix="/api/v1")
     app.include_router(work_reports.router, prefix="/api/v1")
     app.include_router(voice.router, prefix="/api/v1")
+    app.include_router(voice_session.router, prefix="/api/v1")
     app.include_router(backup.router, prefix="/api/v1")
     app.include_router(activities_compat.router, prefix="/api/v1")
     app.include_router(version_router, prefix="/api/v1")
