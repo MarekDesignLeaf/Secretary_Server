@@ -13,6 +13,7 @@ from secretary_clean.api.routes import (
     auth,
     backup,
     bootstrap,
+    calendar,
     catalogue,
     company,
     crm,
@@ -133,6 +134,7 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(tenant_pricing.router, prefix="/api/v1")
     app.include_router(crm.router, prefix="/api/v1")
     app.include_router(work_reports.router, prefix="/api/v1")
+    app.include_router(calendar.router, prefix="/api/v1")
     app.include_router(voice.router, prefix="/api/v1")
     app.include_router(voice_session.router, prefix="/api/v1")
     app.include_router(backup.router, prefix="/api/v1")

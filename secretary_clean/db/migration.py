@@ -99,6 +99,29 @@ CREATE TABLE IF NOT EXISTS clean_voice_sessions (
 
 CREATE INDEX IF NOT EXISTS clean_voice_sessions_company_idx
     ON clean_voice_sessions(company_id);
+
+-- Phase A3: backend calendar events.
+CREATE TABLE IF NOT EXISTS clean_calendar_events (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    description TEXT,
+    location TEXT,
+    start_at TIMESTAMPTZ NOT NULL,
+    end_at TIMESTAMPTZ,
+    all_day BOOLEAN NOT NULL DEFAULT FALSE,
+    client_id TEXT,
+    job_id TEXT,
+    created_by UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS clean_calendar_events_company_idx
+    ON clean_calendar_events(company_id);
+
+CREATE INDEX IF NOT EXISTS clean_calendar_events_start_idx
+    ON clean_calendar_events(company_id, start_at);
 """
 
 # Column additions for existing tables (safe to run multiple times)

@@ -33,6 +33,9 @@ from .models import (
     TenantLanguageChoice,
     TenantOperatingProfile,
     TenantIndustry,
+    CalendarEvent,
+    CalendarEventCreate,
+    CalendarEventUpdate,
     UserAccount,
     WorkReportCreate,
 )
@@ -46,6 +49,7 @@ class InMemorySecretaryRepository:
         self.company_settings: dict[str, CompanyOperatingSettings] = {}
         self.tenant_operating_profiles: dict[str, TenantOperatingProfile] = {}
         self.tenant_industries: dict[str, list] = {}  # Phase A1: company_id -> list[TenantIndustry]
+        self.calendar_events: dict[str, CalendarEvent] = {}  # Phase A3: event_id -> CalendarEvent
         self.tenant_languages: dict[tuple[str, LanguageScope, str], TenantLanguage] = {}
         self.tenant_configuration: dict[str, dict] = {}
         self.users: dict[str, UserAccount] = {}
@@ -900,3 +904,64 @@ class InMemorySecretaryRepository:
             return None
         sess = self._voice_sessions.get(session_id)
         return dict(sess) if sess else None
+
+    # ------------------------------------------------------------------
+    # Phase A3: calendar events
+    # ------------------------------------------------------------------
+
+    def list_calendar_events(
+        self, company_id: str, start: datetime | None = None, end: datetime | None = None
+    ) -> list[CalendarEvent]:
+        events = [e for e in self.calendar_events.values() if e.company_id == company_id]
+        if start is not None:
+            events = [e for e in events if e.start_at >= start]
+        if end is not None:
+            events = [e for e in events if e.start_at <= end]
+        return sorted(events, key=lambda e: e.start_at)
+
+    def get_calendar_event(self, event_id: str, company_id: str) -> CalendarEvent | None:
+        event = self.calendar_events.get(event_id)
+        if not event or event.company_id != company_id:
+            return None
+        return event
+
+    def create_calendar_event(
+        self, company_id: str, payload: CalendarEventCreate, created_by: str | None = None
+    ) -> CalendarEvent:
+        now = datetime.now(timezone.utc)
+        event = CalendarEvent(
+            id=str(uuid4()),
+            company_id=company_id,
+            title=payload.title,
+            description=payload.description,
+            location=payload.location,
+            start_at=payload.start_at,
+            end_at=payload.end_at,
+            all_day=payload.all_day,
+            client_id=payload.client_id,
+            job_id=payload.job_id,
+            created_by=created_by,
+            created_at=now,
+            updated_at=now,
+        )
+        self.calendar_events[event.id] = event
+        return event
+
+    def update_calendar_event(
+        self, event_id: str, company_id: str, payload: CalendarEventUpdate
+    ) -> CalendarEvent:
+        event = self.calendar_events.get(event_id)
+        if not event or event.company_id != company_id:
+            raise KeyError("Calendar event not found")
+        updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+        updates["updated_at"] = datetime.now(timezone.utc)
+        updated = event.model_copy(update=updates)
+        self.calendar_events[event_id] = updated
+        return updated
+
+    def delete_calendar_event(self, event_id: str, company_id: str) -> bool:
+        event = self.calendar_events.get(event_id)
+        if not event or event.company_id != company_id:
+            return False
+        del self.calendar_events[event_id]
+        return True

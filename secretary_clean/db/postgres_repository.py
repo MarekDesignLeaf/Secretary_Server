@@ -41,6 +41,9 @@ from secretary_clean.core.models import (
     TenantActivityPricing,
     TenantIndustryProfile,
     TenantIndustry,
+    CalendarEvent,
+    CalendarEventCreate,
+    CalendarEventUpdate,
     TenantLanguage,
     TenantLanguageChoice,
     TenantOperatingProfile,
@@ -1884,6 +1887,123 @@ class PostgresSecretaryRepository:
         if isinstance(data, str):
             return json.loads(data)
         return dict(data)
+
+    # ------------------------------------------------------------------
+    # Phase A3: calendar events
+    # ------------------------------------------------------------------
+
+    def _row_to_calendar_event(self, row: dict) -> CalendarEvent:
+        return CalendarEvent(
+            id=str(row["id"]),
+            company_id=str(row["company_id"]),
+            title=row["title"],
+            description=row.get("description"),
+            location=row.get("location"),
+            start_at=row["start_at"],
+            end_at=row.get("end_at"),
+            all_day=row["all_day"],
+            client_id=row.get("client_id"),
+            job_id=row.get("job_id"),
+            created_by=str(row["created_by"]) if row.get("created_by") else None,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def list_calendar_events(
+        self, company_id: str, start: datetime | None = None, end: datetime | None = None
+    ) -> list[CalendarEvent]:
+        clauses = ["company_id = %s"]
+        params: list = [company_id]
+        if start is not None:
+            clauses.append("start_at >= %s")
+            params.append(start)
+        if end is not None:
+            clauses.append("start_at <= %s")
+            params.append(end)
+        where = " AND ".join(clauses)
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"SELECT * FROM clean_calendar_events WHERE {where} ORDER BY start_at ASC",
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        return [self._row_to_calendar_event(r) for r in rows]
+
+    def get_calendar_event(self, event_id: str, company_id: str) -> CalendarEvent | None:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM clean_calendar_events WHERE id = %s AND company_id = %s",
+                    (event_id, company_id),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return self._row_to_calendar_event(row)
+
+    def create_calendar_event(
+        self, company_id: str, payload: CalendarEventCreate, created_by: str | None = None
+    ) -> CalendarEvent:
+        event_id = str(uuid4())
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clean_calendar_events
+                        (id, company_id, title, description, location,
+                         start_at, end_at, all_day, client_id, job_id, created_by)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING *
+                    """,
+                    (
+                        event_id, company_id, payload.title, payload.description,
+                        payload.location, payload.start_at, payload.end_at,
+                        payload.all_day, payload.client_id, payload.job_id, created_by,
+                    ),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return self._row_to_calendar_event(row)
+
+    def update_calendar_event(
+        self, event_id: str, company_id: str, payload: CalendarEventUpdate
+    ) -> CalendarEvent:
+        updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if not updates:
+            existing = self.get_calendar_event(event_id, company_id)
+            if not existing:
+                raise KeyError("Calendar event not found")
+            return existing
+        set_parts = ", ".join(f"{col} = %s" for col in updates)
+        params = list(updates.values()) + [event_id, company_id]
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    UPDATE clean_calendar_events
+                    SET {set_parts}, updated_at = now()
+                    WHERE id = %s AND company_id = %s
+                    RETURNING *
+                    """,
+                    tuple(params),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if not row:
+            raise KeyError("Calendar event not found")
+        return self._row_to_calendar_event(row)
+
+    def delete_calendar_event(self, event_id: str, company_id: str) -> bool:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM clean_calendar_events WHERE id = %s AND company_id = %s",
+                    (event_id, company_id),
+                )
+                deleted = cur.rowcount > 0
+            conn.commit()
+        return deleted
 
 
 # ------------------------------------------------------------------

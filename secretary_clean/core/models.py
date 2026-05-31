@@ -304,6 +304,45 @@ class TenantIndustriesUpdate(BaseModel):
     industries: list[TenantIndustry] = Field(default_factory=list)
 
 
+class CalendarEvent(BaseModel):
+    """Phase A3: a backend-stored calendar event."""
+    id: str
+    company_id: str
+    title: str
+    description: str | None = None
+    location: str | None = None
+    start_at: datetime
+    end_at: datetime | None = None
+    all_day: bool = False
+    client_id: str | None = None
+    job_id: str | None = None
+    created_by: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CalendarEventCreate(BaseModel):
+    title: str = Field(min_length=1)
+    description: str | None = None
+    location: str | None = None
+    start_at: datetime
+    end_at: datetime | None = None
+    all_day: bool = False
+    client_id: str | None = None
+    job_id: str | None = None
+
+
+class CalendarEventUpdate(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    location: str | None = None
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    all_day: bool | None = None
+    client_id: str | None = None
+    job_id: str | None = None
+
+
 class LanguageDefinition(BaseModel):
     code: str
     name: str
