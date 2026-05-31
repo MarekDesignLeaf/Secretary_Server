@@ -146,10 +146,10 @@ def _combine(date_iso: str, hhmm: str | None) -> str:
 # ── intent keyword sets ───────────────────────────────────────────────────────
 _LIST_WORDS = ("what do i have", "what's on", "whats on", "co mám", "co mam",
                "what is next", "next in my calendar", "co je dál", "co je dal",
-               "show my calendar", "my schedule", "můj kalendář", "muj kalendar")
+               "show my calendar", "my schedule", "můj kalendář", "muj kalendar", "co je zitra", "co je zítra", "co je na zitrek", "co je na zítřek", "co mam zitra", "co mám zítra", "co je v kalendari", "co je v kalendář", "v kalendari", "v kalendář", "mam dnes", "mám dnes", "co je dnes", "co mam na", "co mám na", "schuzky", "schůzky")
 _CREATE_CAL = ("create meeting", "create appointment", "new meeting", "schedule",
                "vytvoř schůzku", "vytvor schuzku", "nová schůzka", "nova schuzka",
-               "naplánuj", "naplanuj", "create event", "add event", "přidej událost")
+               "naplánuj", "naplanuj", "create event", "add event", "přidej událost", "přidej schůzku", "pridej schuzku", "přidej schuzku", "pridej schůzku", "přidej termín", "pridej termin", "domluv schůzku", "domluv schuzku", "zapiš schůzku", "zapis schuzku")
 _UPDATE_CAL = ("move", "reschedule", "change", "přesuň", "presun", "přesunout",
                "změň termín", "zmen termin", "reschedule")
 _DELETE_CAL = ("cancel", "delete appointment", "delete meeting", "remove meeting",
