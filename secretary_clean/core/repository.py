@@ -36,6 +36,9 @@ from .models import (
     CalendarEvent,
     CalendarEventCreate,
     CalendarEventUpdate,
+    CalendarSyncEventInput,
+    CalendarSyncOutcome,
+    CalendarSyncLogEntry,
     UserAccount,
     WorkReportCreate,
 )
@@ -50,6 +53,7 @@ class InMemorySecretaryRepository:
         self.tenant_operating_profiles: dict[str, TenantOperatingProfile] = {}
         self.tenant_industries: dict[str, list] = {}  # Phase A1: company_id -> list[TenantIndustry]
         self.calendar_events: dict[str, CalendarEvent] = {}  # Phase A3: event_id -> CalendarEvent
+        self.calendar_sync_log: list = []  # Phase A5: list[CalendarSyncLogEntry]
         self.tenant_languages: dict[tuple[str, LanguageScope, str], TenantLanguage] = {}
         self.tenant_configuration: dict[str, dict] = {}
         self.users: dict[str, UserAccount] = {}
@@ -965,3 +969,102 @@ class InMemorySecretaryRepository:
             return False
         del self.calendar_events[event_id]
         return True
+
+    # ------------------------------------------------------------------
+    # Phase A5: calendar sync log + synchronization
+    # ------------------------------------------------------------------
+
+    def add_calendar_sync_log(
+        self, company_id: str, event_id: str | None, source: str,
+        action: str, status: str = "ok", detail: str | None = None,
+    ) -> CalendarSyncLogEntry:
+        entry = CalendarSyncLogEntry(
+            id=str(uuid4()),
+            company_id=company_id,
+            event_id=event_id,
+            source=source,
+            action=action,
+            status=status,
+            detail=detail,
+            created_at=datetime.now(timezone.utc),
+        )
+        self.calendar_sync_log.append(entry)
+        return entry
+
+    def list_calendar_sync_log(self, company_id: str, limit: int = 100) -> list[CalendarSyncLogEntry]:
+        rows = [e for e in self.calendar_sync_log if e.company_id == company_id]
+        rows.sort(key=lambda e: e.created_at, reverse=True)
+        return rows[:limit]
+
+    def sync_calendar_events(
+        self, company_id: str, device_events: list[CalendarSyncEventInput]
+    ) -> list[CalendarSyncOutcome]:
+        """Reconcile device events with backend (backend = source of truth).
+
+        Rules:
+          - exists in both (by backend_id): newest updated_at wins
+          - exists only in backend: device must create it locally (created_on_android)
+          - exists only on device: import to backend (source=android_import)
+        """
+        outcomes: list[CalendarSyncOutcome] = []
+        backend_now = {e.id: e for e in self.calendar_events.values() if e.company_id == company_id}
+        seen_backend_ids: set[str] = set()
+
+        for dev in device_events:
+            # Matched by backend_id
+            if dev.backend_id and dev.backend_id in backend_now:
+                seen_backend_ids.add(dev.backend_id)
+                be = backend_now[dev.backend_id]
+                dev_ts = dev.updated_at
+                be_ts = be.updated_at
+                if dev_ts and dev_ts > be_ts:
+                    # device newer → update backend
+                    upd = CalendarEventUpdate(
+                        title=dev.title, description=dev.description, location=dev.location,
+                        start_at=dev.start_at, end_at=dev.end_at, all_day=dev.all_day,
+                    )
+                    self.update_calendar_event(be.id, company_id, upd)
+                    self.add_calendar_sync_log(company_id, be.id, "android", "conflict_android_wins")
+                    outcomes.append(CalendarSyncOutcome(
+                        backend_id=be.id, android_id=dev.android_id,
+                        action="conflict_android_wins", source="android",
+                        detail="device updated_at newer; backend updated",
+                    ))
+                else:
+                    # backend newer or equal → device must take backend copy
+                    self.add_calendar_sync_log(company_id, be.id, "backend", "conflict_backend_wins")
+                    outcomes.append(CalendarSyncOutcome(
+                        backend_id=be.id, android_id=dev.android_id,
+                        action="conflict_backend_wins", source="backend",
+                        detail="backend updated_at newer or equal; device must adopt backend copy",
+                    ))
+            else:
+                # device-only → import to backend, mark source android_import
+                created = self.create_calendar_event(
+                    company_id,
+                    CalendarEventCreate(
+                        title=dev.title, description=dev.description, location=dev.location,
+                        start_at=dev.start_at, end_at=dev.end_at, all_day=dev.all_day,
+                    ),
+                    created_by=None,
+                )
+                self.add_calendar_sync_log(
+                    company_id, created.id, "android_import", "created_on_backend",
+                    detail="device-only event imported to backend",
+                )
+                outcomes.append(CalendarSyncOutcome(
+                    backend_id=created.id, android_id=dev.android_id,
+                    action="created_on_backend", source="android_import",
+                    detail="device-only event imported",
+                ))
+
+        # backend-only events the device didn't send → device must create them locally
+        for be_id, be in backend_now.items():
+            if be_id not in seen_backend_ids:
+                self.add_calendar_sync_log(company_id, be_id, "backend", "created_on_android")
+                outcomes.append(CalendarSyncOutcome(
+                    backend_id=be_id, android_id=None,
+                    action="created_on_android", source="backend",
+                    detail="backend-only event; device must create locally",
+                ))
+        return outcomes

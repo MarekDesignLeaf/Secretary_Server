@@ -523,7 +523,53 @@ class VoiceExecuteResult(BaseModel):
     resolved_intent: str | None
     requires_confirmation: bool
     message: str
+    action: str | None = None           # e.g. "calendar.create"
+    entity_id: str | None = None        # id of created/updated/deleted entity
+    data: dict[str, Any] = Field(default_factory=dict)  # extracted entities / result payload
     language_context: LanguageContext | None = None
+
+
+class CalendarSyncEventInput(BaseModel):
+    """One event coming FROM the Android device during sync."""
+    android_id: str | None = None       # device-local id (for mapping back)
+    backend_id: str | None = None       # if known, the backend event id
+    title: str
+    description: str | None = None
+    location: str | None = None
+    start_at: datetime
+    end_at: datetime | None = None
+    all_day: bool = False
+    updated_at: datetime | None = None  # device last-modified, for conflict resolution
+
+
+class CalendarSyncRequest(BaseModel):
+    events: list[CalendarSyncEventInput] = Field(default_factory=list)
+
+
+class CalendarSyncOutcome(BaseModel):
+    backend_id: str | None = None
+    android_id: str | None = None
+    action: str                          # created_on_backend|updated_backend|updated_android|created_on_android|conflict_backend_wins|conflict_android_wins|noop
+    source: str                          # backend|android|android_import
+    status: str = "ok"
+    detail: str | None = None
+
+
+class CalendarSyncResult(BaseModel):
+    """Returned to the device: what it must apply locally + what backend did."""
+    outcomes: list[CalendarSyncOutcome] = Field(default_factory=list)
+    backend_events: list[CalendarEvent] = Field(default_factory=list)  # full current truth
+
+
+class CalendarSyncLogEntry(BaseModel):
+    id: str
+    company_id: str
+    event_id: str | None = None
+    source: str
+    action: str
+    status: str
+    detail: str | None = None
+    created_at: datetime
 
 
 class BiometricRegisterRequest(BaseModel):

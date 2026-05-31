@@ -21,6 +21,9 @@ from secretary_clean.core.models import (
     CalendarEvent,
     CalendarEventCreate,
     CalendarEventUpdate,
+    CalendarSyncRequest,
+    CalendarSyncResult,
+    CalendarSyncLogEntry,
     Permission,
     UserAccount,
 )
@@ -88,3 +91,29 @@ def delete_event(
     if not deleted:
         raise HTTPException(status_code=404, detail="Calendar event not found")
     return {"deleted": True, "id": event_id}
+
+
+@router.post("/sync", response_model=CalendarSyncResult)
+def sync_calendar(
+    payload: CalendarSyncRequest,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Synchronize device events with the backend.
+
+    Backend is the source of truth. Conflict resolution: newest updated_at wins.
+    Device-only events are imported (source=android_import). Backend-only events
+    are returned so the device can create them locally. Every sync action is logged."""
+    outcomes = repository.sync_calendar_events(user.company_id, payload.events)
+    backend_events = repository.list_calendar_events(user.company_id)
+    return CalendarSyncResult(outcomes=outcomes, backend_events=backend_events)
+
+
+@router.get("/sync-log", response_model=list[CalendarSyncLogEntry])
+def get_sync_log(
+    limit: int = Query(default=100, ge=1, le=500),
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Return the calendar synchronization log for the tenant (newest first)."""
+    return repository.list_calendar_sync_log(user.company_id, limit=limit)

@@ -122,6 +122,21 @@ CREATE INDEX IF NOT EXISTS clean_calendar_events_company_idx
 
 CREATE INDEX IF NOT EXISTS clean_calendar_events_start_idx
     ON clean_calendar_events(company_id, start_at);
+
+-- Phase A5: calendar synchronization log (backend is source of truth).
+CREATE TABLE IF NOT EXISTS clean_calendar_sync_log (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    event_id TEXT,
+    source TEXT NOT NULL,
+    action TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS clean_calendar_sync_log_company_idx
+    ON clean_calendar_sync_log(company_id, created_at);
 """
 
 # Column additions for existing tables (safe to run multiple times)

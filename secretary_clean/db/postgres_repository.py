@@ -44,6 +44,9 @@ from secretary_clean.core.models import (
     CalendarEvent,
     CalendarEventCreate,
     CalendarEventUpdate,
+    CalendarSyncEventInput,
+    CalendarSyncOutcome,
+    CalendarSyncLogEntry,
     TenantLanguage,
     TenantLanguageChoice,
     TenantOperatingProfile,
@@ -2004,6 +2007,117 @@ class PostgresSecretaryRepository:
                 deleted = cur.rowcount > 0
             conn.commit()
         return deleted
+
+    # ------------------------------------------------------------------
+    # Phase A5: calendar sync log + synchronization
+    # ------------------------------------------------------------------
+
+    def add_calendar_sync_log(
+        self, company_id: str, event_id: str | None, source: str,
+        action: str, status: str = "ok", detail: str | None = None,
+    ) -> CalendarSyncLogEntry:
+        log_id = str(uuid4())
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clean_calendar_sync_log
+                        (id, company_id, event_id, source, action, status, detail)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING *
+                    """,
+                    (log_id, company_id, event_id, source, action, status, detail),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return CalendarSyncLogEntry(
+            id=str(row["id"]), company_id=str(row["company_id"]),
+            event_id=row.get("event_id"), source=row["source"], action=row["action"],
+            status=row["status"], detail=row.get("detail"), created_at=row["created_at"],
+        )
+
+    def list_calendar_sync_log(self, company_id: str, limit: int = 100) -> list[CalendarSyncLogEntry]:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM clean_calendar_sync_log
+                    WHERE company_id = %s ORDER BY created_at DESC LIMIT %s
+                    """,
+                    (company_id, limit),
+                )
+                rows = cur.fetchall()
+        return [
+            CalendarSyncLogEntry(
+                id=str(r["id"]), company_id=str(r["company_id"]),
+                event_id=r.get("event_id"), source=r["source"], action=r["action"],
+                status=r["status"], detail=r.get("detail"), created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def sync_calendar_events(
+        self, company_id: str, device_events: list[CalendarSyncEventInput]
+    ) -> list[CalendarSyncOutcome]:
+        """Reconcile device events with backend (backend = source of truth)."""
+        outcomes: list[CalendarSyncOutcome] = []
+        backend_list = self.list_calendar_events(company_id)
+        backend_now = {e.id: e for e in backend_list}
+        seen_backend_ids: set[str] = set()
+
+        for dev in device_events:
+            if dev.backend_id and dev.backend_id in backend_now:
+                seen_backend_ids.add(dev.backend_id)
+                be = backend_now[dev.backend_id]
+                if dev.updated_at and dev.updated_at > be.updated_at:
+                    self.update_calendar_event(
+                        be.id, company_id,
+                        CalendarEventUpdate(
+                            title=dev.title, description=dev.description, location=dev.location,
+                            start_at=dev.start_at, end_at=dev.end_at, all_day=dev.all_day,
+                        ),
+                    )
+                    self.add_calendar_sync_log(company_id, be.id, "android", "conflict_android_wins")
+                    outcomes.append(CalendarSyncOutcome(
+                        backend_id=be.id, android_id=dev.android_id,
+                        action="conflict_android_wins", source="android",
+                        detail="device updated_at newer; backend updated",
+                    ))
+                else:
+                    self.add_calendar_sync_log(company_id, be.id, "backend", "conflict_backend_wins")
+                    outcomes.append(CalendarSyncOutcome(
+                        backend_id=be.id, android_id=dev.android_id,
+                        action="conflict_backend_wins", source="backend",
+                        detail="backend updated_at newer or equal; device must adopt backend copy",
+                    ))
+            else:
+                created = self.create_calendar_event(
+                    company_id,
+                    CalendarEventCreate(
+                        title=dev.title, description=dev.description, location=dev.location,
+                        start_at=dev.start_at, end_at=dev.end_at, all_day=dev.all_day,
+                    ),
+                    created_by=None,
+                )
+                self.add_calendar_sync_log(
+                    company_id, created.id, "android_import", "created_on_backend",
+                    detail="device-only event imported to backend",
+                )
+                outcomes.append(CalendarSyncOutcome(
+                    backend_id=created.id, android_id=dev.android_id,
+                    action="created_on_backend", source="android_import",
+                    detail="device-only event imported",
+                ))
+
+        for be_id in backend_now:
+            if be_id not in seen_backend_ids:
+                self.add_calendar_sync_log(company_id, be_id, "backend", "created_on_android")
+                outcomes.append(CalendarSyncOutcome(
+                    backend_id=be_id, android_id=None,
+                    action="created_on_android", source="backend",
+                    detail="backend-only event; device must create locally",
+                ))
+        return outcomes
 
 
 # ------------------------------------------------------------------
