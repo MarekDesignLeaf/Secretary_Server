@@ -32,6 +32,7 @@ from .models import (
     TenantLanguage,
     TenantLanguageChoice,
     TenantOperatingProfile,
+    TenantIndustry,
     UserAccount,
     WorkReportCreate,
 )
@@ -44,6 +45,7 @@ class InMemorySecretaryRepository:
         self.companies: dict[str, CompanyProfile] = {}
         self.company_settings: dict[str, CompanyOperatingSettings] = {}
         self.tenant_operating_profiles: dict[str, TenantOperatingProfile] = {}
+        self.tenant_industries: dict[str, list] = {}  # Phase A1: company_id -> list[TenantIndustry]
         self.tenant_languages: dict[tuple[str, LanguageScope, str], TenantLanguage] = {}
         self.tenant_configuration: dict[str, dict] = {}
         self.users: dict[str, UserAccount] = {}
@@ -158,6 +160,28 @@ class InMemorySecretaryRepository:
             last_name=payload.first_admin_last_name,
             phone=payload.phone,
         )
+        # Phase A1: persist ALL selected industries (multi-industry), not just primary.
+        resolved_primary = payload.primary_industry or (
+            payload.selected_industries[0] if payload.selected_industries else payload.industry_group
+        )
+        resolved_subtype = payload.primary_subtype or (
+            payload.selected_subtypes[0] if payload.selected_subtypes else payload.industry_subtype
+        )
+        all_industries = list(payload.selected_industries) if payload.selected_industries else []
+        if resolved_primary and resolved_primary not in all_industries:
+            all_industries.insert(0, resolved_primary)
+        if all_industries:
+            self.set_tenant_industries(
+                company.id,
+                [
+                    TenantIndustry(
+                        industry_code=code,
+                        subtype_code=resolved_subtype if code == resolved_primary else None,
+                        is_primary=(code == resolved_primary),
+                    )
+                    for code in all_industries
+                ],
+            )
         return FirstInstallResult(
             company=company,
             admin=admin,
@@ -330,7 +354,92 @@ class InMemorySecretaryRepository:
         cfg = self.tenant_configuration.setdefault(company_id, {})
         cfg["industry_group"] = industry_group
         cfg["industry_subtype"] = industry_subtype
+        # Phase A1: keep multi-industry list in sync with the legacy single field.
+        if industry_group:
+            self.tenant_industries[company_id] = [
+                TenantIndustry(
+                    industry_code=industry_group,
+                    subtype_code=industry_subtype,
+                    is_primary=True,
+                )
+            ]
         return updated
+
+    def get_tenant_industries(self, company_id: str) -> list[TenantIndustry]:
+        """Phase A1: return all industries for a tenant.
+
+        Falls back to the legacy single industry_group when no multi-industry
+        rows exist yet (backward compatibility with old data)."""
+        if company_id not in self.companies:
+            raise KeyError("Company not found")
+        existing = self.tenant_industries.get(company_id)
+        if existing:
+            return list(existing)
+        # Backward compat: synthesize from legacy single field
+        profile = self.get_tenant_operating_profile(company_id)
+        if profile.industry_group:
+            return [
+                TenantIndustry(
+                    industry_code=profile.industry_group,
+                    subtype_code=profile.industry_subtype,
+                    is_primary=True,
+                )
+            ]
+        return []
+
+    def set_tenant_industries(
+        self, company_id: str, industries: list[TenantIndustry]
+    ) -> list[TenantIndustry]:
+        """Phase A1: replace the full set of industries for a tenant.
+
+        Ensures exactly one primary (first one if none flagged) and mirrors the
+        primary back into the legacy industry_group/subtype fields for
+        compatibility with older readers."""
+        if company_id not in self.companies:
+            raise KeyError("Company not found")
+
+        # Deduplicate by industry_code, preserve order
+        seen: set[str] = set()
+        cleaned: list[TenantIndustry] = []
+        for ind in industries:
+            if not ind.industry_code or ind.industry_code in seen:
+                continue
+            seen.add(ind.industry_code)
+            cleaned.append(
+                TenantIndustry(
+                    industry_code=ind.industry_code,
+                    subtype_code=ind.subtype_code,
+                    is_primary=bool(ind.is_primary),
+                )
+            )
+
+        # Ensure exactly one primary
+        primaries = [i for i in cleaned if i.is_primary]
+        if cleaned and not primaries:
+            cleaned[0].is_primary = True
+        elif len(primaries) > 1:
+            first = True
+            for i in cleaned:
+                if i.is_primary and not first:
+                    i.is_primary = False
+                if i.is_primary:
+                    first = False
+
+        self.tenant_industries[company_id] = cleaned
+
+        # Mirror primary into legacy single fields
+        primary = next((i for i in cleaned if i.is_primary), None)
+        legacy_group = primary.industry_code if primary else None
+        legacy_subtype = primary.subtype_code if primary else None
+        current = self.get_tenant_operating_profile(company_id)
+        self.tenant_operating_profiles[company_id] = current.model_copy(update={
+            "industry_group": legacy_group,
+            "industry_subtype": legacy_subtype,
+        })
+        cfg = self.tenant_configuration.setdefault(company_id, {})
+        cfg["industry_group"] = legacy_group
+        cfg["industry_subtype"] = legacy_subtype
+        return cleaned
 
     def get_tenant_operating_profile(self, company_id: str) -> TenantOperatingProfile:
         if company_id not in self.companies:

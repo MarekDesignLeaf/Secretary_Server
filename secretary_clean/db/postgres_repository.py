@@ -40,6 +40,7 @@ from secretary_clean.core.models import (
     TenantActivityOverrideRequest,
     TenantActivityPricing,
     TenantIndustryProfile,
+    TenantIndustry,
     TenantLanguage,
     TenantLanguageChoice,
     TenantOperatingProfile,
@@ -339,6 +340,29 @@ class PostgresSecretaryRepository:
         # by updating tenant_operating_profile's industry_group/industry_subtype columns
         # which are already set. The TenantIndustryProfile is reconstructed on read
         # from the operating profile.
+
+        # Phase A1: persist ALL selected industries (multi-industry), not just primary.
+        all_industries = list(payload.selected_industries) if payload.selected_industries else []
+        if industry_group and industry_group not in all_industries:
+            all_industries.insert(0, industry_group)
+        if all_industries:
+            now = datetime.now(timezone.utc)
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    for idx, ind_code in enumerate(all_industries):
+                        # primary = the resolved industry_group, or first if none matched
+                        is_primary = (ind_code == industry_group) if industry_group else (idx == 0)
+                        sub = industry_subtype if ind_code == industry_group else None
+                        cur.execute(
+                            """
+                            INSERT INTO clean_tenant_industries
+                                (id, company_id, industry_code, subtype_code, is_primary, created_at)
+                            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s)
+                            ON CONFLICT (company_id, industry_code) DO NOTHING
+                            """,
+                            (company.id, ind_code, sub, is_primary, now),
+                        )
+                conn.commit()
 
         # Seed tenant_activity_pricing
         if payload.selected_activities and activity_defaults:
@@ -777,8 +801,138 @@ class PostgresSecretaryRepository:
                     """,
                     (company_id, industry_group, industry_subtype),
                 )
+                # Phase A1: keep multi-industry table in sync with legacy single field.
+                cur.execute(
+                    "DELETE FROM clean_tenant_industries WHERE company_id = %s", (company_id,)
+                )
+                if industry_group:
+                    cur.execute(
+                        """
+                        INSERT INTO clean_tenant_industries
+                            (id, company_id, industry_code, subtype_code, is_primary)
+                        VALUES (gen_random_uuid(), %s, %s, %s, TRUE)
+                        ON CONFLICT (company_id, industry_code) DO NOTHING
+                        """,
+                        (company_id, industry_group, industry_subtype),
+                    )
             conn.commit()
         return self.get_tenant_operating_profile(company_id)
+
+    def get_tenant_industries(self, company_id: str) -> list[TenantIndustry]:
+        """Phase A1: return all industries for a tenant; fall back to legacy field."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM clean_companies WHERE id = %s", (company_id,))
+                if cur.fetchone()["n"] == 0:
+                    raise KeyError("Company not found")
+                cur.execute(
+                    """
+                    SELECT industry_code, subtype_code, is_primary
+                    FROM clean_tenant_industries
+                    WHERE company_id = %s
+                    ORDER BY is_primary DESC, created_at ASC
+                    """,
+                    (company_id,),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    return [
+                        TenantIndustry(
+                            industry_code=r["industry_code"],
+                            subtype_code=r["subtype_code"],
+                            is_primary=r["is_primary"],
+                        )
+                        for r in rows
+                    ]
+                # Backward compat: synthesize from legacy single field
+                cur.execute(
+                    "SELECT industry_group, industry_subtype FROM clean_companies WHERE id = %s",
+                    (company_id,),
+                )
+                legacy = cur.fetchone()
+        if legacy and legacy["industry_group"]:
+            return [
+                TenantIndustry(
+                    industry_code=legacy["industry_group"],
+                    subtype_code=legacy["industry_subtype"],
+                    is_primary=True,
+                )
+            ]
+        return []
+
+    def set_tenant_industries(
+        self, company_id: str, industries: list[TenantIndustry]
+    ) -> list[TenantIndustry]:
+        """Phase A1: replace the full set of industries; mirror primary to legacy fields."""
+        # Deduplicate by industry_code, preserve order
+        seen: set[str] = set()
+        cleaned: list[TenantIndustry] = []
+        for ind in industries:
+            if not ind.industry_code or ind.industry_code in seen:
+                continue
+            seen.add(ind.industry_code)
+            cleaned.append(
+                TenantIndustry(
+                    industry_code=ind.industry_code,
+                    subtype_code=ind.subtype_code,
+                    is_primary=bool(ind.is_primary),
+                )
+            )
+        # Ensure exactly one primary
+        primaries = [i for i in cleaned if i.is_primary]
+        if cleaned and not primaries:
+            cleaned[0].is_primary = True
+        elif len(primaries) > 1:
+            first = True
+            for i in cleaned:
+                if i.is_primary and not first:
+                    i.is_primary = False
+                if i.is_primary:
+                    first = False
+
+        primary = next((i for i in cleaned if i.is_primary), None)
+        legacy_group = primary.industry_code if primary else None
+        legacy_subtype = primary.subtype_code if primary else None
+
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM clean_companies WHERE id = %s", (company_id,))
+                if cur.fetchone()["n"] == 0:
+                    raise KeyError("Company not found")
+                cur.execute(
+                    "DELETE FROM clean_tenant_industries WHERE company_id = %s", (company_id,)
+                )
+                for ind in cleaned:
+                    cur.execute(
+                        """
+                        INSERT INTO clean_tenant_industries
+                            (id, company_id, industry_code, subtype_code, is_primary)
+                        VALUES (gen_random_uuid(), %s, %s, %s, %s)
+                        ON CONFLICT (company_id, industry_code) DO NOTHING
+                        """,
+                        (company_id, ind.industry_code, ind.subtype_code, ind.is_primary),
+                    )
+                # Mirror primary into legacy single fields
+                cur.execute(
+                    """
+                    UPDATE clean_companies
+                    SET industry_group = %s, industry_subtype = %s, updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (legacy_group, legacy_subtype, company_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO tenant_operating_profile (company_id, industry_group, industry_subtype)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (company_id) DO UPDATE SET
+                        industry_group = EXCLUDED.industry_group,
+                        industry_subtype = EXCLUDED.industry_subtype
+                    """,
+                    (company_id, legacy_group, legacy_subtype),
+                )
+            conn.commit()
+        return cleaned
 
     def update_tenant_operating_profile(
         self, company_id: str, settings: LanguageSettings

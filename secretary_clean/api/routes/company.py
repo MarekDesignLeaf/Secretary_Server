@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from secretary_clean.api.deps import current_user, get_repository
 from pydantic import BaseModel
 
-from secretary_clean.core.models import CompanyLegalIdentity, CompanyOperatingSettings, CompanyProfile, TenantOperatingProfile, UserAccount
+from secretary_clean.core.models import CompanyLegalIdentity, CompanyOperatingSettings, CompanyProfile, TenantIndustriesUpdate, TenantIndustry, TenantOperatingProfile, UserAccount
 
 
 class IndustryUpdate(BaseModel):
@@ -78,5 +78,29 @@ def update_industry(payload: IndustryUpdate, user: UserAccount = Depends(current
             industry_group=payload.industry_group,
             industry_subtype=payload.industry_subtype,
         )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Company not found") from exc
+
+
+@router.get("/industries", response_model=list[TenantIndustry])
+def get_industries(user: UserAccount = Depends(current_user), repository: InMemorySecretaryRepository = Depends(get_repository)):
+    """Phase A1: return all industries assigned to the tenant (multi-industry).
+
+    Backward compatible: if only a legacy single industry exists, it is returned
+    as a one-element list with is_primary=True."""
+    try:
+        return repository.get_tenant_industries(user.company_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Company not found") from exc
+
+
+@router.put("/industries", response_model=list[TenantIndustry])
+def set_industries(payload: TenantIndustriesUpdate, user: UserAccount = Depends(current_user), repository: InMemorySecretaryRepository = Depends(get_repository)):
+    """Phase A1: replace the full set of industries for the tenant.
+
+    The first industry (or the one flagged is_primary) becomes the primary and
+    is mirrored into the legacy industry_group/subtype fields for compatibility."""
+    try:
+        return repository.set_tenant_industries(user.company_id, payload.industries)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Company not found") from exc

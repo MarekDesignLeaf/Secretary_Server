@@ -292,6 +292,18 @@ class TenantIndustryProfile(BaseModel):
     selected_activities: list[str] = Field(default_factory=list)
 
 
+class TenantIndustry(BaseModel):
+    """A single industry assigned to a tenant (Phase A1 multi-industry)."""
+    industry_code: str
+    subtype_code: str | None = None
+    is_primary: bool = False
+
+
+class TenantIndustriesUpdate(BaseModel):
+    """Request body for setting the full list of a tenant's industries."""
+    industries: list[TenantIndustry] = Field(default_factory=list)
+
+
 class LanguageDefinition(BaseModel):
     code: str
     name: str

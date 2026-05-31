@@ -70,6 +70,20 @@ CREATE TABLE IF NOT EXISTS clean_backup_manifests (
     payload JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Phase A1: multi-industry support. A tenant may have any number of industries.
+CREATE TABLE IF NOT EXISTS clean_tenant_industries (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    industry_code TEXT NOT NULL,
+    subtype_code TEXT,
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (company_id, industry_code)
+);
+
+CREATE INDEX IF NOT EXISTS clean_tenant_industries_company_idx
+    ON clean_tenant_industries(company_id);
 """
 
 # Column additions for existing tables (safe to run multiple times)
@@ -81,6 +95,19 @@ ALTER TABLE tenant_operating_profile ADD COLUMN IF NOT EXISTS industry_group TEX
 ALTER TABLE tenant_operating_profile ADD COLUMN IF NOT EXISTS industry_subtype TEXT;
 ALTER TABLE clean_tenant_configuration ADD COLUMN IF NOT EXISTS industry_group TEXT;
 ALTER TABLE clean_tenant_configuration ADD COLUMN IF NOT EXISTS industry_subtype TEXT;
+"""
+
+# Phase A1: backfill multi-industry table from legacy single industry_group.
+# Idempotent: only inserts when a company has an industry but no rows yet.
+_BACKFILL_DDL = """
+INSERT INTO clean_tenant_industries (id, company_id, industry_code, subtype_code, is_primary)
+SELECT gen_random_uuid(), c.id, c.industry_group, c.industry_subtype, TRUE
+FROM clean_companies c
+WHERE c.industry_group IS NOT NULL
+  AND c.industry_group <> ''
+  AND NOT EXISTS (
+    SELECT 1 FROM clean_tenant_industries ti WHERE ti.company_id = c.id
+  );
 """
 
 
@@ -144,7 +171,10 @@ def run_migrations(database_url: str) -> None:
     # ALTER statements for adding columns to existing tables (idempotent via IF NOT EXISTS)
     alter_statements = _split_statements(_ALTER_DDL)
 
-    all_statements = pre_statements + statements + extra_statements + alter_statements
+    # Phase A1 backfill (must run AFTER tables + alters exist)
+    backfill_statements = _split_statements(_BACKFILL_DDL)
+
+    all_statements = pre_statements + statements + extra_statements + alter_statements + backfill_statements
 
     # Run every DDL statement independently with autocommit=True.
     # This means CREATE EXTENSION permission errors do NOT block table creation,
