@@ -883,3 +883,20 @@ class InMemorySecretaryRepository:
             if row.get("restore_token") == token:
                 return row
         return None
+
+    # ------------------------------------------------------------------
+    # Phase A2: voice session persistence
+    # ------------------------------------------------------------------
+
+    def save_voice_session(self, session: dict) -> None:
+        """Persist a voice session dict (keyed by its 'id')."""
+        if not hasattr(self, "_voice_sessions"):
+            self._voice_sessions: dict[str, dict] = {}
+        self._voice_sessions[session["id"]] = dict(session)
+
+    def load_voice_session(self, session_id: str) -> dict | None:
+        """Load a voice session dict by id, or None if not found."""
+        if not hasattr(self, "_voice_sessions"):
+            return None
+        sess = self._voice_sessions.get(session_id)
+        return dict(sess) if sess else None

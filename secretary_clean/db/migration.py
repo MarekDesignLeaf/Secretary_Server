@@ -84,6 +84,21 @@ CREATE TABLE IF NOT EXISTS clean_tenant_industries (
 
 CREATE INDEX IF NOT EXISTS clean_tenant_industries_company_idx
     ON clean_tenant_industries(company_id);
+
+-- Phase A2: persistent voice sessions. Survives server restart / redeploy.
+CREATE TABLE IF NOT EXISTS clean_voice_sessions (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    user_id UUID,
+    state TEXT NOT NULL DEFAULT 'active',
+    step TEXT NOT NULL DEFAULT 'client',
+    data JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    touched_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS clean_voice_sessions_company_idx
+    ON clean_voice_sessions(company_id);
 """
 
 # Column additions for existing tables (safe to run multiple times)

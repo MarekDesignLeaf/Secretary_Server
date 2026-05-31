@@ -22,7 +22,6 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -38,17 +37,17 @@ from secretary_clean.core.repository import InMemorySecretaryRepository
 
 router = APIRouter(prefix="/voice/session", tags=["voice session"])
 
-# ── in-process session store ──────────────────────────────────────────────────
+# ── persistent session store (Phase A2) ──────────────────────────────────────
+# Sessions are persisted via the repository (DB-backed in production), so they
+# survive server restart / redeploy. The in-process dict is gone.
 SESSION_TTL_SECONDS = 3600  # 1 hour
-
-_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _create_session(company_id: str, user_id: str, language: str, work_date: str) -> dict:
+def _create_session(repository, company_id: str, user_id: str, language: str, work_date: str) -> dict:
     sid = str(uuid.uuid4())
     session = {
         "id": sid,
@@ -67,12 +66,12 @@ def _create_session(company_id: str, user_id: str, language: str, work_date: str
         "created_at": _now().isoformat(),
         "touched_at": _now().isoformat(),
     }
-    _SESSIONS[sid] = session
+    repository.save_voice_session(session)
     return session
 
 
-def _get_session(session_id: str, company_id: str) -> dict:
-    sess = _SESSIONS.get(session_id)
+def _get_session(repository, session_id: str, company_id: str) -> dict:
+    sess = repository.load_voice_session(session_id)
     if not sess:
         raise HTTPException(404, "Session not found")
     if sess["company_id"] != company_id:
@@ -80,6 +79,7 @@ def _get_session(session_id: str, company_id: str) -> dict:
     touched = datetime.fromisoformat(sess["touched_at"])
     if (_now() - touched).total_seconds() > SESSION_TTL_SECONDS:
         sess["state"] = "expired"
+        repository.save_voice_session(sess)
         raise HTTPException(410, "Session expired")
     return sess
 
@@ -273,7 +273,7 @@ def voice_session_start(
     """Start a new voice Work Report session."""
     work_date = payload.work_date or _now().date().isoformat()
     lang = payload.language[:2] if len(payload.language) >= 2 else "en"
-    sess = _create_session(user.company_id, user.id, lang, work_date)
+    sess = _create_session(repository, user.company_id, user.id, lang, work_date)
     return SessionResponse(
         session_id=sess["id"],
         step="client",
@@ -288,7 +288,7 @@ def voice_session_input(
     repository: InMemorySecretaryRepository = Depends(get_repository),
 ):
     """Advance the voice dialog by one turn."""
-    sess = _get_session(payload.session_id, user.company_id)
+    sess = _get_session(repository, payload.session_id, user.company_id)
     if sess["state"] != "active":
         raise HTTPException(409, f"Session is {sess['state']}, not active")
 
@@ -461,6 +461,8 @@ def voice_session_input(
                 if lang == "cs" else
                 "Sesja anulowana."
             )
+            _touch(sess)
+            repository.save_voice_session(sess)
             return SessionResponse(
                 session_id=sess["id"],
                 step="done",
@@ -521,7 +523,9 @@ def voice_session_input(
             record = repository.create_work_report(user.company_id, wr_payload)
             sess["saved_work_report_id"] = record.id
             sess["state"] = "completed"
+            sess["step"] = "done"
             _touch(sess)
+            repository.save_voice_session(sess)
             save_reply = (
                 f"Saved. Work report id: {record.id}"
                 if lang == "en" else
@@ -539,6 +543,7 @@ def voice_session_input(
 
     sess["step"] = next_step
     _touch(sess)
+    repository.save_voice_session(sess)
     return SessionResponse(
         session_id=sess["id"],
         step=next_step,
@@ -553,7 +558,7 @@ def voice_session_resume(
     repository: InMemorySecretaryRepository = Depends(get_repository),
 ):
     """Resume a paused session — returns current step and prompt."""
-    sess = _get_session(payload.session_id, user.company_id)
+    sess = _get_session(repository, payload.session_id, user.company_id)
     if sess["state"] == "completed":
         return SessionResponse(
             session_id=sess["id"],
@@ -568,6 +573,7 @@ def voice_session_resume(
             prompt="Session was cancelled.",
         )
     _touch(sess)
+    repository.save_voice_session(sess)
     lang = sess["language"]
     step = sess["step"]
     return SessionResponse(

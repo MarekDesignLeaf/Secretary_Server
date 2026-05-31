@@ -1839,6 +1839,52 @@ class PostgresSecretaryRepository:
             return None
         return dict(row)
 
+    # ------------------------------------------------------------------
+    # Phase A2: voice session persistence (JSONB, survives restart)
+    # ------------------------------------------------------------------
+
+    def save_voice_session(self, session: dict) -> None:
+        """Upsert a voice session as JSONB keyed by its 'id'."""
+        sid = session["id"]
+        company_id = session["company_id"]
+        user_id = session.get("user_id")
+        state = session.get("state", "active")
+        step = session.get("step", "client")
+        payload = json.dumps(session)
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clean_voice_sessions
+                        (id, company_id, user_id, state, step, data, touched_at)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, now())
+                    ON CONFLICT (id) DO UPDATE SET
+                        state = EXCLUDED.state,
+                        step = EXCLUDED.step,
+                        data = EXCLUDED.data,
+                        touched_at = now()
+                    """,
+                    (sid, company_id, user_id, state, step, payload),
+                )
+            conn.commit()
+
+    def load_voice_session(self, session_id: str) -> dict | None:
+        """Load a voice session dict by id, or None if not found."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT data FROM clean_voice_sessions WHERE id = %s",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        data = row["data"]
+        # psycopg2 returns JSONB as dict already; tolerate str just in case
+        if isinstance(data, str):
+            return json.loads(data)
+        return dict(data)
+
 
 # ------------------------------------------------------------------
 # Connection pool context manager
