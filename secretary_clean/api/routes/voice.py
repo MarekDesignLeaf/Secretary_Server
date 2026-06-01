@@ -185,7 +185,7 @@ def execute_voice_command(
             user.company_id, CalendarEventCreate(title=title, start_at=start), created_by=user.id)
         repository.add_calendar_sync_log(user.company_id, created.id, "backend", "created_on_backend", detail="created via voice")
         when = start.strftime("%d.%m. %H:%M")
-        return res(True, f"Vytvorila jsem schuzku: {title} ({when}).", action=intent,
+        return res(True, f"Vytvořila jsem schůzku: {title} ({when}).", action=intent,
                    entity_id=created.id, data={"event": created.model_dump(mode="json")})
 
     if intent == "client.create":
