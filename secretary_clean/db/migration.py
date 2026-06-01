@@ -155,6 +155,53 @@ CREATE TABLE IF NOT EXISTS clean_pending_voice_actions (
 
 CREATE INDEX IF NOT EXISTS clean_pending_voice_actions_company_idx
     ON clean_pending_voice_actions(company_id, status);
+
+-- Phase G2: Google Calendar integration (backend-owned external sync service).
+CREATE TABLE IF NOT EXISTS clean_google_calendar_accounts (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    google_account_email TEXT,
+    google_calendar_id TEXT,
+    access_token TEXT,
+    refresh_token TEXT,
+    token_expires_at TIMESTAMPTZ,
+    scope TEXT,
+    status TEXT NOT NULL DEFAULT 'disconnected',
+    auto_sync_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    last_sync_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS clean_gcal_accounts_company_idx
+    ON clean_google_calendar_accounts(company_id);
+
+CREATE TABLE IF NOT EXISTS clean_google_calendar_mappings (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    backend_event_id UUID NOT NULL,
+    google_event_id TEXT NOT NULL,
+    google_calendar_id TEXT,
+    last_synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS clean_gcal_map_backend_idx
+    ON clean_google_calendar_mappings(company_id, backend_event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS clean_gcal_map_google_idx
+    ON clean_google_calendar_mappings(company_id, google_event_id);
+
+CREATE TABLE IF NOT EXISTS clean_google_calendar_sync_log (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL,
+    action TEXT NOT NULL,
+    backend_event_id UUID,
+    google_event_id TEXT,
+    status TEXT NOT NULL,
+    detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS clean_gcal_synclog_company_idx
+    ON clean_google_calendar_sync_log(company_id, created_at);
 """
 
 # Column additions for existing tables (safe to run multiple times)
