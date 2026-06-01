@@ -1,0 +1,31 @@
+
+######################################################################
+# 1. Co mam zitra v kalendari?
+######################################################################
+USER UTTERANCE: Co mám zítra v kalendáři?
+ENDPOINT CALLED: POST /voice/execute
+REQUEST: {'utterance': 'Co mám zítra v kalendáři?', 'confirmed': false}
+HTTP 200
+RESOLVED INTENT: calendar.list
+ACTION: calendar.list
+EXECUTED: True
+MESSAGE (shown to user): Found 0 event(s).
+DATA: {"events": [], "count": 0}
+
+######################################################################
+# 2. Pridej schuzku zitra v 10
+######################################################################
+USER UTTERANCE: Přidej schůzku zítra v 10
+--- First call WITHOUT confirm ---
+HTTP 200 intent=None executed=False needs_confirm=False
+MESSAGE: No backend intent matched; no action taken.
+--- Second call WITH confirm=true ---
+ENDPOINT CALLED: POST /voice/execute -> POST /calendar/events
+REQUEST: {'utterance': 'Přidej schůzku zítra v 10', 'confirmed': true}
+HTTP 200
+RESOLVED INTENT: None
+EXECUTED: False
+ENTITY_ID: None
+MESSAGE (shown to user): No backend intent matched; no action taken.
+RESPONSE DATA: {}
+DB VERIFY GET /calendar/events: 200 count=0

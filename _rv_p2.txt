@@ -1,0 +1,67 @@
+
+######################################################################
+# 3. Presun ji na 11
+######################################################################
+USER UTTERANCE: Přesuň ji na 11
+ENDPOINT: POST /voice/execute  (confirmed=True)
+HTTP 200
+RESOLVED INTENT: None
+EXECUTED: False
+ENTITY_ID: None
+MESSAGE (to user): No backend intent matched; no action taken.
+DATA: {}
+DB VERIFY GET /calendar/events: 200 count=0
+
+######################################################################
+# 4. Zrus ji
+######################################################################
+USER UTTERANCE: Zruš ji
+ENDPOINT: POST /voice/execute  (confirmed=True)
+HTTP 200
+RESOLVED INTENT: calendar.delete
+EXECUTED: False
+ENTITY_ID: None
+MESSAGE (to user): No matching event found to cancel.
+DATA: {"date": null, "person": null}
+DB VERIFY GET /calendar/events: 200 count=0
+
+######################################################################
+# 5. Vytvor klienta John Smith
+######################################################################
+USER UTTERANCE: Vytvoř klienta John Smith
+ENDPOINT: POST /voice/execute  (confirmed=True)
+HTTP 200
+RESOLVED INTENT: client.create
+EXECUTED: True
+ENTITY_ID: 3d938a5c-eac2-426e-9c36-64b3ce5f478a
+MESSAGE (to user): Created client: John Smith.
+DATA: {"client": {"id": "3d938a5c-eac2-426e-9c36-64b3ce5f478a", "company_id": "cefa20ac-9773-4fc8-8185-92f7394cd057", "name": "John Smith", "status": "open", "data": {"source": "voice"}, "preferred_language_code": null, "created_at": null, "updated_at": null}}
+DB VERIFY GET /crm/clients: 200 count=1
+  LATEST: {"id": "3d938a5c-eac2-426e-9c36-64b3ce5f478a", "company_id": "cefa20ac-9773-4fc8-8185-92f7394cd057", "name": "John Smith", "status": "open", "data": {"source": "voice"}, "preferred_language_code": null, "created_at": "2026-05-31T07:34:29.867702Z", "u
+
+######################################################################
+# 6. Vytvor ukol pro Daniela
+######################################################################
+USER UTTERANCE: Vytvoř úkol pro Daniela
+ENDPOINT: POST /voice/execute  (confirmed=True)
+HTTP 200
+RESOLVED INTENT: task.create
+EXECUTED: True
+ENTITY_ID: 14dfeae4-629e-46c3-b39f-6819e7e567f7
+MESSAGE (to user): Created task: Task for Daniela.
+DATA: {"task": {"id": "14dfeae4-629e-46c3-b39f-6819e7e567f7", "company_id": "cefa20ac-9773-4fc8-8185-92f7394cd057", "name": "Task for Daniela", "status": "open", "data": {"source": "voice", "assignee": "Daniela"}, "preferred_language_code": null, "created_at": null, "updated_at": null}}
+DB VERIFY GET /crm/tasks: 200 count=1
+  LATEST: {"id": "14dfeae4-629e-46c3-b39f-6819e7e567f7", "company_id": "cefa20ac-9773-4fc8-8185-92f7394cd057", "name": "Task for Daniela", "status": "open", "data": {"source": "voice", "assignee": "Daniela"}, "preferred_language_code": null, "created_at": "202
+
+######################################################################
+# 7. Vytvor work report
+######################################################################
+USER UTTERANCE: Vytvoř work report
+ENDPOINT: POST /voice/execute  (confirmed=True)
+HTTP 200
+RESOLVED INTENT: work_report.start
+EXECUTED: False
+ENTITY_ID: None
+MESSAGE (to user): Start a work report via the voice session flow: POST /voice/session/start.
+DATA: {"delegate_to": "/voice/session/start"}
+DB VERIFY GET /work-reports: 200 count=0

@@ -137,6 +137,24 @@ CREATE TABLE IF NOT EXISTS clean_calendar_sync_log (
 
 CREATE INDEX IF NOT EXISTS clean_calendar_sync_log_company_idx
     ON clean_calendar_sync_log(company_id, created_at);
+
+-- Phase A5.2: pending voice actions (multi-turn slot filling, backend-owned).
+CREATE TABLE IF NOT EXISTS clean_pending_voice_actions (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    user_id UUID,
+    intent TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'needs_more_info',
+    collected_data JSONB NOT NULL DEFAULT '{}',
+    missing_fields JSONB NOT NULL DEFAULT '[]',
+    last_question TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS clean_pending_voice_actions_company_idx
+    ON clean_pending_voice_actions(company_id, status);
 """
 
 # Column additions for existing tables (safe to run multiple times)

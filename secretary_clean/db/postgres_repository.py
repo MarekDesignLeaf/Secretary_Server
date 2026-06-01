@@ -47,6 +47,7 @@ from secretary_clean.core.models import (
     CalendarSyncEventInput,
     CalendarSyncOutcome,
     CalendarSyncLogEntry,
+    PendingVoiceAction,
     TenantLanguage,
     TenantLanguageChoice,
     TenantOperatingProfile,
@@ -2118,6 +2119,53 @@ class PostgresSecretaryRepository:
                     detail="backend-only event; device must create locally",
                 ))
         return outcomes
+
+
+    # ------------------------------------------------------------------
+    # Phase A5.2: pending voice actions (JSONB, survives restart)
+    # ------------------------------------------------------------------
+
+    def _row_to_pending(self, row: dict) -> PendingVoiceAction:
+        cd = row["collected_data"]
+        mf = row["missing_fields"]
+        if isinstance(cd, str): cd = json.loads(cd)
+        if isinstance(mf, str): mf = json.loads(mf)
+        return PendingVoiceAction(
+            id=str(row["id"]), company_id=str(row["company_id"]),
+            user_id=str(row["user_id"]) if row.get("user_id") else None,
+            intent=row["intent"], status=row["status"],
+            collected_data=cd or {}, missing_fields=mf or [],
+            last_question=row.get("last_question"),
+            created_at=row["created_at"], updated_at=row["updated_at"],
+            expires_at=row.get("expires_at"),
+        )
+
+    def create_pending_action(self, action: PendingVoiceAction) -> PendingVoiceAction:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_pending_voice_actions (id, company_id, user_id, intent, status, collected_data, missing_fields, last_question, expires_at) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)",
+                    (action.id, action.company_id, action.user_id, action.intent, action.status, json.dumps(action.collected_data), json.dumps(action.missing_fields), action.last_question, action.expires_at),
+                )
+            conn.commit()
+        return action
+
+    def get_pending_action(self, action_id: str, company_id: str) -> PendingVoiceAction | None:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM clean_pending_voice_actions WHERE id = %s AND company_id = %s", (action_id, company_id))
+                row = cur.fetchone()
+        return self._row_to_pending(row) if row else None
+
+    def update_pending_action(self, action: PendingVoiceAction) -> PendingVoiceAction:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE clean_pending_voice_actions SET status=%s, collected_data=%s::jsonb, missing_fields=%s::jsonb, last_question=%s, updated_at=now() WHERE id=%s",
+                    (action.status, json.dumps(action.collected_data), json.dumps(action.missing_fields), action.last_question, action.id),
+                )
+            conn.commit()
+        return action
 
 
 # ------------------------------------------------------------------

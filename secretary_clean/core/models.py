@@ -511,10 +511,26 @@ class VoiceResolveResult(BaseModel):
     language_context: LanguageContext | None = None
 
 
+class PendingVoiceAction(BaseModel):
+    """A multi-turn voice action awaiting more info (Phase A5.2)."""
+    id: str
+    company_id: str
+    user_id: str | None = None
+    intent: str
+    status: str = "needs_more_info"
+    collected_data: dict[str, Any] = Field(default_factory=dict)
+    missing_fields: list[str] = Field(default_factory=list)
+    last_question: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None = None
+
+
 class VoiceExecuteRequest(BaseModel):
     utterance: str
     confirmed: bool = False
     client_id: str | None = None
+    pending_action_id: str | None = None
     context: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -526,6 +542,10 @@ class VoiceExecuteResult(BaseModel):
     action: str | None = None           # e.g. "calendar.create"
     entity_id: str | None = None        # id of created/updated/deleted entity
     data: dict[str, Any] = Field(default_factory=dict)  # extracted entities / result payload
+    status: str = "executed"  # executed|needs_more_info|cancelled|error
+    missing_fields: list[str] = Field(default_factory=list)
+    question: str | None = None
+    pending_action_id: str | None = None
     language_context: LanguageContext | None = None
 
 

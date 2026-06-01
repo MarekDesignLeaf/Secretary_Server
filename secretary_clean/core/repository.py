@@ -39,6 +39,7 @@ from .models import (
     CalendarSyncEventInput,
     CalendarSyncOutcome,
     CalendarSyncLogEntry,
+    PendingVoiceAction,
     UserAccount,
     WorkReportCreate,
 )
@@ -54,6 +55,7 @@ class InMemorySecretaryRepository:
         self.tenant_industries: dict[str, list] = {}  # Phase A1: company_id -> list[TenantIndustry]
         self.calendar_events: dict[str, CalendarEvent] = {}  # Phase A3: event_id -> CalendarEvent
         self.calendar_sync_log: list = []  # Phase A5: list[CalendarSyncLogEntry]
+        self.pending_voice_actions: dict[str, PendingVoiceAction] = {}  # Phase A5.2
         self.tenant_languages: dict[tuple[str, LanguageScope, str], TenantLanguage] = {}
         self.tenant_configuration: dict[str, dict] = {}
         self.users: dict[str, UserAccount] = {}
@@ -1068,3 +1070,23 @@ class InMemorySecretaryRepository:
                     detail="backend-only event; device must create locally",
                 ))
         return outcomes
+
+    # ------------------------------------------------------------------
+    # Phase A5.2: pending voice actions (multi-turn slot filling)
+    # ------------------------------------------------------------------
+
+    def create_pending_action(self, action: PendingVoiceAction) -> PendingVoiceAction:
+        self.pending_voice_actions[action.id] = action
+        return action
+
+    def get_pending_action(self, action_id: str, company_id: str) -> PendingVoiceAction | None:
+        a = self.pending_voice_actions.get(action_id)
+        if not a or a.company_id != company_id:
+            return None
+        return a
+
+    def update_pending_action(self, action: PendingVoiceAction) -> PendingVoiceAction:
+        from datetime import datetime as _dt, timezone as _tz
+        action.updated_at = _dt.now(_tz.utc)
+        self.pending_voice_actions[action.id] = action
+        return action
