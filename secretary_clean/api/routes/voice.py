@@ -1,16 +1,18 @@
-"""Voice foundation routes (Phase A5 — real action execution).
+"""Voice foundation routes (Phase A5 + A5.2 — real action execution + pending follow-up).
 
 /voice/resolve  — classify an utterance into a backend intent (read-only preview)
-/voice/execute  — actually perform the backend action (calendar / task / client)
+/voice/execute  — perform a real backend action; if required info is missing, ask
+                  a follow-up question and keep a backend-owned pending action.
 
-Voice no longer just "opens a screen": when an action is available it executes
-a real repository call. Destructive actions (delete) require confirmed=true.
-Work reports are delegated to the multi-turn voice session flow (not executed here).
+Pending actions live in PostgreSQL (clean_pending_voice_actions), so a multi-turn
+dialog survives a backend restart. Android is only a client: it echoes back the
+pending_action_id and the next utterance.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends
 
@@ -19,6 +21,7 @@ from secretary_clean.core.language import resolve_language_context
 from secretary_clean.core.models import (
     CalendarEventCreate,
     CalendarEventUpdate,
+    PendingVoiceAction,
     Permission,
     UserAccount,
     VoiceExecuteRequest,
@@ -27,9 +30,13 @@ from secretary_clean.core.models import (
     VoiceResolveResult,
 )
 from secretary_clean.core.repository import InMemorySecretaryRepository
-from secretary_clean.core.voice_intents import parse_intent
+from secretary_clean.core import voice_intents as vi
+from secretary_clean.core import voice_slots as vsl
 
 router = APIRouter(prefix="/voice", tags=["voice foundation"])
+
+PENDING_TTL_MIN = 30
+_CANCEL_WORDS = ("zrus", "zrusit", "cancel", "nech to byt", "to staci", "to staci")
 
 
 def _lang_ctx(repository, user: UserAccount, client_id: str | None):
@@ -45,7 +52,7 @@ def resolve_voice_command(
     repository: InMemorySecretaryRepository = Depends(get_repository),
 ):
     """Classify an utterance (read-only). Does not perform any action."""
-    parsed = parse_intent(payload.utterance)
+    parsed = vi.parse_intent(payload.utterance)
     return VoiceResolveResult(
         utterance=payload.utterance,
         resolved_intent=parsed.intent,
@@ -56,23 +63,35 @@ def resolve_voice_command(
     )
 
 
-def _find_event_for_voice(repository, company_id: str, date_iso: str | None, person: str | None):
-    """Best-effort match of an existing event for update/delete.
+def _is_cancel(text: str) -> bool:
+    low = " ".join(text.lower().split())
+    return any(w in low for w in _CANCEL_WORDS)
 
-    Person is the strongest signal (e.g. "meeting with John"). For UPDATE the
-    spoken date is usually the *target* date, not the existing one, so when a
-    person is given we match on person alone. Date is only used as a fallback
-    filter when no person is provided."""
-    events = repository.list_calendar_events(company_id)
-    if person:
-        p = person.lower()
-        pm = [e for e in events if p in (e.title or "").lower()]
-        if pm:
-            return pm
-        # person mentioned but no title match → fall through to date filter
+
+def _merge_answer_into_data(intent: str, text: str, data: dict) -> dict:
+    """Extract entities from a follow-up answer and merge them into collected_data."""
+    d = dict(data)
+    # date/time
+    date_iso = vi.parse_date(text)
+    hhmm = vi.parse_time(text)
     if date_iso:
-        return [e for e in events if e.start_at.date().isoformat() == date_iso]
-    return events if not person else []
+        d["date"] = date_iso
+    if hhmm:
+        d["time"] = hhmm
+    if d.get("date"):
+        when = d["date"]
+        t = d.get("time")
+        d["start_at"] = f"{when}T{t}:00Z" if t else f"{when}T00:00:00Z"
+    # person
+    person = vi.extract_person(text)
+    if person:
+        d["person"] = person
+    # intent-specific free-text slot
+    if intent == "client.create" and not d.get("name"):
+        d["name"] = text.strip()
+    if intent == "task.create" and not d.get("title"):
+        d["title"] = text.strip()
+    return d
 
 
 @router.post("/execute", response_model=VoiceExecuteResult)
@@ -81,128 +100,117 @@ def execute_voice_command(
     user: UserAccount = Depends(require_permission(Permission.voice_execute)),
     repository: InMemorySecretaryRepository = Depends(get_repository),
 ):
-    """Resolve the utterance and execute a real backend action."""
+    """Resolve the utterance and execute a real backend action, asking follow-up
+    questions when required information is missing (Phase A5.2)."""
     lang_ctx = _lang_ctx(repository, user, payload.client_id)
-    parsed = parse_intent(payload.utterance)
-    intent = parsed.intent
-    ent = parsed.entities
 
-    def result(executed, message, action=None, entity_id=None, data=None, needs_confirm=False):
+    def res(executed, message, status="executed", action=None, entity_id=None,
+            data=None, needs_confirm=False, missing=None, question=None, pending_id=None):
         return VoiceExecuteResult(
-            executed=executed,
-            resolved_intent=intent,
-            requires_confirmation=needs_confirm,
-            message=message,
-            action=action,
-            entity_id=entity_id,
-            data=data or {},
-            language_context=lang_ctx,
+            executed=executed, resolved_intent=action, requires_confirmation=needs_confirm,
+            message=message, action=action, entity_id=entity_id, data=data or {},
+            status=status, missing_fields=missing or [], question=question,
+            pending_action_id=pending_id, language_context=lang_ctx,
         )
 
-    if not intent:
-        return result(False, "No backend intent matched; no action taken.")
+    # ── Continuation of an existing pending action ─────────────────────────
+    pending = None
+    if payload.pending_action_id:
+        pending = repository.get_pending_action(payload.pending_action_id, user.company_id)
+        if pending and pending.status != "needs_more_info":
+            pending = None  # already finished/cancelled — treat as fresh
 
-    # Destructive / mutating intents require confirmation
-    if parsed.requires_confirmation and not payload.confirmed:
-        return result(
-            False,
-            f"Confirmation required before executing '{intent}'.",
-            action=intent, data=ent, needs_confirm=True,
-        )
+    # Cancel phrases cancel an active pending action
+    if pending and _is_cancel(payload.utterance):
+        pending.status = "cancelled"
+        repository.update_pending_action(pending)
+        return res(False, "Dobre, akci jsem zrusila.", status="cancelled",
+                   action=pending.intent, pending_id=pending.id)
 
-    # ── CALENDAR LIST (read-only) ──────────────────────────────────────────
+    if pending:
+        intent = pending.intent
+        data = _merge_answer_into_data(intent, payload.utterance, pending.collected_data)
+    else:
+        parsed = vi.parse_intent(payload.utterance)
+        intent = parsed.intent
+        if not intent:
+            return res(False, "Nerozumel jsem prikazu.", status="error")
+        data = dict(parsed.entities)
+
+    # ── Slot check: is required info still missing? ────────────────────────
+    missing = vsl.missing_slots(intent, data)
+    if missing:
+        question = vsl.next_question(intent, missing)
+        now = datetime.now(timezone.utc)
+        if pending:
+            pending.collected_data = data
+            pending.missing_fields = missing
+            pending.last_question = question
+            repository.update_pending_action(pending)
+            pid_out = pending.id
+        else:
+            new_pending = PendingVoiceAction(
+                id=str(uuid.uuid4()), company_id=user.company_id, user_id=user.id,
+                intent=intent, status="needs_more_info", collected_data=data,
+                missing_fields=missing, last_question=question,
+                created_at=now, updated_at=now,
+                expires_at=now + timedelta(minutes=PENDING_TTL_MIN),
+            )
+            repository.create_pending_action(new_pending)
+            pid_out = new_pending.id
+        return res(False, question, status="needs_more_info", action=intent,
+                   data=data, missing=missing, question=question, pending_id=pid_out)
+
+    # All required info present → mark pending ready/executed then run the action.
+    if pending:
+        pending.collected_data = data
+        pending.missing_fields = []
+        pending.status = "executed"
+        repository.update_pending_action(pending)
+
+    # ── EXECUTE (all required info present) ────────────────────────────────
+    if intent == "calendar.create":
+        start = datetime.fromisoformat(data["start_at"].replace("Z", "+00:00"))
+        person = data.get("person")
+        title = data.get("title") or (f"Schuzka s {person}" if person else "Schuzka")
+        created = repository.create_calendar_event(
+            user.company_id, CalendarEventCreate(title=title, start_at=start), created_by=user.id)
+        repository.add_calendar_sync_log(user.company_id, created.id, "backend", "created_on_backend", detail="created via voice")
+        when = start.strftime("%d.%m. %H:%M")
+        return res(True, f"Vytvorila jsem schuzku: {title} ({when}).", action=intent,
+                   entity_id=created.id, data={"event": created.model_dump(mode="json")})
+
+    if intent == "client.create":
+        name = data.get("name")
+        rec = repository.create_crm_record("clients", user.company_id, name, {"source": "voice"})
+        return res(True, f"Vytvorila jsem klienta: {name}.", action=intent,
+                   entity_id=rec.id, data={"client": rec.model_dump(mode="json")})
+
+    if intent == "task.create":
+        title = data.get("title")
+        person = data.get("person")
+        rec = repository.create_crm_record("tasks", user.company_id, title,
+                                           {"source": "voice", "assignee": person})
+        msg = f"Vytvorila jsem ukol pro {person}: {title}." if person else f"Vytvorila jsem ukol: {title}."
+        return res(True, msg, action=intent, entity_id=rec.id, data={"task": rec.model_dump(mode="json")})
+
     if intent == "calendar.list":
         start = end = None
-        if ent.get("date"):
-            d = ent["date"]
-            win = ent.get("window")
+        if data.get("date"):
+            d = data["date"]; win = data.get("window")
             if win:
-                start = datetime.fromisoformat(f"{d}T{win[0]}:00+00:00")
-                end = datetime.fromisoformat(f"{d}T{win[1]}:00+00:00")
+                start = datetime.fromisoformat(f"{d}T{win[0]}:00+00:00"); end = datetime.fromisoformat(f"{d}T{win[1]}:00+00:00")
             else:
-                start = datetime.fromisoformat(f"{d}T00:00:00+00:00")
-                end = datetime.fromisoformat(f"{d}T23:59:59+00:00")
+                start = datetime.fromisoformat(f"{d}T00:00:00+00:00"); end = datetime.fromisoformat(f"{d}T23:59:59+00:00")
         events = repository.list_calendar_events(user.company_id, start=start, end=end)
-        if ent.get("next"):
+        if data.get("next"):
             now = datetime.now(timezone.utc)
-            upcoming = [e for e in repository.list_calendar_events(user.company_id) if e.start_at >= now]
-            events = upcoming[:1]
-        data = {"events": [e.model_dump(mode="json") for e in events], "count": len(events)}
-        return result(True, f"Found {len(events)} event(s).", action=intent, data=data)
+            events = [e for e in repository.list_calendar_events(user.company_id) if e.start_at >= now][:1]
+        if not events:
+            return res(True, "Na ten cas nemas v kalendari nic naplanovaneho.", action=intent,
+                       data={"events": [], "count": 0})
+        titles = ", ".join(e.title for e in events)
+        return res(True, f"Mas {len(events)} udalosti: {titles}.", action=intent,
+                   data={"events": [e.model_dump(mode="json") for e in events], "count": len(events)})
 
-    # ── CALENDAR CREATE ────────────────────────────────────────────────────
-    if intent == "calendar.create":
-        if not ent.get("start_at"):
-            return result(False, "Could not determine a date/time for the event.", action=intent, data=ent)
-        start = datetime.fromisoformat(ent["start_at"].replace("Z", "+00:00"))
-        created = repository.create_calendar_event(
-            user.company_id,
-            CalendarEventCreate(title=ent.get("title") or "Event", start_at=start),
-            created_by=user.id,
-        )
-        repository.add_calendar_sync_log(user.company_id, created.id, "backend", "created_on_backend",
-                                         detail="created via voice")
-        return result(True, f"Created '{created.title}'.", action=intent,
-                      entity_id=created.id, data={"event": created.model_dump(mode="json")})
-
-    # ── CALENDAR UPDATE ────────────────────────────────────────────────────
-    if intent == "calendar.update":
-        matches = _find_event_for_voice(repository, user.company_id, ent.get("date"), ent.get("person"))
-        if not matches:
-            return result(False, "No matching event found to update.", action=intent, data=ent)
-        if len(matches) > 1:
-            return result(False, f"{len(matches)} events match; be more specific.",
-                          action=intent, data={"candidates": [e.model_dump(mode="json") for e in matches]})
-        target = matches[0]
-        upd = CalendarEventUpdate()
-        if ent.get("new_start"):
-            upd.start_at = datetime.fromisoformat(ent["new_start"].replace("Z", "+00:00"))
-        updated = repository.update_calendar_event(target.id, user.company_id, upd)
-        repository.add_calendar_sync_log(user.company_id, updated.id, "backend", "updated_backend",
-                                         detail="updated via voice")
-        return result(True, f"Moved '{updated.title}'.", action=intent,
-                      entity_id=updated.id, data={"event": updated.model_dump(mode="json")})
-
-    # ── CALENDAR DELETE ────────────────────────────────────────────────────
-    if intent == "calendar.delete":
-        matches = _find_event_for_voice(repository, user.company_id, ent.get("date"), ent.get("person"))
-        if not matches:
-            return result(False, "No matching event found to cancel.", action=intent, data=ent)
-        if len(matches) > 1:
-            return result(False, f"{len(matches)} events match; be more specific.",
-                          action=intent, data={"candidates": [e.model_dump(mode="json") for e in matches]})
-        target = matches[0]
-        repository.delete_calendar_event(target.id, user.company_id)
-        repository.add_calendar_sync_log(user.company_id, target.id, "backend", "deleted_backend",
-                                         detail="deleted via voice")
-        return result(True, f"Cancelled '{target.title}'.", action=intent, entity_id=target.id)
-
-    # ── TASK CREATE ────────────────────────────────────────────────────────
-    if intent == "task.create":
-        name = ("Task for " + ent["person"]) if ent.get("person") else (ent.get("raw") or "Task")
-        rec = repository.create_crm_record(
-            "tasks", user.company_id, name, {"source": "voice", "assignee": ent.get("person")}
-        )
-        return result(True, f"Created task: {name}.", action=intent,
-                      entity_id=rec.id, data={"task": rec.model_dump(mode="json")})
-
-    # ── CLIENT CREATE ──────────────────────────────────────────────────────
-    if intent == "client.create":
-        name = ent.get("name")
-        if not name:
-            return result(False, "Could not determine the client name.", action=intent, data=ent)
-        rec = repository.create_crm_record(
-            "clients", user.company_id, name, {"source": "voice"}
-        )
-        return result(True, f"Created client: {name}.", action=intent,
-                      entity_id=rec.id, data={"client": rec.model_dump(mode="json")})
-
-    # ── WORK REPORT → delegate to voice session ────────────────────────────
-    if intent == "work_report.start":
-        return result(
-            False,
-            "Start a work report via the voice session flow: POST /voice/session/start.",
-            action=intent, data={"delegate_to": "/voice/session/start"},
-        )
-
-    return result(False, f"Intent '{intent}' is recognised but not executable yet.", action=intent)
+    return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)

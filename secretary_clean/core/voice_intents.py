@@ -202,9 +202,11 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
         date_iso = parse_date(low, base)
         hhmm = parse_time(low)
         person = extract_person(utterance)
-        title = "Meeting" if "meeting" in low or "schůz" in low or "schuz" in low else "Appointment"
+        # No generic default title — leave title empty so the slot-filler asks
+        # "with whom / what name" when neither person nor explicit title is given.
+        title = None
         if person:
-            title = f"{title} with {person}"
+            title = f"Schuzka s {person}"
         start = _combine(date_iso, hhmm) if date_iso else None
         return ParsedIntent(
             intent="calendar.create",
