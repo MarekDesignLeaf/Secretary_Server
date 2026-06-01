@@ -172,7 +172,15 @@ def execute_voice_command(
     if intent == "calendar.create":
         start = datetime.fromisoformat(data["start_at"].replace("Z", "+00:00"))
         person = data.get("person")
-        title = data.get("title") or (f"Schuzka s {person}" if person else "Schuzka")
+        title = data.get("title") or (f"Schůzka s {person}" if person else "Schůzka")
+        # Dedup: do not silently create a second identical event at the same time.
+        existing = [e for e in repository.list_calendar_events(user.company_id)
+                    if e.title == title and e.start_at == start]
+        if existing:
+            when = start.strftime("%d.%m. %H:%M")
+            return res(False, f"Schůzku '{title}' na {when} už máš v kalendáři.",
+                       status="error", action=intent, entity_id=existing[0].id,
+                       data={"event": existing[0].model_dump(mode="json")})
         created = repository.create_calendar_event(
             user.company_id, CalendarEventCreate(title=title, start_at=start), created_by=user.id)
         repository.add_calendar_sync_log(user.company_id, created.id, "backend", "created_on_backend", detail="created via voice")
