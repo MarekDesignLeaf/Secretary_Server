@@ -56,6 +56,9 @@ class InMemorySecretaryRepository:
         self.calendar_events: dict[str, CalendarEvent] = {}  # Phase A3: event_id -> CalendarEvent
         self.calendar_sync_log: list = []  # Phase A5: list[CalendarSyncLogEntry]
         self.pending_voice_actions: dict[str, PendingVoiceAction] = {}  # Phase A5.2
+        self.google_accounts: dict[str, GoogleCalendarAccount] = {}  # Phase G3 (key=company_id)
+        self.google_mappings: list = []  # Phase G3 dicts: company_id, backend_event_id, google_event_id
+        self.google_sync_log: list = []  # Phase G3 dicts
         self.tenant_languages: dict[tuple[str, LanguageScope, str], TenantLanguage] = {}
         self.tenant_configuration: dict[str, dict] = {}
         self.users: dict[str, UserAccount] = {}
@@ -1090,3 +1093,30 @@ class InMemorySecretaryRepository:
         action.updated_at = _dt.now(_tz.utc)
         self.pending_voice_actions[action.id] = action
         return action
+
+    # ------------------------------------------------------------------
+    # Phase G3: Google Calendar account / mappings / sync log
+    # ------------------------------------------------------------------
+
+    def get_google_account(self, company_id: str) -> GoogleCalendarAccount | None:
+        return self.google_accounts.get(company_id)
+
+    def upsert_google_account(self, account: GoogleCalendarAccount) -> GoogleCalendarAccount:
+        from datetime import datetime as _dt, timezone as _tz
+        account.updated_at = _dt.now(_tz.utc)
+        self.google_accounts[account.company_id] = account
+        return account
+
+    def add_google_sync_log(self, company_id, direction, action, status,
+                            backend_event_id=None, google_event_id=None, detail=None):
+        from datetime import datetime as _dt, timezone as _tz
+        entry = {"company_id": company_id, "direction": direction, "action": action,
+                 "status": status, "backend_event_id": backend_event_id,
+                 "google_event_id": google_event_id, "detail": detail,
+                 "created_at": _dt.now(_tz.utc)}
+        self.google_sync_log.append(entry)
+        return entry
+
+    def list_google_sync_log(self, company_id: str, limit: int = 50) -> list:
+        rows = [e for e in self.google_sync_log if e["company_id"] == company_id]
+        return list(reversed(rows))[:limit]

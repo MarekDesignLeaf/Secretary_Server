@@ -2167,6 +2167,55 @@ class PostgresSecretaryRepository:
             conn.commit()
         return action
 
+    # ------------------------------------------------------------------
+    # Phase G3: Google Calendar account / sync log (tokens never logged)
+    # ------------------------------------------------------------------
+
+    def _row_to_gaccount(self, row: dict) -> GoogleCalendarAccount:
+        return GoogleCalendarAccount(
+            id=str(row["id"]), company_id=str(row["company_id"]),
+            google_account_email=row.get("google_account_email"),
+            google_calendar_id=row.get("google_calendar_id"),
+            access_token=row.get("access_token"),
+            refresh_token=row.get("refresh_token"),
+            token_expires_at=row.get("token_expires_at"),
+            scope=row.get("scope"), status=row["status"],
+            auto_sync_enabled=row["auto_sync_enabled"],
+            last_sync_at=row.get("last_sync_at"),
+            created_at=row["created_at"], updated_at=row["updated_at"])
+
+    def get_google_account(self, company_id: str):
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM clean_google_calendar_accounts WHERE company_id = %s", (company_id,))
+                row = cur.fetchone()
+        return self._row_to_gaccount(row) if row else None
+
+    def upsert_google_account(self, account):
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_google_calendar_accounts (id, company_id, google_account_email, google_calendar_id, access_token, refresh_token, token_expires_at, scope, status, auto_sync_enabled, last_sync_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (company_id) DO UPDATE SET google_account_email=EXCLUDED.google_account_email, google_calendar_id=EXCLUDED.google_calendar_id, access_token=EXCLUDED.access_token, refresh_token=EXCLUDED.refresh_token, token_expires_at=EXCLUDED.token_expires_at, scope=EXCLUDED.scope, status=EXCLUDED.status, auto_sync_enabled=EXCLUDED.auto_sync_enabled, last_sync_at=EXCLUDED.last_sync_at, updated_at=now()",
+                    (account.id, account.company_id, account.google_account_email, account.google_calendar_id, account.access_token, account.refresh_token, account.token_expires_at, account.scope, account.status, account.auto_sync_enabled, account.last_sync_at))
+            conn.commit()
+        return account
+
+    def add_google_sync_log(self, company_id, direction, action, status, backend_event_id=None, google_event_id=None, detail=None):
+        import uuid as _uuid
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_google_calendar_sync_log (id, company_id, direction, action, backend_event_id, google_event_id, status, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (str(_uuid.uuid4()), company_id, direction, action, backend_event_id, google_event_id, status, detail))
+            conn.commit()
+
+    def list_google_sync_log(self, company_id: str, limit: int = 50) -> list:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM clean_google_calendar_sync_log WHERE company_id = %s ORDER BY created_at DESC LIMIT %s", (company_id, limit))
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
 
 # ------------------------------------------------------------------
 # Connection pool context manager

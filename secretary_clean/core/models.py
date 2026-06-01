@@ -658,3 +658,21 @@ class BackupRestoreInfo(BaseModel):
     created_at: datetime
     backup_scope: BackupScope
     includes_db_reference: bool
+
+
+class GoogleCalendarAccount(BaseModel):
+    """Google Calendar OAuth account for a company (Phase G3). Backend-owned.
+    Tokens are never serialized to clients — only status-level fields are exposed."""
+    id: str
+    company_id: str
+    google_account_email: str | None = None
+    google_calendar_id: str | None = None
+    access_token: str | None = None
+    refresh_token: str | None = None
+    token_expires_at: datetime | None = None
+    scope: str | None = None
+    status: str = "disconnected"  # disconnected|connected|needs_reauth
+    auto_sync_enabled: bool = False
+    last_sync_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
