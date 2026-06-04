@@ -47,6 +47,7 @@ from secretary_clean.core.models import (
     CalendarSyncEventInput,
     CalendarSyncOutcome,
     CalendarSyncLogEntry,
+    GoogleCalendarAccount,
     PendingVoiceAction,
     TenantLanguage,
     TenantLanguageChoice,
