@@ -121,16 +121,20 @@ def google_callback(code: str = Query(None), state: str = Query(None),
     except Exception:
         return HTMLResponse("<h3>Vymena tokenu selhala. Zkuste to znovu.</h3>", status_code=502)
     import uuid as _uuid
-    existing = repository.get_google_account(state)
-    now = datetime.now(timezone.utc)
-    acc = existing or GoogleCalendarAccount(id=str(_uuid.uuid4()), company_id=state, created_at=now, updated_at=now)
-    acc.access_token = tok.get("access_token")
-    if tok.get("refresh_token"):
-        acc.refresh_token = tok.get("refresh_token")
-    acc.token_expires_at = now + timedelta(seconds=tok.get("expires_in", 3600))
-    acc.scope = tok.get("scope", GOOGLE_SCOPE)
-    acc.status = "connected"
-    repository.upsert_google_account(acc)
+    try:
+        existing = repository.get_google_account(state)
+        now = datetime.now(timezone.utc)
+        acc = existing or GoogleCalendarAccount(id=str(_uuid.uuid4()), company_id=state, created_at=now, updated_at=now)
+        acc.access_token = tok.get("access_token")
+        if tok.get("refresh_token"):
+            acc.refresh_token = tok.get("refresh_token")
+        acc.token_expires_at = now + timedelta(seconds=tok.get("expires_in", 3600))
+        acc.scope = tok.get("scope", GOOGLE_SCOPE)
+        acc.status = "connected"
+        repository.upsert_google_account(acc)
+    except Exception as exc:
+        import traceback
+        return HTMLResponse(f"<h3>Ulozeni tokenu selhalo: {exc}</h3><pre>{traceback.format_exc()}</pre>", status_code=500)
     return HTMLResponse("<h3>Google Calendar je propojen. Muzete zavrit okno a vratit se do aplikace.</h3>")
 
 @router.post("/disconnect")
