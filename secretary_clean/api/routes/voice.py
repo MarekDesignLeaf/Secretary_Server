@@ -124,7 +124,7 @@ def execute_voice_command(
     if pending and _is_cancel(payload.utterance):
         pending.status = "cancelled"
         repository.update_pending_action(pending)
-        return res(False, "Dobre, akci jsem zrusila.", status="cancelled",
+        return res(False, "Dobře, akci jsem zrušila.", status="cancelled",
                    action=pending.intent, pending_id=pending.id)
 
     if pending:
@@ -134,7 +134,7 @@ def execute_voice_command(
         parsed = vi.parse_intent(payload.utterance)
         intent = parsed.intent
         if not intent:
-            return res(False, "Nerozumel jsem prikazu.", status="error")
+            return res(False, "Nerozuměl jsem příkazu.", status="error")
         data = dict(parsed.entities)
 
     # ── Slot check: is required info still missing? ────────────────────────
@@ -191,7 +191,7 @@ def execute_voice_command(
     if intent == "client.create":
         name = data.get("name")
         rec = repository.create_crm_record("clients", user.company_id, name, {"source": "voice"})
-        return res(True, f"Vytvorila jsem klienta: {name}.", action=intent,
+        return res(True, f"Vytvořila jsem klienta: {name}.", action=intent,
                    entity_id=rec.id, data={"client": rec.model_dump(mode="json")})
 
     if intent == "task.create":
@@ -199,7 +199,7 @@ def execute_voice_command(
         person = data.get("person")
         rec = repository.create_crm_record("tasks", user.company_id, title,
                                            {"source": "voice", "assignee": person})
-        msg = f"Vytvorila jsem ukol pro {person}: {title}." if person else f"Vytvorila jsem ukol: {title}."
+        msg = f"Vytvořila jsem úkol pro {person}: {title}." if person else f"Vytvořila jsem úkol: {title}."
         return res(True, msg, action=intent, entity_id=rec.id, data={"task": rec.model_dump(mode="json")})
 
     if intent == "calendar.list":
@@ -215,10 +215,10 @@ def execute_voice_command(
             now = datetime.now(timezone.utc)
             events = [e for e in repository.list_calendar_events(user.company_id) if e.start_at >= now][:1]
         if not events:
-            return res(True, "Na ten cas nemas v kalendari nic naplanovaneho.", action=intent,
+            return res(True, "Na ten čas nemáš v kalendáři nic naplánováno.", action=intent,
                        data={"events": [], "count": 0})
         titles = ", ".join(e.title for e in events)
-        return res(True, f"Mas {len(events)} udalosti: {titles}.", action=intent,
+        return res(True, f"Máš {len(events)} událostí: {titles}.", action=intent,
                    data={"events": [e.model_dump(mode="json") for e in events], "count": len(events)})
 
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)

@@ -9,14 +9,14 @@ from __future__ import annotations
 # Order matters: first missing slot is asked first.
 _SLOTS = {
     "calendar.create": [
-        ("start_at", "Na kdy mam schuzku vytvorit?"),
-        ("title_or_person", "S kym nebo jaky nazev ma schuzka mit?"),
+        ("start_at", "Na kdy mám schůzku vytvořit?"),
+        ("title_or_person", "S kým nebo jaký název má schůzka mít?"),
     ],
     "client.create": [
         ("name", "Jak se klient jmenuje?"),
     ],
     "task.create": [
-        ("title", "Jaky ukol mam vytvorit?"),
+        ("title", "Jaký úkol mám vytvořit?"),
     ],
 }
 
