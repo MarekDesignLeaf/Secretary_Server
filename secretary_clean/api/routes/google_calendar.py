@@ -32,7 +32,7 @@ from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
 
 from secretary_clean.api.deps import get_repository, current_user, require_permission
-from secretary_clean.core.models import Permission, UserAccount
+from secretary_clean.core.models import GoogleCalendarAccount, Permission, UserAccount
 from secretary_clean.core.repository import InMemorySecretaryRepository
 
 router = APIRouter(prefix="/calendar/google", tags=["google calendar"])
