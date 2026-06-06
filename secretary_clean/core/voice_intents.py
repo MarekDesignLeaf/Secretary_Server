@@ -153,11 +153,20 @@ _CREATE_CAL = ("create meeting", "create appointment", "new meeting", "schedule"
 _UPDATE_CAL = ("move", "reschedule", "change", "přesuň", "presun", "přesunout",
                "změň termín", "zmen termin", "reschedule")
 _DELETE_CAL = ("cancel", "delete appointment", "delete meeting", "remove meeting",
-               "zruš", "zrus", "smaž schůzku", "smaz schuzku", "odstraň událost")
+               "zruš", "zrus", "smaž schůzku", "smaz schuzku", "odstraň událost",
+               "odstran udalost", "zrus schuzku", "zruš schůzku", "zrus termin",
+               "zruš termín", "vymaz schuzku", "vymaž schůzku", "odvolej schuzku",
+               "odvolej schůzku", "smaz termin", "smaž termín")
 _CREATE_TASK = ("create task", "new task", "add task", "vytvoř úkol", "vytvor ukol",
-                "nový úkol", "novy ukol", "přidej úkol")
-_CREATE_CLIENT = ("create client", "new client", "add client", "vytvoř klienta",
-                  "vytvor klienta", "nový klient", "novy klient")
+                "nový úkol", "novy ukol", "přidej úkol", "pridej ukol", "přidej úkol",
+                "zaloz ukol", "založ úkol", "zapiš úkol", "zapis ukol", "udelej ukol",
+                "udělej úkol", "novy task", "pridej task", "dej ukol", "zadej ukol",
+                "zadej úkol", "novy pozadavek", "vytvoř task")
+_CREATE_CLIENT = ("create client", "new client", "add client", "register client",
+                  "vytvoř klienta", "vytvor klienta", "nový klient", "novy klient",
+                  "novy zakaznik", "nový zákazník", "přidej klienta", "pridej klienta",
+                  "zaevidovat klienta", "zaeviduj klienta", "zaloz klienta", "založ klienta",
+                  "zapiš klienta", "zapis klienta", "novy kontakt klienta")
 _CREATE_WR = ("create work report", "new work report", "work report",
               "vytvoř report", "vytvor report", "pracovní výkaz", "pracovni vykaz")
 _NEXT_WORDS = ("next", "dál", "dal", "nejbliž", "nejbliz")
