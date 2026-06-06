@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends
 
 from secretary_clean.api.deps import get_repository, require_permission
 from secretary_clean.core.language import resolve_language_context
+from secretary_clean.core import help_content
 from secretary_clean.core.models import (
     CalendarEventCreate,
     CalendarEventUpdate,
@@ -119,6 +120,18 @@ def execute_voice_command(
             status=status, missing_fields=missing or [], question=question,
             pending_action_id=pending_id, language_context=lang_ctx,
         )
+
+    # ── HELP / NÁPOVĚDA (user- and permission-aware) ──────────────────────
+    # Only when no pending action is in progress (help must not interrupt a dialog).
+    if not payload.pending_action_id:
+        _is_h, _rest = help_content.is_help(payload.utterance)
+        if _is_h:
+            if not _rest:
+                return res(True, help_content.spoken_overview(user), status="executed", action="help")
+            _sec = help_content.find_section(user, _rest)
+            if _sec is not None:
+                return res(True, help_content.spoken_section(user, _sec), status="executed", action="help")
+            return res(True, help_content.spoken_overview(user), status="executed", action="help")
 
     # ── Continuation of an existing pending action ─────────────────────────
     pending = None
@@ -229,3 +242,13 @@ def execute_voice_command(
                    data={"events": [e.model_dump(mode="json") for e in events], "count": len(events)})
 
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
+
+
+
+@router.get("/help")
+def get_help(
+    user: UserAccount = Depends(require_permission(Permission.voice_execute)),
+):
+    """Structured help filtered by the user's permissions, in their language.
+    Single source of truth shared with the spoken 'help' intent."""
+    return help_content.help_for_user(user)
