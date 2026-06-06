@@ -36,7 +36,7 @@ from secretary_clean.core import voice_slots as vsl
 router = APIRouter(prefix="/voice", tags=["voice foundation"])
 
 PENDING_TTL_MIN = 30
-_CANCEL_WORDS = ("zrus", "zrusit", "cancel", "nech to byt", "to staci", "to staci")
+_CANCEL_WORDS = ("zrus", "zrusit", "cancel", "nech to byt", "to staci", "stop", "nechci", "zapomen na to", "uz ne", "konec")
 
 
 def _lang_ctx(repository, user: UserAccount, client_id: str | None):
@@ -63,8 +63,15 @@ def resolve_voice_command(
     )
 
 
+def _strip_diacritics(s: str) -> str:
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+
 def _is_cancel(text: str) -> bool:
-    low = " ".join(text.lower().split())
+    # Normalize diacritics so "zruš" matches "zrus" (root cause: spoken text keeps
+    # diacritics but the cancel-word list is ASCII).
+    low = _strip_diacritics(" ".join(text.lower().split()))
     return any(w in low for w in _CANCEL_WORDS)
 
 
