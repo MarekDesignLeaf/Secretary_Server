@@ -94,11 +94,18 @@ def _merge_answer_into_data(intent: str, text: str, data: dict) -> dict:
     person = vi.extract_person(text)
     if person:
         d["person"] = person
-    # intent-specific free-text slot
-    if intent == "client.create" and not d.get("name"):
-        d["name"] = text.strip()
+    # intent-specific free-text slots. For client.create we collect name, then
+    # phone, then address in order: the answer fills the first slot still empty.
+    ans = text.strip()
+    if intent == "client.create":
+        if not d.get("name"):
+            d["name"] = ans
+        elif not d.get("phone"):
+            d["phone"] = ans
+        elif not d.get("address"):
+            d["address"] = ans
     if intent == "task.create" and not d.get("title"):
-        d["title"] = text.strip()
+        d["title"] = ans
     return d
 
 
@@ -210,9 +217,12 @@ def execute_voice_command(
 
     if intent == "client.create":
         name = data.get("name")
-        rec = repository.create_crm_record("clients", user.company_id, name, {"source": "voice"})
-        return res(True, f"Vytvořila jsem klienta: {name}.", action=intent,
-                   entity_id=rec.id, data={"client": rec.model_dump(mode="json")})
+        phone = data.get("phone")
+        address = data.get("address")
+        rec = repository.create_crm_record("clients", user.company_id, name,
+                                           {"source": "voice", "phone": phone, "address": address})
+        return res(True, f"Vytvořila jsem klienta: {name}, telefon {phone}, adresa {address}.",
+                   action=intent, entity_id=rec.id, data={"client": rec.model_dump(mode="json")})
 
     if intent == "task.create":
         title = data.get("title")

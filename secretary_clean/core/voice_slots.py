@@ -14,6 +14,8 @@ _SLOTS = {
     ],
     "client.create": [
         ("name", "Jak se klient jmenuje?"),
+        ("phone", "Jaké je telefonní číslo klienta?"),
+        ("address", "Jaká je adresa klienta?"),
     ],
     "task.create": [
         ("title", "Jaký úkol mám vytvořit?"),
