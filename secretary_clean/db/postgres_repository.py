@@ -2217,6 +2217,36 @@ class PostgresSecretaryRepository:
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
 
+    def get_google_mapping(self, company_id: str, backend_event_id: str):
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM clean_google_calendar_mappings WHERE company_id = %s AND backend_event_id = %s", (company_id, backend_event_id))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def set_google_mapping(self, company_id: str, backend_event_id: str, google_event_id: str):
+        import uuid as _uuid
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_google_calendar_mappings (id, company_id, backend_event_id, google_event_id) VALUES (%s,%s,%s,%s) ON CONFLICT (company_id, backend_event_id) DO UPDATE SET google_event_id=EXCLUDED.google_event_id",
+                    (str(_uuid.uuid4()), company_id, backend_event_id, google_event_id))
+            conn.commit()
+        return {"company_id": company_id, "backend_event_id": backend_event_id, "google_event_id": google_event_id}
+
+    def list_google_mappings(self, company_id: str):
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM clean_google_calendar_mappings WHERE company_id = %s", (company_id,))
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_google_mapping(self, company_id: str, backend_event_id: str):
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM clean_google_calendar_mappings WHERE company_id = %s AND backend_event_id = %s", (company_id, backend_event_id))
+            conn.commit()
+
 
 # ------------------------------------------------------------------
 # Connection pool context manager

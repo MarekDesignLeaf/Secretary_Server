@@ -193,6 +193,35 @@ def google_select_calendar(body: SelectedCalendarBody,
     repository.upsert_google_account(acc)
     return {"google_calendar_id": acc.google_calendar_id}
 
+def _push_event_to_google(token: str, calendar_id: str, ev) -> str | None:
+    """Create one event in Google Calendar. Returns the Google event id or None.
+    One-way push (backend -> Google). Tokens/PII are never logged."""
+    body = {
+        "summary": ev.title or "(bez nazvu)",
+        "description": ev.description or "",
+        "location": ev.location or "",
+    }
+    if ev.all_day:
+        body["start"] = {"date": ev.start_at.date().isoformat()}
+        end_date = (ev.end_at or ev.start_at).date().isoformat()
+        body["end"] = {"date": end_date}
+    else:
+        body["start"] = {"dateTime": ev.start_at.isoformat()}
+        end_dt = ev.end_at or (ev.start_at + timedelta(hours=1))
+        body["end"] = {"dateTime": end_dt.isoformat()}
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{urllib.parse.quote(calendar_id)}/events"
+    data = _json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            created = _json.loads(resp.read().decode())
+        return created.get("id")
+    except Exception:
+        return None
+
+
 @router.post("/sync")
 def google_sync(user: UserAccount = Depends(require_permission(Permission.crm_manage)),
                 repository: InMemorySecretaryRepository = Depends(get_repository)):
@@ -202,14 +231,35 @@ def google_sync(user: UserAccount = Depends(require_permission(Permission.crm_ma
         raise HTTPException(status_code=409, detail="Google not connected")
     if not acc.google_calendar_id:
         raise HTTPException(status_code=400, detail="No calendar selected")
-    # G3 establishes the manual-sync entry point and logs the run. Full
-    # bi-directional reconciliation is implemented in G5/G6.
+
+    # G5: one-way push backend -> Google. Events already mapped are skipped
+    # (dedup via clean_google_calendar_mappings), so re-running sync is safe.
     backend_events = repository.list_calendar_events(user.company_id)
-    repository.add_google_sync_log(user.company_id, "manual", "sync_started", "ok",
-                                   detail=f"{len(backend_events)} backend events")
+    pushed = 0
+    skipped = 0
+    failed = 0
+    for ev in backend_events:
+        existing = repository.get_google_mapping(user.company_id, ev.id)
+        if existing:
+            skipped += 1
+            continue
+        gid = _push_event_to_google(token, acc.google_calendar_id, ev)
+        if gid:
+            repository.set_google_mapping(user.company_id, ev.id, gid)
+            repository.add_google_sync_log(user.company_id, "push", "create", "ok",
+                                           backend_event_id=ev.id, google_event_id=gid)
+            pushed += 1
+        else:
+            repository.add_google_sync_log(user.company_id, "push", "create", "error",
+                                           backend_event_id=ev.id)
+            failed += 1
+
     acc.last_sync_at = datetime.now(timezone.utc)
     repository.upsert_google_account(acc)
+    repository.add_google_sync_log(user.company_id, "manual", "sync_finished", "ok",
+                                   detail=f"pushed={pushed} skipped={skipped} failed={failed}")
     return {"status": "ok", "backend_events": len(backend_events),
+            "pushed": pushed, "skipped": skipped, "failed": failed,
             "calendar_id": acc.google_calendar_id, "synced_at": acc.last_sync_at.isoformat()}
 
 

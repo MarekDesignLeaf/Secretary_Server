@@ -1107,6 +1107,29 @@ class InMemorySecretaryRepository:
         self.google_accounts[account.company_id] = account
         return account
 
+    def get_google_mapping(self, company_id: str, backend_event_id: str):
+        for m in self.google_mappings:
+            if m["company_id"] == company_id and m["backend_event_id"] == backend_event_id:
+                return m
+        return None
+
+    def set_google_mapping(self, company_id: str, backend_event_id: str, google_event_id: str):
+        existing = self.get_google_mapping(company_id, backend_event_id)
+        if existing:
+            existing["google_event_id"] = google_event_id
+            return existing
+        m = {"company_id": company_id, "backend_event_id": backend_event_id,
+             "google_event_id": google_event_id}
+        self.google_mappings.append(m)
+        return m
+
+    def list_google_mappings(self, company_id: str):
+        return [m for m in self.google_mappings if m["company_id"] == company_id]
+
+    def delete_google_mapping(self, company_id: str, backend_event_id: str):
+        self.google_mappings = [m for m in self.google_mappings
+                                if not (m["company_id"] == company_id and m["backend_event_id"] == backend_event_id)]
+
     def add_google_sync_log(self, company_id, direction, action, status,
                             backend_event_id=None, google_event_id=None, detail=None):
         from datetime import datetime as _dt, timezone as _tz
