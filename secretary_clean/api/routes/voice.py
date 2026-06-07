@@ -219,6 +219,16 @@ def execute_voice_command(
         name = data.get("name")
         phone = data.get("phone")
         address = data.get("address")
+        # Duplicate check (blueprint S9): if a client with the same phone or name
+        # already exists, do NOT create a duplicate — report it and stop.
+        dup = repository.find_duplicate_client(user.company_id, name=name, phone=phone)
+        if dup is not None:
+            dphone = (dup.data or {}).get("phone")
+            extra = f" (telefon {dphone})" if dphone else ""
+            return res(False,
+                       f"Klienta {dup.name}{extra} už v databázi mám, nevytvářím duplicitu.",
+                       status="error", action=intent,
+                       entity_id=dup.id, data={"duplicate_of": dup.id})
         rec = repository.create_crm_record("clients", user.company_id, name,
                                            {"source": "voice", "phone": phone, "address": address})
         return res(True, f"Vytvořila jsem klienta: {name}, telefon {phone}, adresa {address}.",

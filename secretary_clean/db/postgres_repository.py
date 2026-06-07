@@ -1292,6 +1292,25 @@ class PostgresSecretaryRepository:
                 rows = cur.fetchall()
         return [self._row_to_crm_record(r, module) for r in rows]
 
+    def find_duplicate_client(self, company_id: str, name: str | None = None,
+                              phone: str | None = None, email: str | None = None):
+        """Return an existing client that looks like a duplicate, or None.
+        Match priority (blueprint S9): phone, then email, then exact name."""
+        def norm_phone(p):
+            return "".join(ch for ch in (p or "") if ch.isdigit())
+        def norm_txt(s):
+            return " ".join((s or "").lower().split())
+        np, ne, nn = norm_phone(phone), norm_txt(email), norm_txt(name)
+        for rec in self.list_crm_records("clients", company_id):
+            d = rec.data or {}
+            if np and norm_phone(d.get("phone")) == np:
+                return rec
+            if ne and norm_txt(d.get("email")) == ne:
+                return rec
+            if nn and norm_txt(rec.name) == nn:
+                return rec
+        return None
+
     def get_crm_record(self, module: str, record_id: str, company_id: str) -> CRMRecord | None:
         if module not in _VALID_CRM_MODULES:
             raise KeyError("Unknown CRM module")
