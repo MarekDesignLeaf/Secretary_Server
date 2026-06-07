@@ -34,7 +34,12 @@ COMMAND_TREE = [
             ("calendar.update", _t("move meeting", "přesuň schůzku na 14:00", "przenieś spotkanie"), False),
         ]),
         ("prehled", _t("Overview", "Přehled", "Przegląd"), [
-            ("calendar.list", _t("what do I have today", "co mám dnes / co mám zítra", "co mam dzisiaj"), True),
+            ("calendar.list", _t("what do I have today / tomorrow",
+                                 "co mám dnes / co mám zítra / zobraz kalendář / co mě čeká",
+                                 "co mam dzisiaj / jutro"), True),
+            ("calendar.list", _t("this week / next week",
+                                 "co mám tento týden / příští týden / ukaž týden",
+                                 "ten tydzień / następny tydzień"), True),
         ]),
         ("ruseni", _t("Cancellation", "Rušení", "Anulowanie"), [
             ("calendar.delete", _t("cancel meeting", "zruš schůzku / smaž termín", "odwołaj spotkanie"), True),

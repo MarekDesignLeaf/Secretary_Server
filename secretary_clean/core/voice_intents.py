@@ -146,7 +146,9 @@ def _combine(date_iso: str, hhmm: str | None) -> str:
 # ── intent keyword sets ───────────────────────────────────────────────────────
 _LIST_WORDS = ("what do i have", "what's on", "whats on", "co mám", "co mam",
                "what is next", "next in my calendar", "co je dál", "co je dal",
-               "show my calendar", "my schedule", "můj kalendář", "muj kalendar", "co je zitra", "co je zítra", "co je na zitrek", "co je na zítřek", "co mam zitra", "co mám zítra", "co je v kalendari", "co je v kalendář", "v kalendari", "v kalendář", "mam dnes", "mám dnes", "co je dnes", "co mam na", "co mám na", "schuzky", "schůzky")
+               "show my calendar", "my schedule", "můj kalendář", "muj kalendar", "co je zitra", "co je zítra", "co je na zitrek", "co je na zítřek", "co mam zitra", "co mám zítra", "co je v kalendari", "co je v kalendář", "v kalendari", "v kalendář", "mam dnes", "mám dnes", "co je dnes", "co mam na", "co mám na", "schuzky", "schůzky", "otevři kalendář", "otevri kalendar", "ukaž kalendář", "ukaz kalendar", "zobraz kalendář", "zobraz kalendar", "ukaž rozvrh", "ukaz rozvrh", "můj rozvrh", "muj rozvrh", "co mě čeká", "co me ceka", "jaký mám program", "jaky mam program", "co mám naplánováno", "co mam naplanovano", "program na", "rozvrh na")
+_WEEK_WORDS = ("tento týden", "tento tyden", "tenhle týden", "tenhle tyden", "this week", "celý týden", "cely tyden", "týdenní přehled", "tydenni prehled", "co mám tento týden", "ukaž týden", "ukaz tyden", "příští týden", "pristi tyden", "next week")
+
 _CREATE_CAL = ("create meeting", "create appointment", "new meeting", "schedule",
                "vytvoř schůzku", "vytvor schuzku", "nová schůzka", "nova schuzka",
                "naplánuj", "naplanuj", "create event", "add event", "přidej událost", "přidej schůzku", "pridej schuzku", "přidej schuzku", "pridej schůzku", "přidej termín", "pridej termin", "domluv schůzku", "domluv schuzku", "zapiš schůzku", "zapis schuzku")
@@ -241,14 +243,19 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
         )
 
     # ----- CALENDAR LIST -----
-    if _has(low, _LIST_WORDS) or (_has(low, _NEXT_WORDS) and ("calendar" in low or "kalendář" in low or "kalendar" in low)):
+    if (_has(low, _LIST_WORDS) or _has(low, _WEEK_WORDS)
+            or (_has(low, _NEXT_WORDS) and ("calendar" in low or "kalendář" in low or "kalendar" in low))):
         date_iso = parse_date(low, base)
         win = time_window(low)
         is_next = _has(low, _NEXT_WORDS)
+        # Week view: "this week" / "next week" -> a 7-day range starting Monday.
+        rng = None
+        if _has(low, _WEEK_WORDS):
+            rng = "next_week" if ("příští" in low or "pristi" in low or "next week" in low) else "this_week"
         return ParsedIntent(
             intent="calendar.list",
             confidence=0.8,
-            entities={"date": date_iso, "window": win, "next": is_next},
+            entities={"date": date_iso, "window": win, "next": is_next, "range": rng},
             requires_confirmation=False,
             reason="Read-only calendar query.",
         )

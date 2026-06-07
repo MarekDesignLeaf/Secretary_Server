@@ -245,7 +245,15 @@ def execute_voice_command(
 
     if intent == "calendar.list":
         start = end = None
-        if data.get("date"):
+        rng = data.get("range")
+        if rng in ("this_week", "next_week"):
+            # 7-day window starting Monday of the (this/next) week.
+            now = datetime.now(timezone.utc)
+            monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+            if rng == "next_week":
+                monday = monday + timedelta(days=7)
+            start = monday; end = monday + timedelta(days=7) - timedelta(seconds=1)
+        elif data.get("date"):
             d = data["date"]; win = data.get("window")
             if win:
                 start = datetime.fromisoformat(f"{d}T{win[0]}:00+00:00"); end = datetime.fromisoformat(f"{d}T{win[1]}:00+00:00")
