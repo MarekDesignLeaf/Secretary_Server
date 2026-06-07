@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 
 from secretary_clean.api.deps import get_repository, require_permission
 from secretary_clean.core.language import resolve_language_context
@@ -307,3 +308,34 @@ def get_help(
     """Structured help filtered by the user's permissions, in their language.
     Single source of truth shared with the spoken 'help' intent."""
     return help_content.help_for_user(user)
+
+
+
+class LearnAliasRequest(BaseModel):
+    phrase: str
+    answer: str
+
+
+@router.post("/learn-alias")
+def learn_alias(payload: LearnAliasRequest,
+                user: UserAccount = Depends(require_permission(Permission.crm_manage))):
+    """Adaptive alias learning. Given an unknown phrase and the user's answer
+    (the command to map it to), decide the target intent and ACTIVE/PENDING
+    status. The alias itself is persisted by the client; this endpoint is the
+    single source of the mapping/status logic so voice never bypasses workflow."""
+    from secretary_clean.core import alias_learning as al
+    if al.is_cancel(payload.answer):
+        return {"status": "cancelled", "message": "Dobře, nic neukládám."}
+    intent = al.resolve_target_intent(payload.answer)
+    if not intent or not al.is_known(intent):
+        return {"status": "unknown_target",
+                "message": "Tomu příkazu nerozumím. Zkus to říct jinak, nebo řekni omyl."}
+    state = al.status_for(intent)
+    phrase = payload.phrase.strip()
+    if state == "ACTIVE":
+        msg = f"Frázi „{phrase}“ jsem přiřadila k příkazu {intent}. Můžeš ji hned použít."
+    else:
+        msg = (f"Frázi „{phrase}“ jsem přiřadila k příkazu {intent}. "
+               f"Jakmile bude tato funkce dostupná, příkaz začne fungovat.")
+    return {"status": "saved", "alias_status": state, "target_intent": intent,
+            "phrase": phrase, "message": msg}
