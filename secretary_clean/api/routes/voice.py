@@ -310,6 +310,16 @@ def get_help(
     return help_content.help_for_user(user)
 
 
+@router.get("/command-tree")
+def get_command_tree(
+    user: UserAccount = Depends(require_permission(Permission.voice_execute)),
+):
+    """Hierarchical command catalogue (module -> branch -> command), filtered by
+    permission and localized. Empty branches are kept for future growth."""
+    from secretary_clean.core import command_tree
+    return command_tree.tree_for_user(user)
+
+
 
 class LearnAliasRequest(BaseModel):
     phrase: str
@@ -332,10 +342,17 @@ def learn_alias(payload: LearnAliasRequest,
                 "message": "Tomu příkazu nerozumím. Zkus to říct jinak, nebo řekni omyl."}
     state = al.status_for(intent)
     phrase = payload.phrase.strip()
+    # Locate where this command lives in the tree (module > branch) so we can
+    # tell the user the correct placement.
+    from secretary_clean.core import command_tree
+    loc = command_tree.locate_intent(intent)
+    loc_txt = ""
+    if loc:
+        loc_txt = f" ({loc['module_title']} > {loc['branch_title']})"
     if state == "ACTIVE":
-        msg = f"Frázi „{phrase}“ jsem přiřadila k příkazu {intent}. Můžeš ji hned použít."
+        msg = f"Frázi „{phrase}“ jsem přiřadila k příkazu {intent}{loc_txt}. Můžeš ji hned použít."
     else:
-        msg = (f"Frázi „{phrase}“ jsem přiřadila k příkazu {intent}. "
+        msg = (f"Frázi „{phrase}“ jsem přiřadila k příkazu {intent}{loc_txt}. "
                f"Jakmile bude tato funkce dostupná, příkaz začne fungovat.")
     return {"status": "saved", "alias_status": state, "target_intent": intent,
-            "phrase": phrase, "message": msg}
+            "phrase": phrase, "location": loc, "message": msg}
