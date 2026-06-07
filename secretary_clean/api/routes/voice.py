@@ -305,6 +305,52 @@ def execute_voice_command(
         return res(True, msg, action=intent,
                    data={"pushed": pushed, "skipped": skipped, "failed": failed})
 
+    if intent in ("calendar.delete", "calendar.update"):
+        # Find the target event by person (matched in title) and/or date.
+        person = (data.get("person") or "").strip()
+        date_iso = data.get("date")
+        candidates = repository.list_calendar_events(user.company_id)
+        def _matches(ev):
+            ok = True
+            if person:
+                ok = ok and (person.lower() in (ev.title or "").lower())
+            if date_iso:
+                ok = ok and (ev.start_at.date().isoformat() == date_iso)
+            return ok
+        matched = [e for e in candidates if _matches(e)]
+        if not matched:
+            who = f" s {person}" if person else ""
+            return res(False, f"Nenašla jsem schůzku{who} k úpravě. Zkus to upřesnit.",
+                       status="error", action=intent)
+        if len(matched) > 1:
+            matched = sorted(matched, key=lambda e: e.start_at)
+        target = matched[0]
+
+        if intent == "calendar.delete":
+            ok = repository.delete_calendar_event(target.id, user.company_id)
+            if ok:
+                return res(True, f"Zrušila jsem schůzku: {target.title}.", action=intent,
+                           entity_id=target.id)
+            return res(False, "Schůzku se nepodařilo zrušit.", status="error", action=intent)
+
+        # calendar.update — move to a new time
+        new_start = data.get("new_start")
+        if not new_start:
+            return res(False, "Na kdy mám schůzku přesunout? Řekni datum a čas.",
+                       status="needs_more_info", action=intent,
+                       missing=["new_start"], question="Na kdy mám schůzku přesunout?")
+        from datetime import datetime as _dt
+        try:
+            ns = _dt.fromisoformat(new_start)
+        except Exception:
+            return res(False, "Nerozuměla jsem novému času. Zkus to znovu.",
+                       status="error", action=intent)
+        upd = CalendarEventUpdate(start_at=ns)
+        updated = repository.update_calendar_event(target.id, user.company_id, upd)
+        return res(True, f"Přesunula jsem schůzku {updated.title} na {ns.strftime('%d.%m. %H:%M')}.",
+                   action=intent, entity_id=updated.id,
+                   data={"event": updated.model_dump(mode="json")})
+
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
 
 

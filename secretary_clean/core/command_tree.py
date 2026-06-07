@@ -31,7 +31,7 @@ COMMAND_TREE = [
     ("kalendar", _t("Calendar", "Kalendář", "Kalendarz"), Permission.voice_execute, [
         ("planovani", _t("Scheduling", "Plánování", "Planowanie"), [
             ("calendar.create", _t("add meeting", "přidej schůzku / domluv schůzku", "dodaj spotkanie"), True),
-            ("calendar.update", _t("move meeting", "přesuň schůzku na 14:00", "przenieś spotkanie"), False),
+            ("calendar.update", _t("move meeting", "přesuň schůzku na 14:00", "przenieś spotkanie"), True),
         ]),
         ("prehled", _t("Overview", "Přehled", "Przegląd"), [
             ("calendar.list", _t("what do I have today / tomorrow",

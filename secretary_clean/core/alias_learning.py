@@ -18,14 +18,14 @@ import unicodedata
 # execution branches. When a new module ships, add its intent here and pending
 # aliases pointing at it auto-activate via refresh.
 SUPPORTED_INTENTS = {
-    "calendar.create", "calendar.list", "calendar.delete", "calendar.sync",
+    "calendar.create", "calendar.list", "calendar.delete", "calendar.update", "calendar.sync",
     "client.create", "task.create",
 }
 
 # Intents the system knows about but cannot execute yet (planned). Used to
 # validate that a learning target is a real future command, not gibberish.
 PLANNED_INTENTS = {
-    "calendar.update", "client.find", "client.note", "client.archive",
+    "client.find", "client.note", "client.archive",
     "task.list", "task.complete", "task.assign",
     "job.create", "job.change_status", "job.list",
     "lead.create", "lead.convert",
