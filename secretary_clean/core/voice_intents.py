@@ -152,6 +152,10 @@ _CREATE_CAL = ("create meeting", "create appointment", "new meeting", "schedule"
                "naplánuj", "naplanuj", "create event", "add event", "přidej událost", "přidej schůzku", "pridej schuzku", "přidej schuzku", "pridej schůzku", "přidej termín", "pridej termin", "domluv schůzku", "domluv schuzku", "zapiš schůzku", "zapis schuzku")
 _UPDATE_CAL = ("move", "reschedule", "change", "přesuň", "presun", "přesunout",
                "změň termín", "zmen termin", "reschedule")
+_SYNC_CAL = ("synchronizuj kalendar", "synchronizuj kalendář", "sesynchronizuj kalendar",
+             "sesynchronizuj kalendář", "synchronizace kalendare", "synchronizuj google",
+             "sync kalendar", "sync calendar", "synchronize calendar", "aktualizuj kalendar",
+             "synchronizuj s googlem", "nahraj do kalendare", "synchronizuj udalosti")
 _DELETE_CAL = ("cancel", "delete appointment", "delete meeting", "remove meeting",
                "zruš", "zrus", "smaž schůzku", "smaz schuzku", "odstraň událost",
                "odstran udalost", "zrus schuzku", "zruš schůzku", "zrus termin",
@@ -179,6 +183,16 @@ def _has(low: str, words) -> bool:
 def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
     """Main entry point. Deterministically classify an utterance."""
     low = " ".join(utterance.lower().split())
+
+    # ----- CALENDAR SYNC (Google) - check first, very specific -----
+    if _has(low, _SYNC_CAL):
+        return ParsedIntent(
+            intent="calendar.sync",
+            confidence=0.9,
+            entities={},
+            requires_confirmation=False,
+            reason="Voice-triggered Google Calendar sync.",
+        )
 
     # ----- CALENDAR DELETE (check before create/update) -----
     if _has(low, _DELETE_CAL):

@@ -241,6 +241,41 @@ def execute_voice_command(
         return res(True, f"Máš {len(events)} událostí: {titles}.", action=intent,
                    data={"events": [e.model_dump(mode="json") for e in events], "count": len(events)})
 
+    if intent == "calendar.sync":
+        from secretary_clean.api.routes import google_calendar as _gc
+        acc = repository.get_google_account(user.company_id)
+        token = _gc._valid_access_token(repository, acc)
+        if not token:
+            return res(False, "Google kalendář není připojený. Připoj ho v nastavení.",
+                       status="error", action=intent)
+        if not acc.google_calendar_id:
+            return res(False, "Nemáš vybraný kalendář pro synchronizaci. Vyber ho v nastavení.",
+                       status="error", action=intent)
+        backend_events = repository.list_calendar_events(user.company_id)
+        pushed = skipped = failed = 0
+        for ev in backend_events:
+            if repository.get_google_mapping(user.company_id, ev.id):
+                skipped += 1
+                continue
+            gid = _gc._push_event_to_google(token, acc.google_calendar_id, ev)
+            if gid:
+                repository.set_google_mapping(user.company_id, ev.id, gid)
+                repository.add_google_sync_log(user.company_id, "push", "create", "ok",
+                                               backend_event_id=ev.id, google_event_id=gid)
+                pushed += 1
+            else:
+                failed += 1
+        acc.last_sync_at = datetime.now(timezone.utc)
+        repository.upsert_google_account(acc)
+        if pushed == 0 and skipped > 0:
+            msg = "Kalendář je už synchronizovaný, nic nového k nahrání."
+        elif pushed > 0:
+            msg = f"Synchronizováno. Nahrála jsem {pushed} událostí do Google kalendáře."
+        else:
+            msg = "Nemáš žádné události k synchronizaci."
+        return res(True, msg, action=intent,
+                   data={"pushed": pushed, "skipped": skipped, "failed": failed})
+
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
 
 
