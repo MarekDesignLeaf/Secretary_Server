@@ -351,6 +351,39 @@ def execute_voice_command(
                    action=intent, entity_id=updated.id,
                    data={"event": updated.model_dump(mode="json")})
 
+    if intent == "task.list":
+        tasks = repository.list_crm_records("tasks", user.company_id)
+        open_tasks = [t for t in tasks if (t.status or "open") not in ("done", "completed", "deleted")]
+        if not open_tasks:
+            return res(True, "Nemáš žádné otevřené úkoly.", action=intent,
+                       data={"tasks": [], "count": 0})
+        titles = ", ".join(t.name for t in open_tasks[:10])
+        return res(True, f"Máš {len(open_tasks)} úkolů: {titles}.", action=intent,
+                   data={"tasks": [t.model_dump(mode="json") for t in open_tasks], "count": len(open_tasks)})
+
+    if intent == "task.complete":
+        person = (data.get("person") or "").strip()
+        raw = (data.get("raw") or "").lower()
+        tasks = repository.list_crm_records("tasks", user.company_id)
+        open_tasks = [t for t in tasks if (t.status or "open") not in ("done", "completed", "deleted")]
+        def _match(t):
+            nm = (t.name or "").lower()
+            asg = str((t.data or {}).get("assignee") or "").lower()
+            if person:
+                return person.lower() in nm or person.lower() in asg
+            # otherwise match any title word that appears in the utterance
+            return any(w in raw for w in nm.split() if len(w) > 3)
+        matched = [t for t in open_tasks if _match(t)]
+        if not matched:
+            return res(False, "Nenašla jsem odpovídající úkol k dokončení. Zkus to upřesnit.",
+                       status="error", action=intent)
+        target = matched[0]
+        from secretary_clean.core.models import CRMUpdateRequest
+        updated = repository.update_crm_record("tasks", target.id, user.company_id,
+                                               CRMUpdateRequest(status="done"))
+        return res(True, f"Označila jsem úkol jako hotový: {updated.name}.", action=intent,
+                   entity_id=updated.id, data={"task": updated.model_dump(mode="json")})
+
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
 
 

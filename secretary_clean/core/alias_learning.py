@@ -19,14 +19,14 @@ import unicodedata
 # aliases pointing at it auto-activate via refresh.
 SUPPORTED_INTENTS = {
     "calendar.create", "calendar.list", "calendar.delete", "calendar.update", "calendar.sync",
-    "client.create", "task.create",
+    "client.create", "task.create", "task.list", "task.complete",
 }
 
 # Intents the system knows about but cannot execute yet (planned). Used to
 # validate that a learning target is a real future command, not gibberish.
 PLANNED_INTENTS = {
     "client.find", "client.note", "client.archive",
-    "task.list", "task.complete", "task.assign",
+    "task.assign",
     "job.create", "job.change_status", "job.list",
     "lead.create", "lead.convert",
     "quote.create", "quote.send", "quote.approve",

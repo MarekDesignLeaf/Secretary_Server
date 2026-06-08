@@ -168,6 +168,14 @@ _CREATE_TASK = ("create task", "new task", "add task", "vytvoř úkol", "vytvor 
                 "zaloz ukol", "založ úkol", "zapiš úkol", "zapis ukol", "udelej ukol",
                 "udělej úkol", "novy task", "pridej task", "dej ukol", "zadej ukol",
                 "zadej úkol", "novy pozadavek", "vytvoř task")
+_LIST_TASKS = ("moje úkoly", "moje ukoly", "my tasks", "co mám za úkoly", "co mam za ukoly",
+               "jaké mám úkoly", "jake mam ukoly", "zobraz úkoly", "zobraz ukoly",
+               "ukaž úkoly", "ukaz ukoly", "seznam úkolů", "seznam ukolu", "co mám udělat",
+               "co mam udelat", "list tasks", "show tasks", "nedokončené úkoly", "nedokoncene ukoly")
+_COMPLETE_TASK = ("dokonči úkol", "dokonci ukol", "hotový úkol", "hotovy ukol", "splnil jsem",
+                  "splněno", "splneno", "úkol hotovo", "ukol hotovo", "označ úkol", "oznac ukol",
+                  "complete task", "mark task done", "dokončit úkol", "dokoncit ukol",
+                  "uzavři úkol", "uzavri ukol", "hotovo úkol")
 _CREATE_CLIENT = ("create client", "new client", "add client", "register client",
                   "vytvoř klienta", "vytvor klienta", "nový klient", "novy klient",
                   "novy zakaznik", "nový zákazník", "přidej klienta", "pridej klienta",
@@ -258,6 +266,27 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
             entities={"date": date_iso, "window": win, "next": is_next, "range": rng},
             requires_confirmation=False,
             reason="Read-only calendar query.",
+        )
+
+    # ----- TASK COMPLETE (before create: "dokonči úkol" must not match create) -----
+    if _has(low, _COMPLETE_TASK):
+        person = extract_person(utterance)
+        return ParsedIntent(
+            intent="task.complete",
+            confidence=0.75,
+            entities={"person": person, "raw": utterance},
+            requires_confirmation=True,
+            reason="Task completion; confirmation required.",
+        )
+
+    # ----- TASK LIST (read-only) -----
+    if _has(low, _LIST_TASKS):
+        return ParsedIntent(
+            intent="task.list",
+            confidence=0.8,
+            entities={},
+            requires_confirmation=False,
+            reason="Read-only task query.",
         )
 
     # ----- TASK CREATE -----

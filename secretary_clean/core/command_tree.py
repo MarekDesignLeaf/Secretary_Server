@@ -65,8 +65,8 @@ COMMAND_TREE = [
             ("task.create", _t("new task", "vytvoř úkol / přidej úkol", "nowe zadanie"), True),
         ]),
         ("sprava", _t("Manage", "Správa", "Zarządzanie"), [
-            ("task.list", _t("my tasks", "moje úkoly", "moje zadania"), False),
-            ("task.complete", _t("complete task", "dokonči úkol", "zakończ zadanie"), False),
+            ("task.list", _t("my tasks", "moje úkoly / zobraz úkoly", "moje zadania"), True),
+            ("task.complete", _t("complete task", "dokonči úkol / úkol hotovo", "zakończ zadanie"), True),
             ("task.assign", _t("assign task", "přiřaď úkol", "przypisz zadanie"), False),
         ]),
     ]),
