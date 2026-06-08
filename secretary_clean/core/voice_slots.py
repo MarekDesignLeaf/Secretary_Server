@@ -17,6 +17,9 @@ _SLOTS = {
         ("phone", "Jaké je telefonní číslo klienta?"),
         ("address", "Jaká je adresa klienta?"),
     ],
+    "job.create": [
+        ("title", "Jaká zakázka? Řekni název nebo popis."),
+    ],
     "task.create": [
         ("title", "Jaký úkol mám vytvořit?"),
     ],

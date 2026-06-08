@@ -107,6 +107,8 @@ def _merge_answer_into_data(intent: str, text: str, data: dict) -> dict:
             d["address"] = ans
     if intent == "task.create" and not d.get("title"):
         d["title"] = ans
+    if intent == "job.create" and not d.get("title"):
+        d["title"] = ans
     return d
 
 
@@ -383,6 +385,16 @@ def execute_voice_command(
                                                CRMUpdateRequest(status="done"))
         return res(True, f"Označila jsem úkol jako hotový: {updated.name}.", action=intent,
                    entity_id=updated.id, data={"task": updated.model_dump(mode="json")})
+
+    if intent == "job.create":
+        title = data.get("title")
+        client = data.get("client")
+        rec = repository.create_crm_record("jobs", user.company_id, title,
+                                           {"source": "voice", "client_name": client})
+        msg = (f"Vytvořila jsem zakázku: {title} pro {client}." if client
+               else f"Vytvořila jsem zakázku: {title}.")
+        return res(True, msg, action=intent, entity_id=rec.id,
+                   data={"job": rec.model_dump(mode="json")})
 
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
 

@@ -181,6 +181,9 @@ _CREATE_CLIENT = ("create client", "new client", "add client", "register client"
                   "novy zakaznik", "nový zákazník", "přidej klienta", "pridej klienta",
                   "zaevidovat klienta", "zaeviduj klienta", "zaloz klienta", "založ klienta",
                   "zapiš klienta", "zapis klienta", "novy kontakt klienta")
+_CREATE_JOB = ("create job", "new job", "vytvoř zakázku", "vytvor zakazku", "nová zakázka",
+               "nova zakazka", "založ zakázku", "zaloz zakazku", "přidej zakázku", "pridej zakazku",
+               "zaeviduj zakázku", "zaeviduj zakazku", "nová zakázka pro", "zaloz zakazku pro")
 _CREATE_WR = ("create work report", "new work report", "work report",
               "vytvoř report", "vytvor report", "pracovní výkaz", "pracovni vykaz")
 _NEXT_WORDS = ("next", "dál", "dal", "nejbliž", "nejbliz")
@@ -306,6 +309,25 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
             entities={"person": person, "raw": utterance, "title": title},
             requires_confirmation=True,
             reason="Task creation; confirmation required.",
+        )
+
+    # ----- JOB CREATE (before client: "zakazku pro Jana" must not match client) -----
+    if _has(low, _CREATE_JOB):
+        import re as _re
+        title = _re.sub(r".*(create job|new job|vytvoř zakázku|vytvor zakazku|nová zakázka|nova zakazka|založ zakázku|zaloz zakazku|přidej zakázku|pridej zakazku|zaeviduj zakázku|zaeviduj zakazku)\s*",
+                        "", utterance, flags=_re.IGNORECASE).strip(" :,-")
+        # optional client after "pro"
+        client = None
+        m = _re.search(r"\bpro\s+(.+)$", title, flags=_re.IGNORECASE)
+        if m:
+            client = m.group(1).strip()
+            title = title[:m.start()].strip(" :,-")
+        return ParsedIntent(
+            intent="job.create",
+            confidence=0.75 if title else 0.5,
+            entities={"title": title or None, "client": client, "raw": utterance},
+            requires_confirmation=True,
+            reason="Job creation; confirmation required.",
         )
 
     # ----- CLIENT CREATE -----
