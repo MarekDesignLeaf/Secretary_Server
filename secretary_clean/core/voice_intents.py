@@ -292,10 +292,18 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
     # ----- TASK CREATE -----
     if _has(low, _CREATE_TASK):
         person = extract_person(utterance)
+        # Extract the task title = text after the matched create-task phrase.
+        title = None
+        for kw in _CREATE_TASK:
+            pos = low.find(kw)
+            if pos >= 0:
+                title = utterance[pos + len(kw):].strip(" :,-")
+                break
+        title = title or None
         return ParsedIntent(
             intent="task.create",
             confidence=0.75,
-            entities={"person": person, "raw": utterance},
+            entities={"person": person, "raw": utterance, "title": title},
             requires_confirmation=True,
             reason="Task creation; confirmation required.",
         )
