@@ -73,10 +73,10 @@ COMMAND_TREE = [
     ("zakazky", _t("Jobs", "Zakázky", "Zlecenia"), Permission.crm_manage, [
         ("zivotni_cyklus", _t("Lifecycle", "Životní cyklus", "Cykl życia"), [
             ("job.create", _t("create job", "vytvoř zakázku / nová zakázka pro klienta", "utwórz zlecenie"), True),
-            ("job.change_status", _t("change status", "změň stav zakázky", "zmień status"), False),
+            ("job.change_status", _t("change status", "změň stav zakázky / dokonči zakázku", "zmień status"), True),
         ]),
         ("prehled", _t("Overview", "Přehled", "Przegląd"), [
-            ("job.list", _t("show jobs", "zobraz zakázky", "pokaż zlecenia"), False),
+            ("job.list", _t("show jobs", "zobraz zakázky / moje zakázky", "pokaż zlecenia"), True),
         ]),
     ]),
     ("leady", _t("Leads", "Leady", "Leady"), Permission.crm_manage, [

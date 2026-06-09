@@ -396,6 +396,46 @@ def execute_voice_command(
         return res(True, msg, action=intent, entity_id=rec.id,
                    data={"job": rec.model_dump(mode="json")})
 
+    if intent == "job.list":
+        jobs = repository.list_crm_records("jobs", user.company_id)
+        active = [j for j in jobs if (j.status or "open") not in ("uzavřeno", "deleted", "zrušeno")]
+        if not active:
+            return res(True, "Nemáš žádné aktivní zakázky.", action=intent,
+                       data={"jobs": [], "count": 0})
+        parts = []
+        for j in active[:10]:
+            st = j.status or "nová"
+            parts.append(f"{j.name} ({st})")
+        return res(True, f"Máš {len(active)} zakázek: " + ", ".join(parts) + ".", action=intent,
+                   data={"jobs": [j.model_dump(mode="json") for j in active], "count": len(active)})
+
+    if intent == "job.change_status":
+        new_status = data.get("new_status")
+        if not new_status:
+            return res(False, "Na jaký stav mám zakázku změnit? Třeba v realizaci, dokončeno, čeká na materiál.",
+                       status="needs_more_info", action=intent,
+                       missing=["new_status"], question="Na jaký stav mám zakázku změnit?")
+        person = (data.get("person") or "").strip()
+        raw = (data.get("raw") or "").lower()
+        jobs = repository.list_crm_records("jobs", user.company_id)
+        active = [j for j in jobs if (j.status or "open") not in ("uzavřeno", "deleted")]
+        def _match(j):
+            nm = (j.name or "").lower()
+            client = str((j.data or {}).get("client_name") or "").lower()
+            if person:
+                return person.lower() in nm or person.lower() in client
+            return any(w in raw for w in nm.split() if len(w) > 3)
+        matched = [j for j in active if _match(j)]
+        if not matched:
+            return res(False, "Nenašla jsem odpovídající zakázku. Zkus to upřesnit.",
+                       status="error", action=intent)
+        target = matched[0]
+        from secretary_clean.core.models import CRMUpdateRequest
+        updated = repository.update_crm_record("jobs", target.id, user.company_id,
+                                               CRMUpdateRequest(status=new_status))
+        return res(True, f"Změnila jsem stav zakázky {updated.name} na {new_status}.", action=intent,
+                   entity_id=updated.id, data={"job": updated.model_dump(mode="json")})
+
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
 
 

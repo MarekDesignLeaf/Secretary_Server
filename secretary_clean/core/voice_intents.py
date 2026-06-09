@@ -184,6 +184,26 @@ _CREATE_CLIENT = ("create client", "new client", "add client", "register client"
 _CREATE_JOB = ("create job", "new job", "vytvoř zakázku", "vytvor zakazku", "nová zakázka",
                "nova zakazka", "založ zakázku", "zaloz zakazku", "přidej zakázku", "pridej zakazku",
                "zaeviduj zakázku", "zaeviduj zakazku", "nová zakázka pro", "zaloz zakazku pro")
+_LIST_JOBS = ("zobraz zakázky", "zobraz zakazky", "moje zakázky", "moje zakazky", "seznam zakázek",
+              "seznam zakazek", "ukaž zakázky", "ukaz zakazky", "jaké mám zakázky", "jake mam zakazky",
+              "co mám za zakázky", "co mam za zakazky", "list jobs", "show jobs", "zakázky na",
+              "aktivní zakázky", "aktivni zakazky")
+_CHANGE_JOB_STATUS = ("změň stav zakázky", "zmen stav zakazky", "změň zakázku na", "zmen zakazku na",
+                      "stav zakázky", "stav zakazky", "nastav zakázku", "nastav zakazku",
+                      "zakázka je", "zakazka je", "je v realizaci", "je dokončeno", "je hotová", "change job status", "zakázku dokončeno",
+                      "zakazku dokonceno", "dokonči zakázku", "dokonci zakazku")
+# Map spoken status words -> canonical job status (blueprint S4)
+_JOB_STATUS_MAP = (
+    (("dokončeno", "dokonceno", "hotovo", "hotová", "hotova", "completed", "done"), "dokončeno"),
+    (("v realizaci", "realizace", "probíhá", "probiha", "in progress", "active"), "v_realizaci"),
+    (("naplánováno", "naplanovano", "scheduled", "naplánovaná"), "naplánováno"),
+    (("čeká na materiál", "ceka na material", "waiting material", "na materiál"), "čeká_na_materiál"),
+    (("čeká na klienta", "ceka na klienta", "waiting client", "na klienta"), "čeká_na_klienta"),
+    (("vyfakturováno", "vyfakturovano", "invoiced", "fakturováno"), "vyfakturováno"),
+    (("uzavřeno", "uzavreno", "closed", "uzavřená"), "uzavřeno"),
+    (("zrušeno", "zruseno", "cancelled", "zrušená"), "zrušeno"),
+    (("nová", "nova", "new"), "nová"),
+)
 _CREATE_WR = ("create work report", "new work report", "work report",
               "vytvoř report", "vytvor report", "pracovní výkaz", "pracovni vykaz")
 _NEXT_WORDS = ("next", "dál", "dal", "nejbliž", "nejbliz")
@@ -309,6 +329,35 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
             entities={"person": person, "raw": utterance, "title": title},
             requires_confirmation=True,
             reason="Task creation; confirmation required.",
+        )
+
+    # ----- JOB CHANGE STATUS (before create) -----
+    if _has(low, _CHANGE_JOB_STATUS):
+        new_status = None
+        for words, canonical in _JOB_STATUS_MAP:
+            if any(w in low for w in words):
+                new_status = canonical
+                break
+        # "dokonči/dokonci zakázku" implies completed even without explicit status word
+        if new_status is None and ("dokonč" in low or "dokonc" in low):
+            new_status = "dokončeno"
+        person = extract_person(utterance)
+        return ParsedIntent(
+            intent="job.change_status",
+            confidence=0.75,
+            entities={"new_status": new_status, "person": person, "raw": utterance},
+            requires_confirmation=True,
+            reason="Job status change; confirmation required.",
+        )
+
+    # ----- JOB LIST (read-only) -----
+    if _has(low, _LIST_JOBS):
+        return ParsedIntent(
+            intent="job.list",
+            confidence=0.8,
+            entities={},
+            requires_confirmation=False,
+            reason="Read-only job query.",
         )
 
     # ----- JOB CREATE (before client: "zakazku pro Jana" must not match client) -----
