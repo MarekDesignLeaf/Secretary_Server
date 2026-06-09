@@ -107,8 +107,8 @@ COMMAND_TREE = [
     ]),
     ("komunikace", _t("Communication", "Komunikace", "Komunikacja"), Permission.crm_manage, [
         ("zaznamy", _t("Logging", "Záznamy", "Rejestrowanie"), [
-            ("comm.log", _t("log a call", "zaloguj hovor", "zarejestruj rozmowę"), False),
-            ("comm.list", _t("history", "historie komunikace", "historia"), False),
+            ("comm.log", _t("log a call", "zaloguj hovor / zaznamenej email", "zarejestruj rozmowę"), True),
+            ("comm.list", _t("history", "historie komunikace", "historia"), True),
         ]),
     ]),
     ("material", _t("Materials & stock", "Materiál a sklad", "Materiały"), Permission.crm_manage, [

@@ -436,6 +436,33 @@ def execute_voice_command(
         return res(True, f"Změnila jsem stav zakázky {updated.name} na {new_status}.", action=intent,
                    entity_id=updated.id, data={"job": updated.model_dump(mode="json")})
 
+    if intent == "comm.log":
+        comm_type = data.get("comm_type") or "hovor"
+        person = (data.get("person") or "").strip()
+        raw = data.get("raw") or ""
+        name = f"{comm_type}" + (f" - {person}" if person else "")
+        rec = repository.create_crm_record("communications", user.company_id, name,
+                                           {"source": "voice", "type": comm_type,
+                                            "contact": person or None, "note": raw})
+        msg = (f"Zaznamenala jsem {comm_type} s {person}." if person
+               else f"Zaznamenala jsem {comm_type}.")
+        return res(True, msg, action=intent, entity_id=rec.id,
+                   data={"communication": rec.model_dump(mode="json")})
+
+    if intent == "comm.list":
+        person = (data.get("person") or "").strip()
+        comms = repository.list_crm_records("communications", user.company_id)
+        if person:
+            comms = [c for c in comms if person.lower() in (c.name or "").lower()
+                     or person.lower() in str((c.data or {}).get("contact") or "").lower()]
+        comms = [c for c in comms if (c.status or "open") != "deleted"]
+        if not comms:
+            return res(True, "Žádná komunikace k zobrazení.", action=intent,
+                       data={"communications": [], "count": 0})
+        parts = [c.name for c in comms[:10]]
+        return res(True, f"Mám {len(comms)} záznamů: " + ", ".join(parts) + ".", action=intent,
+                   data={"communications": [c.model_dump(mode="json") for c in comms], "count": len(comms)})
+
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
 
 

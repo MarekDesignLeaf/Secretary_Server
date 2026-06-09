@@ -184,6 +184,19 @@ _CREATE_CLIENT = ("create client", "new client", "add client", "register client"
 _CREATE_JOB = ("create job", "new job", "vytvoř zakázku", "vytvor zakazku", "nová zakázka",
                "nova zakazka", "založ zakázku", "zaloz zakazku", "přidej zakázku", "pridej zakazku",
                "zaeviduj zakázku", "zaeviduj zakazku", "nová zakázka pro", "zaloz zakazku pro")
+_LOG_COMM = ("zaloguj hovor", "zaznamenej hovor", "zapiš hovor", "zapis hovor", "log hovor",
+             "volal jsem", "telefonoval jsem", "zaloguj email", "zaznamenej email", "zapiš email",
+             "zaznamenej komunikaci", "zaloguj komunikaci", "log call", "zaloguj sms", "poslal jsem sms",
+             "psal jsem", "kontaktoval jsem", "mluvil jsem s")
+_LIST_COMM = ("historie komunikace", "historie hovoru", "historie hovorů", "co jsme řešili",
+              "co jsme resili", "komunikace s", "zobraz komunikaci", "ukaz komunikaci",
+              "posledni komunikace", "poslední komunikace", "communication history")
+_COMM_TYPE_MAP = (
+    (("hovor", "volal", "telefon", "call"), "hovor"),
+    (("email", "mail"), "email"),
+    (("sms", "zpráv", "zprav"), "sms"),
+    (("schůzk", "schuzk", "osobně", "osobne", "meeting"), "schůzka"),
+)
 _LIST_JOBS = ("zobraz zakázky", "zobraz zakazky", "moje zakázky", "moje zakazky", "seznam zakázek",
               "seznam zakazek", "ukaž zakázky", "ukaz zakazky", "jaké mám zakázky", "jake mam zakazky",
               "co mám za zakázky", "co mam za zakazky", "list jobs", "show jobs", "zakázky na",
@@ -329,6 +342,33 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
             entities={"person": person, "raw": utterance, "title": title},
             requires_confirmation=True,
             reason="Task creation; confirmation required.",
+        )
+
+    # ----- COMMUNICATION LIST (read-only) -----
+    if _has(low, _LIST_COMM):
+        person = extract_person(utterance)
+        return ParsedIntent(
+            intent="comm.list",
+            confidence=0.8,
+            entities={"person": person},
+            requires_confirmation=False,
+            reason="Read-only communication query.",
+        )
+
+    # ----- COMMUNICATION LOG -----
+    if _has(low, _LOG_COMM):
+        comm_type = "hovor"
+        for words, canonical in _COMM_TYPE_MAP:
+            if any(w in low for w in words):
+                comm_type = canonical
+                break
+        person = extract_person(utterance)
+        return ParsedIntent(
+            intent="comm.log",
+            confidence=0.75,
+            entities={"comm_type": comm_type, "person": person, "raw": utterance},
+            requires_confirmation=True,
+            reason="Communication log; confirmation required.",
         )
 
     # ----- JOB CHANGE STATUS (before create) -----
