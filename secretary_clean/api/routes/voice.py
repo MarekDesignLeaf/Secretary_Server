@@ -109,6 +109,11 @@ def _merge_answer_into_data(intent: str, text: str, data: dict) -> dict:
         d["title"] = ans
     if intent == "job.create" and not d.get("title"):
         d["title"] = ans
+    if intent == "whatsapp.send":
+        if not d.get("person"):
+            d["person"] = ans
+        elif not d.get("message"):
+            d["message"] = ans
     return d
 
 
@@ -462,6 +467,40 @@ def execute_voice_command(
         parts = [c.name for c in comms[:10]]
         return res(True, f"Mám {len(comms)} záznamů: " + ", ".join(parts) + ".", action=intent,
                    data={"communications": [c.model_dump(mode="json") for c in comms], "count": len(comms)})
+
+    if intent == "whatsapp.send":
+        from secretary_clean.core import whatsapp as _wa
+        if not _wa.is_configured():
+            return res(False, "WhatsApp není na serveru nakonfigurovaný.",
+                       status="error", action=intent)
+        person = (data.get("person") or "").strip()
+        message = (data.get("message") or "").strip()
+        if not message:
+            return res(False, "Co mám napsat?", status="needs_more_info",
+                       action=intent, missing=["message"], question="Co mám napsat?")
+        # Resolve the client's phone from CRM by name match.
+        phone = None
+        client_name = person
+        for c in repository.list_crm_records("clients", user.company_id):
+            if person and person.lower() in (c.name or "").lower():
+                phone = (c.data or {}).get("phone")
+                client_name = c.name
+                break
+        if not phone:
+            return res(False, f"Nenašla jsem telefon klienta {person}. Přidej ho do kontaktu.",
+                       status="error", action=intent)
+        ok, mid, err = _wa.send_text(phone, message)
+        if not ok:
+            return res(False, f"WhatsApp se nepodařilo odeslat: {err}",
+                       status="error", action=intent)
+        # Log the outbound message into communications.
+        repository.create_crm_record("communications", user.company_id,
+                                     f"whatsapp - {client_name}",
+                                     {"source": "voice", "type": "whatsapp",
+                                      "direction": "out", "contact": client_name,
+                                      "phone": phone, "note": message, "wa_message_id": mid})
+        return res(True, f"Odeslala jsem WhatsApp {client_name}: {message}", action=intent,
+                   data={"wa_message_id": mid})
 
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
 

@@ -188,6 +188,11 @@ _LOG_COMM = ("zaloguj hovor", "zaznamenej hovor", "zapiš hovor", "zapis hovor",
              "volal jsem", "telefonoval jsem", "zaloguj email", "zaznamenej email", "zapiš email",
              "zaznamenej komunikaci", "zaloguj komunikaci", "log call", "zaloguj sms", "poslal jsem sms",
              "psal jsem", "kontaktoval jsem", "mluvil jsem s")
+_SEND_WHATSAPP = ("pošli whatsapp", "posli whatsapp", "napiš na whatsapp", "napis na whatsapp",
+                  "pošli zprávu na whatsapp", "posli zpravu na whatsapp", "whatsapp zpráva",
+                  "whatsapp zprava", "pošli whatsapp zprávu", "posli whatsapp zpravu",
+                  "send whatsapp", "napiš whatsapp", "napis whatsapp", "zpráva přes whatsapp",
+                  "zprava pres whatsapp", "pošli přes whatsapp", "posli pres whatsapp")
 _LIST_COMM = ("historie komunikace", "historie hovoru", "historie hovorů", "co jsme řešili",
               "co jsme resili", "komunikace s", "zobraz komunikaci", "ukaz komunikaci",
               "posledni komunikace", "poslední komunikace", "communication history")
@@ -342,6 +347,24 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
             entities={"person": person, "raw": utterance, "title": title},
             requires_confirmation=True,
             reason="Task creation; confirmation required.",
+        )
+
+    # ----- WHATSAPP SEND (before comm log/list) -----
+    if _has(low, _SEND_WHATSAPP):
+        person = extract_person(utterance)
+        # message text = only after an explicit content marker ("ze"/"rekni"/"text").
+        # Otherwise leave empty and ask via slot-filling (more reliable than guessing).
+        msg_text = None
+        import re as _re
+        m = _re.search(r"\b(že|ze|řekni mu|rekni mu|řekni jí|rekni ji|s textem|text)\b\s+(.+)$", utterance, flags=_re.IGNORECASE)
+        if m:
+            msg_text = m.group(2).strip()
+        return ParsedIntent(
+            intent="whatsapp.send",
+            confidence=0.75,
+            entities={"person": person, "message": msg_text, "raw": utterance},
+            requires_confirmation=True,
+            reason="Outbound WhatsApp message; confirmation required.",
         )
 
     # ----- COMMUNICATION LIST (read-only) -----

@@ -17,6 +17,10 @@ _SLOTS = {
         ("phone", "Jaké je telefonní číslo klienta?"),
         ("address", "Jaká je adresa klienta?"),
     ],
+    "whatsapp.send": [
+        ("person", "Komu mám WhatsApp poslat?"),
+        ("message", "Co mám napsat?"),
+    ],
     "job.create": [
         ("title", "Jaká zakázka? Řekni název nebo popis."),
     ],

@@ -106,6 +106,9 @@ COMMAND_TREE = [
         ]),
     ]),
     ("komunikace", _t("Communication", "Komunikace", "Komunikacja"), Permission.crm_manage, [
+        ("odesilani", _t("Send", "Odesílání", "Wysyłanie"), [
+            ("whatsapp.send", _t("send WhatsApp", "pošli WhatsApp klientovi", "wyślij WhatsApp"), True),
+        ]),
         ("zaznamy", _t("Logging", "Záznamy", "Rejestrowanie"), [
             ("comm.log", _t("log a call", "zaloguj hovor / zaznamenej email", "zarejestruj rozmowę"), True),
             ("comm.list", _t("history", "historie komunikace", "historia"), True),
