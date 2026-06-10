@@ -452,7 +452,9 @@ class PostgresSecretaryRepository:
         try:
             user_role = Role(role)
         except ValueError:
-            user_role = Role.worker
+            # Unknown role string falls back to the lowest general role.
+            # (Role.worker does not exist; valid roles: owner/admin/manager/staff/accountant.)
+            user_role = Role.staff
         normalized_email = email.lower()
         # check duplicate
         with self._conn() as conn:

@@ -227,7 +227,7 @@ class InMemorySecretaryRepository:
         try:
             user_role = Role(role)
         except ValueError:
-            user_role = Role.worker
+            user_role = Role.staff
         user = UserAccount(
             id=str(uuid4()),
             company_id=company_id,
