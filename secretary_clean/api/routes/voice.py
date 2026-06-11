@@ -394,9 +394,25 @@ def execute_voice_command(
     if intent == "job.create":
         title = data.get("title")
         client = data.get("client")
-        rec = repository.create_crm_record("jobs", user.company_id, title,
-                                           {"source": "voice", "client_name": client})
-        msg = (f"Vytvořila jsem zakázku: {title} pro {client}." if client
+        extra = {"source": "voice", "client_name": client}
+        if client:
+            cl = client.strip().lower()
+            clients = repository.list_crm_records("clients", user.company_id)
+            hits = [c for c in clients if cl in (c.name or "").lower()]
+            if len(hits) == 1:
+                extra["client_id"] = hits[0].id
+                extra["client_name"] = hits[0].name
+            elif len(hits) > 1:
+                names = ", ".join(c.name for c in hits[:5])
+                return res(False, f"Našla jsem víc klientů: {names}. Pro kterého má zakázka být?",
+                           status="needs_more_info", action=intent,
+                           missing=["client"], question="Pro kterého klienta?")
+            else:
+                return res(False, f"Klienta '{client}' jsem nenašla. Řekni přesné jméno, nebo ho nejdřív založ.",
+                           status="needs_more_info", action=intent,
+                           missing=["client"], question=f"Klient {client} neexistuje. Jaké je správné jméno?")
+        rec = repository.create_crm_record("jobs", user.company_id, title, extra)
+        msg = (f"Vytvořila jsem zakázku: {title} pro {extra['client_name']}." if extra.get("client_id")
                else f"Vytvořila jsem zakázku: {title}.")
         return res(True, msg, action=intent, entity_id=rec.id,
                    data={"job": rec.model_dump(mode="json")})

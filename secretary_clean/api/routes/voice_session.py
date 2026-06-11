@@ -195,7 +195,8 @@ def _find_clients(name: str, repository, company_id: str) -> list:
 def _find_users(text: str, repository, company_id: str) -> tuple[list, list]:
     """Return (matched_users, not_found_tokens)."""
     users = repository.list_users(company_id)
-    tokens = [t.strip() for t in re.split(r"[,;and&]+", text) if t.strip()]
+    # split on , ; & and the words "and"/"a"/"i" — NOT a char class (old bug shredded names containing a/n/d)
+    tokens = [t.strip() for t in re.split(r"[,;&]+|\band\b|\ba\b|\bi\b", text, flags=re.IGNORECASE) if t.strip()]
     matched, not_found = [], []
     for token in tokens:
         q = token.lower()
