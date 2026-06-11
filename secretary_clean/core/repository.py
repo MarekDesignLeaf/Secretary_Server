@@ -76,6 +76,7 @@ class InMemorySecretaryRepository:
                 "invoices",
                 "communications",
                 "work_reports",
+                "leads",
             )
         }
 

@@ -73,6 +73,7 @@ _CRM_TABLES: dict[str, str] = {
     "invoices": "clean_invoices",
     "communications": "clean_communications",
     "work_reports": "clean_work_reports",
+    "leads": "clean_leads",
 }
 
 _VALID_CRM_MODULES = set(_CRM_TABLES.keys())

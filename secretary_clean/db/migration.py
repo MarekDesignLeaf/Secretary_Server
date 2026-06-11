@@ -32,6 +32,20 @@ CREATE EXTENSION IF NOT EXISTS citext;
 
 # Extra tables required by the Postgres repository that are not in schema.sql
 _EXTRA_DDL = """
+CREATE TABLE IF NOT EXISTS clean_leads (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    preferred_language_code TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    data JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS clean_leads_company_idx
+    ON clean_leads(company_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS clean_assistant_memory (
     id UUID PRIMARY KEY,
     company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
