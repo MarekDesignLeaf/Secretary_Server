@@ -73,6 +73,17 @@ def _update(repository, module: str, record_id: str, user: UserAccount, payload:
     return record
 
 
+def _notes_list(data: dict | None) -> list[dict]:
+    """data['notes'] may be a list of dicts (note API) or a scalar string
+    sent in a create payload — never crash the detail view on it."""
+    raw = (data or {}).get("notes")
+    if isinstance(raw, list):
+        return [n for n in raw if isinstance(n, dict)]
+    if isinstance(raw, str) and raw.strip():
+        return [{"id": "", "content": raw, "note_type": "general"}]
+    return []
+
+
 def _note_payload(data: dict) -> NoteCreateRequest:
     content = (data.get("note") or data.get("content") or "").strip()
     if not content:
@@ -142,7 +153,7 @@ def get_client_detail(
     tasks = [shapes.task_out(t, names)
              for t in _records(repository, "tasks", user.company_id)
              if str((t.data or {}).get("clientId") or (t.data or {}).get("client_id")) == client_id]
-    notes = [shapes.note_out(n) for n in (record.data or {}).get("notes", [])]
+    notes = [shapes.note_out(n) for n in _notes_list(record.data)]
     return {
         "client": shapes.client_out(record),
         "properties": (record.data or {}).get("properties") or [],
@@ -196,7 +207,7 @@ def add_client_note(
         record = repository.add_crm_note("clients", client_id, user.company_id, note, author_id=user.id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"ok": True, "notes": [shapes.note_out(n) for n in record.data.get("notes", [])]}
+    return {"ok": True, "notes": [shapes.note_out(n) for n in _notes_list(record.data)]}
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +257,7 @@ def get_job_detail(
              for t in _records(repository, "tasks", user.company_id)
              if str((t.data or {}).get("jobId") or (t.data or {}).get("job_id")) == job_id]
     notes = [shapes.note_out(n, parent_id=job_id)
-             for n in (record.data or {}).get("notes", [])]
+             for n in _notes_list(record.data)]
     return {
         "job": shapes.job_out(record, names),
         "tasks": tasks,
