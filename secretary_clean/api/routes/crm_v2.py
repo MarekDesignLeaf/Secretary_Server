@@ -4,10 +4,12 @@ Responses use the rich shapes the Android client expects (core/crm_shapes.py);
 storage stays the generic CRMRecord, so the voice layer and repository are
 untouched. IDs are UUID strings (Blueprint section 5).
 
-Fáze 2 (budoucí): photos upload, timeline z activity logu, notifications,
-calendar-feed — zatím prázdné kompatibilní odpovědi, viz konec souboru.
+Fáze 2 (budoucí): photos upload, notifications — zatím prázdné kompatibilní
+odpovědi, viz konec souboru. Timeline a calendar-feed jsou reálné.
 """
 from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -616,5 +618,41 @@ def list_notifications(user: UserAccount = Depends(current_user)):
 
 
 @router.get("/calendar-feed")
-def calendar_feed(user: UserAccount = Depends(current_user)):
-    return []
+def calendar_feed(
+    days: int = 30,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Backend calendar events mapped to the Android CalendarFeedEntry shape.
+
+    Every CalendarFeedEntry field is emitted explicitly: Gson instantiates
+    Kotlin data classes without running default initializers, so a missing
+    key would surface as null in a non-null field on the client.
+    """
+    days = max(1, min(days, 365))
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    events = repository.list_calendar_events(
+        user.company_id, start=start, end=start + timedelta(days=days))
+    client_names = _client_names(repository, user.company_id)
+    return [
+        {
+            "entry_key": f"calendar_event:{event.id}",
+            "entry_type": "calendar_event",
+            "source_id": event.id,
+            "title": event.title,
+            "client_name": client_names.get(event.client_id) if event.client_id else None,
+            "job_title": None,
+            "assigned_user_id": None,
+            "assigned_to": None,
+            "is_assigned_to_current": False,
+            "display_mode": "shared",
+            "planned_start_at": event.start_at.isoformat(),
+            "planned_end_at": event.end_at.isoformat() if event.end_at else None,
+            "planned_date": event.start_at.date().isoformat(),
+            "description": event.description,
+            "calendar_sync_enabled": True,
+            "reminder_for_assignee_only": True,
+            "status": "scheduled",
+        }
+        for event in events
+    ]
