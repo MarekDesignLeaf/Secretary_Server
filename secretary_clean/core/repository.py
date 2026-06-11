@@ -145,11 +145,36 @@ class InMemorySecretaryRepository:
         return user
 
     def create_first_install(self, payload: FirstInstallCreate, *, activity_defaults: dict | None = None) -> FirstInstallResult:
-        if self.companies:
-            raise ValueError("First company already exists")
         if any(user.role == Role.owner for user in self.users.values()):
             raise ValueError("First admin already exists")
-        company = self.create_first_company(
+        # Recovery: company exists but no owner (half-installed) -> adopt it.
+        orphan = next(iter(self.companies.values()), None)
+        if orphan is not None:
+            self.companies.pop(orphan.id, None)
+            company = self.create_first_company(
+                FirstCompanyCreate(
+                    legal_name=payload.company_name,
+                    trading_name=payload.company_name,
+                    legal_type=payload.company_legal_type,
+                    default_country=payload.country,
+                    default_currency=payload.currency,
+                    timezone=payload.timezone,
+                    phone=payload.phone,
+                    website=payload.website,
+                    workspace_mode=payload.workspace_mode,
+                    industry_group=payload.primary_industry or (payload.selected_industries[0] if payload.selected_industries else payload.industry_group),
+                    industry_subtype=payload.primary_subtype or (payload.selected_subtypes[0] if payload.selected_subtypes else payload.industry_subtype),
+                    default_internal_language_code=payload.default_internal_language_code,
+                    default_customer_language_code=payload.default_customer_language_code,
+                )
+            )
+            # keep the original company id so any orphaned records stay linked
+            rebound = company.model_copy(update={"id": orphan.id})
+            self.companies.pop(company.id, None)
+            self.companies[orphan.id] = rebound
+            company = rebound
+        else:
+            company = self.create_first_company(
             FirstCompanyCreate(
                 legal_name=payload.company_name,
                 trading_name=payload.company_name,

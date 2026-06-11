@@ -291,6 +291,101 @@ class PostgresSecretaryRepository:
 
         return self._build_user_account(user_id)
 
+    def _adopt_orphan_company(self, company_id: str, payload: FirstCompanyCreate) -> CompanyProfile:
+        """Recovery for half-installed DB: company row exists but no owner user.
+        Overwrites the orphaned company identity with the new first-install data
+        and (re)upserts operating settings, profile, configuration and languages."""
+        payload_data = payload.model_dump()
+        default_internal_language_code = normalize_language_code(
+            payload_data.pop("default_internal_language_code", None)
+        )
+        default_customer_language_code = normalize_language_code(
+            payload_data.pop("default_customer_language_code", None)
+        )
+        workspace_mode = payload_data.pop("workspace_mode", "single_company")
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE clean_companies SET
+                        legal_name = %s, trading_name = %s, legal_type = %s,
+                        default_country = %s, default_currency = %s, timezone = %s,
+                        phone = %s, website = %s,
+                        industry_group = %s, industry_subtype = %s,
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (
+                        payload_data["legal_name"],
+                        payload_data.get("trading_name"),
+                        payload_data.get("legal_type"),
+                        payload_data.get("default_country", "GB"),
+                        payload_data.get("default_currency", "GBP"),
+                        payload_data.get("timezone", "Europe/London"),
+                        payload_data.get("phone"),
+                        payload_data.get("website"),
+                        payload_data.get("industry_group"),
+                        payload_data.get("industry_subtype"),
+                        company_id,
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO clean_company_operating_settings (company_id, workspace_mode)
+                    VALUES (%s, %s)
+                    ON CONFLICT (company_id) DO UPDATE SET workspace_mode = EXCLUDED.workspace_mode
+                    """,
+                    (company_id, workspace_mode),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO tenant_operating_profile
+                        (company_id, workspace_mode, industry_group, industry_subtype,
+                         default_internal_language_code, default_customer_language_code)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (company_id) DO UPDATE SET
+                        workspace_mode = EXCLUDED.workspace_mode,
+                        industry_group = EXCLUDED.industry_group,
+                        industry_subtype = EXCLUDED.industry_subtype,
+                        default_internal_language_code = EXCLUDED.default_internal_language_code,
+                        default_customer_language_code = EXCLUDED.default_customer_language_code
+                    """,
+                    (
+                        company_id, workspace_mode,
+                        payload_data.get("industry_group"),
+                        payload_data.get("industry_subtype"),
+                        default_internal_language_code,
+                        default_customer_language_code,
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO clean_tenant_configuration
+                        (company_id, workspace_mode, industry_group, industry_subtype, phone, website)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (company_id) DO UPDATE SET
+                        workspace_mode = EXCLUDED.workspace_mode,
+                        industry_group = EXCLUDED.industry_group,
+                        industry_subtype = EXCLUDED.industry_subtype,
+                        phone = EXCLUDED.phone,
+                        website = EXCLUDED.website
+                    """,
+                    (
+                        company_id, workspace_mode,
+                        payload_data.get("industry_group"),
+                        payload_data.get("industry_subtype"),
+                        payload_data.get("phone"),
+                        payload_data.get("website"),
+                    ),
+                )
+            conn.commit()
+            self._seed_default_languages_conn(
+                conn, company_id, default_internal_language_code, default_customer_language_code
+            )
+            conn.commit()
+        logger.warning("first-install adopted orphaned company %s (no owner existed)", company_id)
+        return self.get_company(company_id)
+
     def create_first_install(
         self,
         payload: FirstInstallCreate,
@@ -299,12 +394,16 @@ class PostgresSecretaryRepository:
     ) -> FirstInstallResult:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) AS n FROM clean_companies")
-                if cur.fetchone()["n"] > 0:
-                    raise ValueError("First company already exists")
                 cur.execute("SELECT COUNT(*) AS n FROM clean_users WHERE role = %s", (Role.owner.value,))
                 if cur.fetchone()["n"] > 0:
                     raise ValueError("First admin already exists")
+                # Recovery path: a previous install may have created the company
+                # but failed before the owner was created. In that half-installed
+                # state we ADOPT the orphaned company instead of bricking
+                # onboarding with 409 forever.
+                cur.execute("SELECT id FROM clean_companies ORDER BY created_at ASC LIMIT 1")
+                row = cur.fetchone()
+                orphan_company_id = str(row["id"]) if row else None
 
         industry_group = payload.primary_industry or (
             payload.selected_industries[0] if payload.selected_industries else payload.industry_group
@@ -313,8 +412,7 @@ class PostgresSecretaryRepository:
             payload.selected_subtypes[0] if payload.selected_subtypes else payload.industry_subtype
         )
 
-        company = self.create_first_company(
-            FirstCompanyCreate(
+        first_company_payload = FirstCompanyCreate(
                 legal_name=payload.company_name,
                 trading_name=payload.company_name,
                 legal_type=payload.company_legal_type,
@@ -329,7 +427,10 @@ class PostgresSecretaryRepository:
                 default_internal_language_code=payload.default_internal_language_code or "en-GB",
                 default_customer_language_code=payload.default_customer_language_code or "en-GB",
             )
-        )
+        if orphan_company_id is None:
+            company = self.create_first_company(first_company_payload)
+        else:
+            company = self._adopt_orphan_company(orphan_company_id, first_company_payload)
 
         admin = self.create_first_admin(
             company_id=company.id,
