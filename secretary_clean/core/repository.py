@@ -63,6 +63,8 @@ class InMemorySecretaryRepository:
         self.tenant_configuration: dict[str, dict] = {}
         self.users: dict[str, UserAccount] = {}
         self.password_hashes: dict[str, str] = {}
+        self.assistant_memory: list[dict] = []  # dicts: id, company_id, created_by, memory_type, content, updated_at
+        self.activity_log: list[dict] = []  # dicts matching ActivityLogEntry + company_id
         self.tenant_pricing: dict[tuple[str, str], TenantActivityPricing] = {}
         self.crm: dict[str, dict[str, CRMRecord]] = {
             name: {}
@@ -550,6 +552,81 @@ class InMemorySecretaryRepository:
 
     def list_users(self, company_id: str) -> list[UserAccount]:
         return [user for user in self.users.values() if user.company_id == company_id]
+
+    # ------------------------------------------------------------------
+    # Assistant memory (permanent "zapamatuj si" entries)
+    # ------------------------------------------------------------------
+
+    def list_assistant_memory(self, company_id: str, limit: int = 100) -> list[dict]:
+        rows = [m for m in self.assistant_memory if m["company_id"] == company_id]
+        rows.sort(key=lambda m: m["updated_at"], reverse=True)
+        return rows[:limit]
+
+    def add_assistant_memory(
+        self, company_id: str, created_by: str | None, content: str, memory_type: str = "long"
+    ) -> dict:
+        item = {
+            "id": str(uuid4()),
+            "company_id": company_id,
+            "created_by": created_by,
+            "memory_type": memory_type,
+            "content": content,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        self.assistant_memory.append(item)
+        return item
+
+    def delete_assistant_memory(self, memory_id: str, company_id: str) -> bool:
+        before = len(self.assistant_memory)
+        self.assistant_memory = [
+            m for m in self.assistant_memory
+            if not (m["id"] == memory_id and m["company_id"] == company_id)
+        ]
+        return len(self.assistant_memory) < before
+
+    # ------------------------------------------------------------------
+    # Activity log (admin-visible "who did what")
+    # ------------------------------------------------------------------
+
+    def log_activity(
+        self,
+        company_id: str,
+        actor_user_id: str | None,
+        entity_type: str,
+        entity_id: str,
+        action: str,
+        description: str,
+        source_channel: str = "app",
+        details: dict | None = None,
+    ) -> None:
+        self.activity_log.append({
+            "id": str(uuid4()),
+            "company_id": company_id,
+            "actor_user_id": actor_user_id,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "action": action,
+            "description": description,
+            "source_channel": source_channel,
+            "details": details or {},
+            "created_at": datetime.now(timezone.utc),
+        })
+
+    def list_activity_log(
+        self, company_id: str, limit: int = 200, actor_user_id: str | None = None
+    ) -> list[dict]:
+        rows = [e for e in self.activity_log if e["company_id"] == company_id]
+        if actor_user_id:
+            rows = [e for e in rows if e["actor_user_id"] == actor_user_id]
+        rows.sort(key=lambda e: e["created_at"], reverse=True)
+        out = []
+        for e in rows[:limit]:
+            actor = self.users.get(e["actor_user_id"]) if e["actor_user_id"] else None
+            entry = dict(e)
+            entry["actor_display_name"] = actor.display_name if actor else ""
+            entry["actor_email"] = actor.email if actor else ""
+            out.append(entry)
+        return out
 
     def save_tenant_pricing(self, company_id: str, activity_code: str, request: TenantActivityOverrideRequest) -> TenantActivityPricing:
         override = TenantActivityPricing(

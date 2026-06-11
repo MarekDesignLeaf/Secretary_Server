@@ -31,7 +31,7 @@ def create_user(
     if user.role.value not in ("owner", "admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     try:
-        return repository.create_user(
+        created = repository.create_user(
             company_id=user.company_id,
             email=payload.email,
             password=payload.password,
@@ -42,6 +42,11 @@ def create_user(
             phone=payload.phone,
             preferred_language_code=payload.preferred_language_code,
         )
+        repository.log_activity(
+            user.company_id, user.id, "user", created.id,
+            "create", f"User created: {created.display_name or created.email}",
+        )
+        return created
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -56,7 +61,7 @@ def update_user(
     if user.role.value not in ("owner", "admin") and user.id != user_id:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     try:
-        return repository.update_user(
+        updated = repository.update_user(
             user_id,
             user.company_id,
             display_name=payload.display_name,
@@ -67,6 +72,11 @@ def update_user(
             preferred_language_code=payload.preferred_language_code,
             is_active=payload.is_active,
         )
+        repository.log_activity(
+            user.company_id, user.id, "user", user_id,
+            "update", f"User updated: {updated.display_name or updated.email}",
+        )
+        return updated
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -83,6 +93,10 @@ def delete_user(
         raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
     try:
         repository.delete_user(user_id, user.company_id)
+        repository.log_activity(
+            user.company_id, user.id, "user", user_id,
+            "deactivate", "User deactivated",
+        )
         return {"ok": True}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -91,31 +105,21 @@ def delete_user(
 @router.post("/{user_id}/reset-password")
 def reset_user_password(
     user_id: str,
-    payload: ResetPasswordRequest,
+    payload: ResetPasswordRequest | None = None,
     user: UserAccount = Depends(current_user),
     repository: InMemorySecretaryRepository = Depends(get_repository),
 ):
+    """Reset a user's password. With a body -> that password; without a body
+    -> default temp password '12345' (must_change_password flow)."""
     if user.role.value not in ("owner", "admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    try:
-        repository.reset_user_password(user_id, payload.new_password)
-        return {"ok": True}
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@router.post("/{user_id}/reset-password")
-def reset_user_password(
-    user_id: str,
-    user: UserAccount = Depends(current_user),
-    repository: InMemorySecretaryRepository = Depends(get_repository),
-):
-    """Reset user password to default temp password '12345' and set must_change_password=True."""
-    if user.role.value not in ("owner", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-    # Verify user belongs to same company
     target = repository.get_user(user_id)
     if not target or target.company_id != user.company_id:
         raise HTTPException(status_code=404, detail="User not found")
-    repository.reset_user_password(user_id, "12345")
+    new_password = payload.new_password if payload and payload.new_password else "12345"
+    repository.reset_user_password(user_id, new_password)
+    repository.log_activity(
+        user.company_id, user.id, "user", user_id,
+        "reset_password", f"Password reset for {target.display_name or target.email}",
+    )
     return {"ok": True}

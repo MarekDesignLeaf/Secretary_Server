@@ -443,6 +443,140 @@ class PostgresSecretaryRepository:
                 rows = cur.fetchall()
         return [self._row_to_user(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # Assistant memory (permanent "zapamatuj si" entries)
+    # ------------------------------------------------------------------
+
+    def list_assistant_memory(self, company_id: str, limit: int = 100) -> list[dict]:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, memory_type, content, updated_at, created_by, company_id "
+                    "FROM clean_assistant_memory WHERE company_id = %s "
+                    "ORDER BY updated_at DESC LIMIT %s",
+                    (company_id, limit),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "id": str(r["id"]),
+                "company_id": str(r["company_id"]),
+                "created_by": str(r["created_by"]) if r["created_by"] else None,
+                "memory_type": r["memory_type"],
+                "content": r["content"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    def add_assistant_memory(
+        self, company_id: str, created_by: str | None, content: str, memory_type: str = "long"
+    ) -> dict:
+        memory_id = str(uuid4())
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_assistant_memory "
+                    "(id, company_id, created_by, memory_type, content) "
+                    "VALUES (%s, %s, %s, %s, %s) RETURNING updated_at",
+                    (memory_id, company_id, created_by, memory_type, content),
+                )
+                updated_at = cur.fetchone()["updated_at"]
+            conn.commit()
+        return {
+            "id": memory_id,
+            "company_id": company_id,
+            "created_by": created_by,
+            "memory_type": memory_type,
+            "content": content,
+            "updated_at": updated_at,
+        }
+
+    def delete_assistant_memory(self, memory_id: str, company_id: str) -> bool:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM clean_assistant_memory WHERE id = %s AND company_id = %s",
+                    (memory_id, company_id),
+                )
+                deleted = cur.rowcount > 0
+            conn.commit()
+        return deleted
+
+    # ------------------------------------------------------------------
+    # Activity log (admin-visible "who did what")
+    # ------------------------------------------------------------------
+
+    def log_activity(
+        self,
+        company_id: str,
+        actor_user_id: str | None,
+        entity_type: str,
+        entity_id: str,
+        action: str,
+        description: str,
+        source_channel: str = "app",
+        details: dict | None = None,
+    ) -> None:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_activity_log "
+                    "(id, company_id, actor_user_id, entity_type, entity_id, action, "
+                    " description, source_channel, details) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        str(uuid4()), company_id, actor_user_id, entity_type, entity_id,
+                        action, description, source_channel, json.dumps(details or {}),
+                    ),
+                )
+            conn.commit()
+
+    def list_activity_log(
+        self, company_id: str, limit: int = 200, actor_user_id: str | None = None
+    ) -> list[dict]:
+        sql = (
+            "SELECT a.id, a.entity_type, a.entity_id, a.action, a.description, "
+            "       a.source_channel, a.created_at, a.actor_user_id, a.details, "
+            "       COALESCE(u.display_name, '') AS actor_display_name, "
+            "       COALESCE(u.email, '') AS actor_email "
+            "FROM clean_activity_log a "
+            "LEFT JOIN clean_users u ON u.id = a.actor_user_id "
+            "WHERE a.company_id = %s"
+        )
+        params: list = [company_id]
+        if actor_user_id:
+            sql += " AND a.actor_user_id = %s"
+            params.append(actor_user_id)
+        sql += " ORDER BY a.created_at DESC LIMIT %s"
+        params.append(limit)
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        out = []
+        for r in rows:
+            details = r["details"]
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except Exception:
+                    details = {}
+            out.append({
+                "id": str(r["id"]),
+                "entity_type": r["entity_type"],
+                "entity_id": r["entity_id"],
+                "action": r["action"],
+                "description": r["description"],
+                "source_channel": r["source_channel"],
+                "created_at": r["created_at"],
+                "actor_user_id": str(r["actor_user_id"]) if r["actor_user_id"] else None,
+                "actor_display_name": r["actor_display_name"],
+                "actor_email": r["actor_email"],
+                "details": details if isinstance(details, dict) else {},
+            })
+        return out
+
     def create_user(self, company_id: str, email: str, password: str, display_name: str,
                     role: str = "worker", first_name: str | None = None,
                     last_name: str | None = None, phone: str | None = None,

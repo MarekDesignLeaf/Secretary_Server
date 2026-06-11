@@ -273,6 +273,34 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class AssistantMemoryItem(BaseModel):
+    """Permanent assistant memory entry ("zapamatuj si")."""
+    id: str
+    memory_type: str = "long"
+    content: str
+    updated_at: datetime | None = None
+
+
+class AssistantMemoryCreate(BaseModel):
+    content: str
+    memory_type: str = "long"
+
+
+class ActivityLogEntry(BaseModel):
+    """Admin-visible activity log entry (who did what, when, via which channel)."""
+    id: str
+    entity_type: str = ""
+    entity_id: str = ""
+    action: str = ""
+    description: str = ""
+    source_channel: str = "app"
+    created_at: datetime | None = None
+    actor_user_id: str | None = None
+    actor_display_name: str = ""
+    actor_email: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class PasswordResetToken(BaseModel):
     id: str
     user_id: str

@@ -10,6 +10,8 @@ from fastapi import FastAPI
 
 from secretary_clean.api.routes import (
     activities_compat,
+    admin,
+    assistant,
     auth,
     backup,
     bootstrap,
@@ -141,6 +143,8 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(voice_session.router, prefix="/api/v1")
     app.include_router(backup.router, prefix="/api/v1")
     app.include_router(activities_compat.router, prefix="/api/v1")
+    app.include_router(assistant.router, prefix="/api/v1")
+    app.include_router(admin.router, prefix="/api/v1")
     return app
 
 
