@@ -7,6 +7,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from secretary_clean.api.routes import (
     activities_compat,
@@ -33,6 +34,17 @@ from secretary_clean.core.models import FirstInstallCreate
 from secretary_clean.core.repository import InMemorySecretaryRepository
 
 log = logging.getLogger(__name__)
+
+
+# CORS: origins are driven exclusively by the ALLOWED_ORIGINS env variable.
+# Default (env not set) allows local development only. No hardcoded
+# production domains. Never use "*" together with allow_credentials.
+_DEFAULT_DEV_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
+
+
+def _allowed_origins() -> list[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", _DEFAULT_DEV_ORIGINS)
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
 _postgres_error: str | None = None
@@ -125,6 +137,13 @@ async def lifespan(app: FastAPI):
 def create_app(repository=None) -> FastAPI:
     repo = repository or _default_repository()
     app = FastAPI(title="Secretary Clean Backend", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins(),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
     app.state.repository = repo
     app.state.catalogue = load_catalogue()
     app.include_router(bootstrap.router, prefix="/api/v1")
