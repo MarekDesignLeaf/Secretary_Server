@@ -196,10 +196,12 @@ _SEND_WHATSAPP = ("pošli whatsapp", "posli whatsapp", "napiš na whatsapp", "na
                   "odpověz na whatsapp", "odpovez na whatsapp", "odpověz mu", "odpovez mu",
                   "odpověz jí", "odpovez ji", "odepiš", "odepis", "reply on whatsapp")
 _READ_WHATSAPP = ("přečti zprávy", "precti zpravy", "přečti mi zprávy", "precti mi zpravy",
+                  "přečti zprávu", "precti zpravu", "přečti mi zprávu", "precti mi zpravu",
+                  "přečti novou", "precti novou", "nová zpráva", "nova zprava",
                   "nové zprávy", "nove zpravy", "mám nové zprávy", "mam nove zpravy",
                   "zkontroluj zprávy", "zkontroluj zpravy", "přečti whatsapp", "precti whatsapp",
                   "nějaké zprávy", "nejake zpravy", "co mi přišlo", "co mi prislo",
-                  "read messages", "check messages", "new messages")
+                  "read messages", "check messages", "new messages", "read message")
 _LIST_COMM = ("historie komunikace", "historie hovoru", "historie hovorů", "co jsme řešili",
               "co jsme resili", "komunikace s", "zobraz komunikaci", "ukaz komunikaci",
               "posledni komunikace", "poslední komunikace", "communication history")

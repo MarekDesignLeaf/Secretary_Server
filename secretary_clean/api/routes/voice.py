@@ -534,9 +534,6 @@ def execute_voice_command(
     if intent == "whatsapp.send":
         from secretary_clean.core import whatsapp as _wa
         from secretary_clean.api.routes.whatsapp import outbound_text_for
-        if not _wa.is_configured():
-            return res(False, "WhatsApp není na serveru nakonfigurovaný.",
-                       status="error", action=intent)
         person = (data.get("person") or "").strip()
         message = (data.get("message") or "").strip()
         if not message:
@@ -558,10 +555,21 @@ def execute_voice_command(
         # Internal language -> customer language rule (tenant profile + client preference).
         text_to_send, lang_meta = outbound_text_for(
             repository, user.company_id, client_record, message)
+        if not _wa.is_configured():
+            # No Meta credentials on the server: hand the (translated) message
+            # back to the app, which opens WhatsApp pre-filled for the user.
+            return res(False, f"Otevírám WhatsApp se zprávou pro {client_name}.",
+                       status="client_fallback", action=intent,
+                       data={"phone": phone, "message": text_to_send,
+                             "contact": client_name,
+                             "translated": lang_meta.get("translated", False)})
         ok, mid, err = _wa.send_text(phone, text_to_send)
         if not ok:
-            return res(False, f"WhatsApp se nepodařilo odeslat: {err}",
-                       status="error", action=intent)
+            return res(False, f"Neodeslalo se přes server ({err}). Otevírám WhatsApp se zprávou pro {client_name}.",
+                       status="client_fallback", action=intent,
+                       data={"phone": phone, "message": text_to_send,
+                             "contact": client_name,
+                             "translated": lang_meta.get("translated", False)})
         # Log the outbound message into communications.
         repository.create_crm_record("communications", user.company_id,
                                      f"whatsapp - {client_name}",

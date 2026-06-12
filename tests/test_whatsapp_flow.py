@@ -120,6 +120,30 @@ def test_voice_read_messages_marks_read_and_translates(monkeypatch):
     assert "Žádné nové zprávy" in out2["message"]
 
 
+def test_voice_send_without_meta_falls_back_to_client(monkeypatch):
+    """No Meta credentials -> voice send hands phone+translated text to the app."""
+    client, headers = _bootstrap_logged_in_client(monkeypatch)
+    client.post("/api/v1/crm/clients", headers=headers,
+                json={"name": "Mr Smith", "phone": "+447911123456"})
+    monkeypatch.delenv("WHATSAPP_PHONE_NUMBER_ID", raising=False)
+    monkeypatch.delenv("WHATSAPP_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(tr, "is_configured", lambda: True)
+    monkeypatch.setattr(tr, "translate_text",
+                        lambda text, target, source=None: (True, f"[{target}] {text}", None))
+
+    out = client.post("/api/v1/voice/execute", headers=headers,
+                      json={"utterance": "pošli whatsapp Smith že přijedu v pátek"}).json()
+    if out["status"] == "needs_more_info":
+        out = client.post("/api/v1/voice/execute", headers=headers,
+                          json={"utterance": "Smith",
+                                "pending_action_id": out["pending_action_id"]}).json()
+    assert out["status"] == "client_fallback", out
+    assert out["executed"] is False
+    assert out["data"]["phone"] == "+447911123456"
+    assert out["data"]["message"].startswith("[en-GB] ")  # language rule still applied
+    assert "Otevírám WhatsApp" in out["message"]
+
+
 def test_voice_send_applies_customer_language_rule(monkeypatch):
     client, headers = _bootstrap_logged_in_client(monkeypatch)
     client.post("/api/v1/crm/clients", headers=headers,
