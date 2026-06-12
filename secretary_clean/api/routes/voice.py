@@ -33,12 +33,45 @@ from secretary_clean.core.models import (
     VoiceResolveResult,
 )
 from secretary_clean.core.repository import InMemorySecretaryRepository
+from secretary_clean.core import ai_intent
 from secretary_clean.core import voice_intents as vi
 from secretary_clean.core import voice_slots as vsl
 
 router = APIRouter(prefix="/voice", tags=["voice foundation"])
 
 PENDING_TTL_MIN = 30
+
+# Learned phrase -> intent, per tenant. The AI resolves an unknown phrasing once;
+# it is then recognized instantly (and consistently) next time. Best-effort cache
+# (rebuilds after a restart as phrases recur).
+_LEARNED: dict[str, dict[str, str]] = {}
+
+
+def _learn_key(text: str) -> str:
+    return " ".join(_strip_diacritics(text.lower()).split())
+
+
+def _recall_learned(company_id: str, text: str) -> str | None:
+    return _LEARNED.get(company_id, {}).get(_learn_key(text))
+
+
+def _learn(company_id: str, text: str, intent: str) -> None:
+    _LEARNED.setdefault(company_id, {})[_learn_key(text)] = intent
+
+
+def _entities_from_text(intent: str, text: str) -> dict:
+    """Light entity extraction for a learned intent when the deterministic
+    parser doesn't re-derive them (uses the same primitives)."""
+    d: dict = {}
+    person = vi.extract_person(text)
+    if person:
+        d["person"] = person
+    date_iso = vi.parse_date(text)
+    if date_iso:
+        d["date"] = date_iso
+        t = vi.parse_time(text)
+        d["start_at"] = f"{date_iso}T{t}:00Z" if t else f"{date_iso}T00:00:00Z"
+    return d
 _CANCEL_WORDS = ("zrus", "zrusit", "cancel", "nech to byt", "to staci", "stop", "nechci",
                  "zapomen na to", "uz ne", "konec", "omyl", "neplatny prikaz", "anuluj")
 
@@ -197,9 +230,25 @@ def execute_voice_command(
     else:
         parsed = vi.parse_intent(payload.utterance)
         intent = parsed.intent
+        data = dict(parsed.entities) if intent else {}
         if not intent:
-            return res(False, "Nerozuměl jsem příkazu.", status="error")
-        data = dict(parsed.entities)
+            # Deterministic parser failed → learned cache → AI intent detection.
+            learned = _recall_learned(user.company_id, payload.utterance)
+            if learned:
+                intent = learned
+                # Re-extract entities for this intent from the utterance.
+                reparsed = vi.parse_intent(payload.utterance)
+                data = dict(reparsed.entities) if reparsed.intent == intent else \
+                    _entities_from_text(intent, payload.utterance)
+            else:
+                ai = ai_intent.classify(payload.utterance, getattr(lang_ctx, "internal", None))
+                if ai:
+                    intent = ai["intent"]
+                    data = ai["entities"]
+                    _learn(user.company_id, payload.utterance, intent)  # learning
+            if not intent:
+                return res(False, "Nerozuměl jsem příkazu. Můžeš to říct jinak?",
+                           status="error")
 
     # ── Slot check: is required info still missing? ────────────────────────
     missing = vsl.missing_slots(intent, data)
