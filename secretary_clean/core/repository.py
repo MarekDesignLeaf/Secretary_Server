@@ -128,8 +128,12 @@ class InMemorySecretaryRepository:
             raise KeyError("Company not found")
         if any(user.role == Role.owner for user in self.users.values()):
             raise ValueError("First admin already exists")
+        # Recovery parity with Postgres: adopt a leftover user with this e-mail
+        # instead of ending up with two accounts on the same address.
+        leftover_id = next(
+            (uid for uid, u in self.users.items() if u.email == email.lower()), None)
         user = UserAccount(
-            id=str(uuid4()),
+            id=leftover_id or str(uuid4()),
             company_id=company_id,
             email=email.lower(),
             display_name=display_name,

@@ -266,27 +266,51 @@ class PostgresSecretaryRepository:
                 )
                 password_hash = hash_password(password)
 
-                cur.execute(
-                    """
-                    INSERT INTO clean_users
-                        (id, company_id, email, display_name, role, is_active,
-                         preferred_language_code, first_name, last_name, phone, password_hash)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        user_id,
-                        company_id,
-                        normalized_email,
-                        display_name,
-                        Role.owner.value,
-                        True,
-                        normalized_lang,
-                        first_name,
-                        last_name,
-                        phone,
-                        password_hash,
-                    ),
-                )
+                # Recovery: a previous half-install (or partial wipe) may have
+                # left a user row with this e-mail. A plain INSERT would hit the
+                # unique e-mail constraint and brick onboarding with a 500 —
+                # since no owner exists (checked above), ADOPT that row instead.
+                cur.execute("SELECT id FROM clean_users WHERE email = %s", (normalized_email,))
+                leftover = cur.fetchone()
+                if leftover:
+                    user_id = str(leftover["id"])
+                    cur.execute(
+                        """
+                        UPDATE clean_users SET
+                            company_id = %s, display_name = %s, role = %s,
+                            is_active = TRUE, preferred_language_code = %s,
+                            first_name = %s, last_name = %s, phone = %s,
+                            password_hash = %s, must_change_password = FALSE,
+                            updated_at = now()
+                        WHERE id = %s
+                        """,
+                        (company_id, display_name, Role.owner.value, normalized_lang,
+                         first_name, last_name, phone, password_hash, user_id),
+                    )
+                    logger.warning(
+                        "first-admin adopted leftover user %s (%s)", user_id, normalized_email)
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO clean_users
+                            (id, company_id, email, display_name, role, is_active,
+                             preferred_language_code, first_name, last_name, phone, password_hash)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            user_id,
+                            company_id,
+                            normalized_email,
+                            display_name,
+                            Role.owner.value,
+                            True,
+                            normalized_lang,
+                            first_name,
+                            last_name,
+                            phone,
+                            password_hash,
+                        ),
+                    )
             conn.commit()
 
         return self._build_user_account(user_id)

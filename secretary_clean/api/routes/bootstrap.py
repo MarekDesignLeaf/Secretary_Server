@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import logging
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -95,6 +96,14 @@ def create_first_install(
         return repository.create_first_install(payload, activity_defaults=activity_defaults)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — onboarding must report, not blank-500
+        logging.getLogger(__name__).exception("first-install failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"First install failed: {type(exc).__name__}: {exc}",
+        ) from exc
 
 
 @router.post("/wipe")
