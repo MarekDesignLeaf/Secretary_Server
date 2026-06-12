@@ -27,6 +27,7 @@ INTENT_CATALOGUE: dict[str, tuple[str, list[str]]] = {
     "client.find": ("find a client/contact and read their details", ["query"]),
     "client.set_address": ("set a client's address from their message", ["person"]),
     "contacts.import": ("import phone contacts into the CRM", []),
+    "work_report.start": ("start a work report (what was done on a job)", []),
     "job.create": ("create a job/work order for a client", ["title", "person"]),
     "job.list": ("list active jobs", []),
     "job.change_status": ("change a job's status", ["status", "person"]),

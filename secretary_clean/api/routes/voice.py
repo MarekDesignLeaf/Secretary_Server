@@ -282,6 +282,13 @@ def execute_voice_command(
         repository.update_pending_action(pending)
 
     # ── EXECUTE (all required info present) ────────────────────────────────
+    if intent == "work_report.start":
+        # The work report uses the multi-turn voice SESSION flow; the app picks
+        # this up (resolved_intent) and starts /voice/session.
+        return res(True, "Spouštím pracovní výkaz. Pověz mi, co se dělalo.",
+                   status="client_action", action="work_report.start",
+                   data={"client_action": "start_work_report"})
+
     if intent == "calendar.create":
         start = datetime.fromisoformat(data["start_at"].replace("Z", "+00:00"))
         person = data.get("person")
