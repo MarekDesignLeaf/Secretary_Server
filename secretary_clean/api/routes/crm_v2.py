@@ -473,6 +473,138 @@ def update_invoice(
     return shapes.invoice_out(record, _client_names(repository, user.company_id))
 
 
+def _invoice_items(repository, record, company_id: str) -> list[dict]:
+    """line_items with ids; from-work-report items predate ids, so backfill
+    them once and persist (delete-by-id needs a stable id)."""
+    items = list((record.data or {}).get("line_items") or [])
+    changed = False
+    for item in items:
+        if not item.get("id"):
+            item["id"] = str(uuid4())
+            changed = True
+    if changed:
+        repository.update_crm_record(
+            "invoices", record.id, company_id, CRMUpdateRequest(data={"line_items": items}))
+    return items
+
+
+def _items_total(items: list[dict]) -> float:
+    return round(sum(float(i.get("subtotal") or 0.0) for i in items), 2)
+
+
+@router.get("/invoices/{invoice_id}/items")
+def list_invoice_items(
+    invoice_id: str,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "invoices", invoice_id, user.company_id)
+    return _invoice_items(repository, record, user.company_id)
+
+
+@router.post("/invoices/{invoice_id}/items", status_code=201)
+def add_invoice_item(
+    invoice_id: str,
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "invoices", invoice_id, user.company_id)
+    quantity = float(payload.get("quantity") or 1)
+    unit_price = float(payload.get("unit_price") or 0)
+    item = {
+        "id": str(uuid4()),
+        "description": str(payload.get("description") or "Item"),
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "subtotal": round(float(payload.get("total") or quantity * unit_price), 2),
+    }
+    items = _invoice_items(repository, record, user.company_id)
+    items.append(item)
+    grand_total = _items_total(items)
+    repository.update_crm_record(
+        "invoices", invoice_id, user.company_id,
+        CRMUpdateRequest(data={"line_items": items, "grand_total": grand_total}))
+    repository.log_activity(
+        user.company_id, user.id, "invoice", invoice_id, "item_added",
+        f"Invoice item: {item['description']} ({item['subtotal']})", source_channel="app")
+    return {**item, "invoice_grand_total": grand_total}
+
+
+@router.delete("/invoices/{invoice_id}/items/{item_id}")
+def delete_invoice_item(
+    invoice_id: str,
+    item_id: str,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "invoices", invoice_id, user.company_id)
+    items = _invoice_items(repository, record, user.company_id)
+    remaining = [i for i in items if i.get("id") != item_id]
+    if len(remaining) == len(items):
+        raise HTTPException(status_code=404, detail="Invoice item not found")
+    grand_total = _items_total(remaining)
+    repository.update_crm_record(
+        "invoices", invoice_id, user.company_id,
+        CRMUpdateRequest(data={"line_items": remaining, "grand_total": grand_total}))
+    repository.log_activity(
+        user.company_id, user.id, "invoice", invoice_id, "item_deleted",
+        f"Invoice item removed ({item_id})", source_channel="app")
+    return {"status": "deleted", "invoice_grand_total": grand_total}
+
+
+@router.get("/invoices/{invoice_id}/payments")
+def list_invoice_payments(
+    invoice_id: str,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "invoices", invoice_id, user.company_id)
+    return (record.data or {}).get("payments") or []
+
+
+@router.post("/invoices/{invoice_id}/payments", status_code=201)
+def add_invoice_payment(
+    invoice_id: str,
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Payment status semantics ported from commit 440aa04:
+    total paid >= grand_total -> 'uhrazena', partial -> 'castecne_uhrazena'."""
+    record = _get_or_404(repository, "invoices", invoice_id, user.company_id)
+    amount = float(payload.get("amount") or 0)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be > 0")
+    payment = {
+        "id": str(uuid4()),
+        "amount": amount,
+        "payment_date": str(payload.get("payment_date")
+                            or datetime.now(timezone.utc).date().isoformat()),
+        "payment_method": str(payload.get("payment_method") or "bank_transfer"),
+        "reference": payload.get("reference"),
+        "notes": payload.get("notes"),
+        "created_by": user.id,
+    }
+    payments = list((record.data or {}).get("payments") or [])
+    payments.append(payment)
+    total_paid = round(sum(float(p.get("amount") or 0) for p in payments), 2)
+    d = record.data or {}
+    grand_total = float(d.get("grand_total") or d.get("total") or 0.0)
+    status = None
+    if grand_total > 0 and total_paid >= grand_total:
+        status = "uhrazena"
+    elif total_paid > 0:
+        status = "castecne_uhrazena"
+    repository.update_crm_record(
+        "invoices", invoice_id, user.company_id,
+        CRMUpdateRequest(status=status, data={"payments": payments}))
+    repository.log_activity(
+        user.company_id, user.id, "invoice", invoice_id, "payment",
+        f"Payment {amount:.2f} ({payment['payment_method']})", source_channel="app")
+    return {"id": payment["id"], "amount": amount, "total_paid": total_paid}
+
+
 # ---------------------------------------------------------------------------
 # Quotes
 # ---------------------------------------------------------------------------
