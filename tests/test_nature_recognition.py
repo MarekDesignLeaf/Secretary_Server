@@ -50,16 +50,57 @@ def test_plant_identify_with_vision(monkeypatch):
     assert hist and hist[0]["display_name"] == "Levandule"
 
 
-def test_mushroom_always_carries_safety_warning(monkeypatch):
+def test_mushroom_uses_kindwise_and_warns(monkeypatch):
     client, headers = _bootstrap_logged_in_client(monkeypatch)
-    monkeypatch.setattr(nr, "is_configured", lambda: True)
-    monkeypatch.setattr(nr, "_vision", lambda *a, **k: {
-        "display_name": "Hřib smrkový", "scientific_name": "Boletus edulis",
-        "probability": 0.8, "spoken_summary": "Vypadá to na hřib smrkový."})
+    monkeypatch.setenv("MUSHROOM_ID_API_KEY", "test-key")
+    monkeypatch.setattr(nr, "is_configured", lambda: False)  # no OpenAI -> guidance==spoken
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"result": {"classification": {"suggestions": [{
+                "name": "Boletus edulis", "probability": 0.82,
+                "details": {
+                    "common_names": ["Hřib smrkový"],
+                    "edibility": "edible", "psychoactive": True,
+                    "look_alikes": ["Tylopilus felleus"],
+                    "description": "Choice edible bolete.",
+                    "taxonomy": {"family": "Boletaceae", "genus": "Boletus"},
+                }}]}}}
+
+    import secretary_clean.core.nature_recognition as mod
+    captured = {}
+    def _post(url, **kw):
+        captured["url"] = url
+        captured["api_key"] = kw["headers"]["Api-Key"]
+        return _Resp()
+    monkeypatch.setattr(mod.httpx if hasattr(mod, "httpx") else __import__("httpx"),
+                        "post", _post, raising=False)
+    import httpx
+    monkeypatch.setattr(httpx, "post", _post)
+
     res = client.post("/api/v1/mushrooms/identify", headers=headers,
                       files={"images": _img()}, data={"language": "cs"}).json()
-    assert "VAROVÁNÍ" in res["spoken_summary"]
-    assert res["edibility"]  # never asserts "safe"
+    assert "kindwise" in captured["url"]
+    assert captured["api_key"] == "test-key"
+    assert res["database"] == "mushroom.id"
+    assert res["display_name"] == "Hřib smrkový"
+    assert res["scientific_name"] == "Boletus edulis"
+    assert res["edibility"] == "edible"          # real data from Kindwise
+    assert res["psychoactive"] is True
+    assert "Boletaceae" == res["family"]
+    # Safety: spoken summary always warns, never confirms edibility.
+    assert "nepotvrzuj" in res["spoken_summary"].lower()
+
+
+def test_mushroom_unconfigured_is_graceful(monkeypatch):
+    client, headers = _bootstrap_logged_in_client(monkeypatch)
+    monkeypatch.delenv("MUSHROOM_ID_API_KEY", raising=False)
+    monkeypatch.delenv("KINDWISE_MUSHROOM_API_KEY", raising=False)
+    res = client.post("/api/v1/mushrooms/identify", headers=headers,
+                      files={"images": _img()}, data={"language": "cs"})
+    assert res.status_code == 200
+    assert "MUSHROOM_ID_API_KEY" in res.json()["spoken_summary"]
 
 
 def test_health_assessment(monkeypatch):

@@ -89,7 +89,9 @@ async def identify_mushroom(
     location_source: str | None = Form(default=None),
     user: UserAccount = Depends(current_user),
 ):
-    result = nr.identify_mushroom(await _first_image(images), language)
+    # Kindwise mushroom.id benefits from multiple angles (whole/underside/stem).
+    image_bytes = [await img.read() for img in images[:5]]
+    result = nr.identify_mushroom(image_bytes, language)
     _record(user, "mushroom", result, captured_at, latitude, longitude)
     return result
 
