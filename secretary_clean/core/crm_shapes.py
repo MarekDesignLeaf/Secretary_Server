@@ -171,7 +171,8 @@ def invoice_out(r: CRMRecord, client_names: dict[str, str] | None = None) -> dic
         "client_id": cid,
         "client_name": (d.get("client_name")
                         or (client_names or {}).get(str(cid) if cid else "")),
-        "grand_total": float(d.get("grand_total") or 0.0),
+        # from-work-report invoices store the amount under "total"
+        "grand_total": float(d.get("grand_total") or d.get("total") or 0.0),
         "status": r.status or "draft",
         "due_date": d.get("due_date"),
         "created_at": iso(r.created_at),

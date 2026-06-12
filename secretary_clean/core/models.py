@@ -480,6 +480,9 @@ class WorkReportWorker(BaseModel):
     worker_name: str
     hours: float = 0
     hourly_rate: float = 0
+    # Internal cost per hour; missing cost counts as 0 — same semantics as the
+    # original profit calculation in commit 440aa04.
+    hourly_cost: float = 0
 
 
 class WorkReportEntry(BaseModel):
