@@ -22,6 +22,7 @@ from secretary_clean.api.routes import (
     crm_v2,
     google_calendar,
     language,
+    nature,
     tenant_pricing,
     tenant_rates,
     translate,
@@ -170,6 +171,7 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(admin.router, prefix="/api/v1")
     app.include_router(whatsapp.router, prefix="/api/v1")
     app.include_router(translate.router, prefix="/api/v1")
+    app.include_router(nature.router, prefix="/api/v1")
     return app
 
 
