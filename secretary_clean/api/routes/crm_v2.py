@@ -650,6 +650,57 @@ def update_quote(
     return shapes.quote_out(record, _client_names(repository, user.company_id))
 
 
+@router.post("/quotes/{quote_id}/items", status_code=201)
+def add_quote_item(
+    quote_id: str,
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "quotes", quote_id, user.company_id)
+    quantity = float(payload.get("quantity") or 1)
+    unit_price = float(payload.get("unit_price") or 0)
+    item = {
+        "id": str(uuid4()),
+        "description": str(payload.get("description") or "Item"),
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "subtotal": round(float(payload.get("total") or quantity * unit_price), 2),
+    }
+    items = list((record.data or {}).get("items") or [])
+    items.append(item)
+    grand_total = _items_total(items)
+    updated = repository.update_crm_record(
+        "quotes", quote_id, user.company_id,
+        CRMUpdateRequest(data={"items": items, "grand_total": grand_total}))
+    repository.log_activity(
+        user.company_id, user.id, "quote", quote_id, "item_added",
+        f"Quote item: {item['description']} ({item['subtotal']})", source_channel="app")
+    return shapes.quote_out(updated, _client_names(repository, user.company_id))
+
+
+@router.delete("/quotes/{quote_id}/items/{item_id}")
+def delete_quote_item(
+    quote_id: str,
+    item_id: str,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "quotes", quote_id, user.company_id)
+    items = list((record.data or {}).get("items") or [])
+    remaining = [i for i in items if i.get("id") != item_id]
+    if len(remaining) == len(items):
+        raise HTTPException(status_code=404, detail="Quote item not found")
+    grand_total = _items_total(remaining)
+    updated = repository.update_crm_record(
+        "quotes", quote_id, user.company_id,
+        CRMUpdateRequest(data={"items": remaining, "grand_total": grand_total}))
+    repository.log_activity(
+        user.company_id, user.id, "quote", quote_id, "item_deleted",
+        f"Quote item removed ({item_id})", source_channel="app")
+    return shapes.quote_out(updated, _client_names(repository, user.company_id))
+
+
 @router.post("/quotes/{quote_id}/approve")
 def approve_quote(
     quote_id: str,
