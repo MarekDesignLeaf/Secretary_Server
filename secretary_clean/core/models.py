@@ -485,6 +485,19 @@ class WorkReportWorker(BaseModel):
     hourly_cost: float = 0
 
 
+class WorkReportActivity(BaseModel):
+    """A catalogue activity performed, with its price. Quantity is in the unit
+    of the pricing method (hours, m², visits, items…). The app sends the rate it
+    showed the user (tenant override or Oxfordshire default); the backend falls
+    back to the tenant pricing override when rate is missing."""
+    activity_code: str
+    name: str | None = None
+    quantity: float = 1
+    rate: float = 0
+    pricing_method: str | None = None
+    unit: str | None = None
+
+
 class WorkReportEntry(BaseModel):
     """A single line item in a work report (type of work performed)."""
     entry_type: str = "work"
@@ -516,6 +529,7 @@ class WorkReportCreate(BaseModel):
     notes: str | None = None
     input_type: str = "manual"
     workers: list[WorkReportWorker] = Field(default_factory=list)
+    activities: list[WorkReportActivity] = Field(default_factory=list)
     entries: list[WorkReportEntry] = Field(default_factory=list)
     materials: list[WorkReportMaterial] = Field(default_factory=list)
     waste: list[WorkReportWaste] = Field(default_factory=list)

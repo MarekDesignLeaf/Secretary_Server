@@ -815,6 +815,7 @@ class InMemorySecretaryRepository:
             raise ValueError("Work report already invoiced")
 
         workers_data = wr.data.get("workers", [])
+        activities = wr.data.get("activities", [])
         entries = wr.data.get("entries", [])
         materials = wr.data.get("materials", [])
         waste = wr.data.get("waste", [])
@@ -822,6 +823,18 @@ class InMemorySecretaryRepository:
         line_items = []
         calculated_total = 0.0
 
+        # ── activities (catalogue work + its set price) ──────────────────────
+        from secretary_clean.core import invoicing as _inv
+        _rate_by_code: dict[str, float] = {}
+        try:
+            for tp in self.list_tenant_pricing(company_id):
+                if tp.rate and tp.rate > 0:
+                    _rate_by_code[tp.activity_code] = float(tp.rate)
+        except Exception:
+            pass
+        _act_items, _act_total, _act_warnings = _inv.activity_line_items(activities, _rate_by_code)
+        line_items.extend(_act_items)
+        calculated_total += _act_total
 
         # ── resolve tenant default labour rate ───────────────────────────────
         tenant_labour_rate: float | None = None
@@ -841,7 +854,7 @@ class InMemorySecretaryRepository:
         except Exception:
             pass
 
-        pricing_warnings: list[str] = []
+        pricing_warnings: list[str] = list(_act_warnings)
         # Workers (from voice or manual work reports)
         for w in workers_data:
             hours = float(w.get("hours", 0))
