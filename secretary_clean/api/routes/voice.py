@@ -129,12 +129,32 @@ def execute_voice_command(
     questions when required information is missing (Phase A5.2)."""
     lang_ctx = _lang_ctx(repository, user, payload.client_id)
 
+    # Voice responses are authored in Czech. The team language can be cs/en/pl;
+    # for en/pl we translate the response (and follow-up question) so the
+    # assistant answers in the user's language. Czech stays native & instant.
+    _app_lang = (user.preferred_language_code or "").split("-")[0].lower()
+    if _app_lang not in ("cs", "en", "pl"):
+        _prof = repository.get_tenant_operating_profile(user.company_id)
+        _app_lang = (getattr(_prof, "default_internal_language_code", "") or "cs").split("-")[0].lower()
+
+    def _localize(msg):
+        if not msg or _app_lang == "cs":
+            return msg
+        target = {"en": "English", "pl": "Polish"}.get(_app_lang)
+        if not target:
+            return msg
+        from secretary_clean.core import translation as _tr
+        if not _tr.is_configured():
+            return msg
+        ok, out, _err = _tr.translate_text(msg, target, "Czech")
+        return out if ok and out else msg
+
     def res(executed, message, status="executed", action=None, entity_id=None,
             data=None, needs_confirm=False, missing=None, question=None, pending_id=None):
         return VoiceExecuteResult(
             executed=executed, resolved_intent=action, requires_confirmation=needs_confirm,
-            message=message, action=action, entity_id=entity_id, data=data or {},
-            status=status, missing_fields=missing or [], question=question,
+            message=_localize(message), action=action, entity_id=entity_id, data=data or {},
+            status=status, missing_fields=missing or [], question=_localize(question),
             pending_action_id=pending_id, language_context=lang_ctx,
         )
 
