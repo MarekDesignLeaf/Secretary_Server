@@ -26,6 +26,7 @@ from secretary_clean.api.routes import (
     users,
     voice,
     voice_session,
+    whatsapp,
     work_reports,
 )
 from secretary_clean.api.routes.bootstrap import version_router
@@ -164,6 +165,7 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(activities_compat.router, prefix="/api/v1")
     app.include_router(assistant.router, prefix="/api/v1")
     app.include_router(admin.router, prefix="/api/v1")
+    app.include_router(whatsapp.router, prefix="/api/v1")
     return app
 
 
