@@ -281,6 +281,56 @@ def execute_voice_command(
                else f"Vytvořila jsem úkol{when}: {title}.")
         return res(True, msg, action=intent, entity_id=rec.id, data={"task": rec.model_dump(mode="json")})
 
+    if intent == "contacts.import":
+        # Device access lives on the phone — tell the app to read contacts and
+        # POST them to /crm/clients/sync-contacts. Backend stays source of truth.
+        return res(True, "Načítám kontakty z telefonu a importuji je do CRM…",
+                   status="client_action", action=intent,
+                   data={"client_action": "import_contacts"})
+
+    if intent == "client.find":
+        query = (data.get("query") or "").strip()
+        if not query:
+            return res(False, "Koho mám najít? Řekni jméno.",
+                       status="needs_more_info", action=intent,
+                       missing=["query"], question="Koho mám najít?")
+        q = _strip_diacritics(query.lower())
+        clients = [c for c in repository.list_crm_records("clients", user.company_id)
+                   if c.status != "deleted"]
+        matched = [c for c in clients if q in _strip_diacritics((c.name or "").lower())
+                   or any(qt in _strip_diacritics((c.name or "").lower()) for qt in q.split())]
+        if not matched:
+            return res(False, f"Kontakt {query} jsem nenašla.", status="error", action=intent)
+        target = matched[0]
+        d = target.data or {}
+        phone = d.get("phone") or d.get("phone_primary")
+        address = d.get("billing_address_line1") or d.get("address")
+        # Bound records: open tasks / active jobs for this client.
+        def _for_client(module, statuses_done):
+            out = []
+            for r in repository.list_crm_records(module, user.company_id):
+                rd = r.data or {}
+                cid = str(rd.get("client_id") or rd.get("clientId") or "")
+                if cid == target.id and (r.status or "open") not in statuses_done:
+                    out.append(r)
+            return out
+        open_tasks = _for_client("tasks", ("done", "completed", "deleted"))
+        active_jobs = _for_client("jobs", ("completed", "cancelled", "deleted"))
+        parts = [target.name]
+        if phone:
+            parts.append(f"telefon {phone}")
+        if address:
+            parts.append(f"adresa {address}")
+        if open_tasks:
+            parts.append(f"{len(open_tasks)} otevřených úkolů")
+        if active_jobs:
+            parts.append(f"{len(active_jobs)} aktivních zakázek")
+        msg = ", ".join(parts) + ". Můžeš říct: zavolej, napiš whatsapp, naviguj, nebo vytvoř úkol."
+        return res(True, msg, action=intent, entity_id=target.id,
+                   data={"client": target.model_dump(mode="json"),
+                         "phone": phone, "address": address,
+                         "open_tasks": len(open_tasks), "active_jobs": len(active_jobs)})
+
     if intent == "client.set_address":
         from secretary_clean.core import address_extract
         person = (data.get("person") or "").strip().lower()

@@ -197,6 +197,14 @@ _SEND_WHATSAPP = ("pošli whatsapp", "posli whatsapp", "napiš na whatsapp", "na
                   "odpověz jí", "odpovez ji", "odepiš", "odepis", "reply on whatsapp")
 _WEATHER = ("počasí", "pocasi", "předpověď", "predpoved", "bude pršet", "bude prset",
             "weather", "forecast", "jaké bude venku", "jake bude venku", "kolik je venku")
+_FIND_CLIENT = ("najdi kontakt", "najdi klienta", "vyhledej kontakt", "vyhledej klienta",
+                "vyhledej", "najdi mi", "kdo je", "informace o klientovi", "info o klientovi",
+                "detail klienta", "ukaž klienta", "ukaz klienta", "find contact", "find client",
+                "search contact", "look up", "who is")
+_IMPORT_CONTACTS = ("importuj kontakty", "naimportuj kontakty", "import kontaktů",
+                    "import kontaktu", "načti kontakty", "nacti kontakty",
+                    "synchronizuj kontakty", "stáhni kontakty", "stahni kontakty",
+                    "import contacts", "sync contacts", "import phone contacts")
 _SET_ADDRESS = ("doplň adresu", "dopln adresu", "ulož adresu", "uloz adresu",
                 "nastav adresu", "zapiš adresu", "zapis adresu", "adresa z zprávy",
                 "adresu ze zprávy", "adresu ze zpravy", "doplň adresu klientovi",
@@ -388,6 +396,33 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
                       "date": date_iso, "time": hhmm, "start_at": start},
             requires_confirmation=True,
             reason="Task creation; confirmation required.",
+        )
+
+    # ----- IMPORT CONTACTS (device -> CRM; app reads device, server stores) -----
+    if _has(low, _IMPORT_CONTACTS):
+        return ParsedIntent(
+            intent="contacts.import",
+            confidence=0.85,
+            entities={},
+            requires_confirmation=False,
+            reason="Import device contacts into CRM.",
+        )
+
+    # ----- FIND CLIENT / CONTACT (read-only search + read-back) -----
+    if _has(low, _FIND_CLIENT):
+        # Name = text after the matched search phrase.
+        query = None
+        for kw in _FIND_CLIENT:
+            pos = low.find(kw)
+            if pos >= 0:
+                query = utterance[pos + len(kw):].strip(" :,-?")
+                break
+        return ParsedIntent(
+            intent="client.find",
+            confidence=0.8,
+            entities={"query": query or extract_person(utterance)},
+            requires_confirmation=False,
+            reason="Read-only client lookup.",
         )
 
     # ----- CLIENT SET ADDRESS (from latest inbound message) -----

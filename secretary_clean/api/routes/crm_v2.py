@@ -216,6 +216,40 @@ def add_client_note(
     return {"ok": True, "notes": [shapes.note_out(n) for n in _notes_list(record.data)]}
 
 
+@router.post("/clients/sync-contacts")
+def sync_contacts(
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Bulk-import device contacts as clients. Body: {contacts:[{name,phone,email}]}.
+    Skips duplicates (by phone/email/name); never creates a second copy."""
+    contacts = payload.get("contacts") or []
+    imported, skipped = 0, 0
+    created_ids = []
+    for c in contacts:
+        name = str(c.get("name") or "").strip()
+        phone = str(c.get("phone") or "").strip()
+        if not name and not phone:
+            continue
+        email = str(c.get("email") or "").strip() or None
+        if repository.find_duplicate_client(user.company_id, name=name or None,
+                                            phone=phone or None, email=email) is not None:
+            skipped += 1
+            continue
+        rec = repository.create_crm_record(
+            "clients", user.company_id, name or phone,
+            {"source": "import", "phone": phone or None, "email": email})
+        created_ids.append(rec.id)
+        imported += 1
+    if imported:
+        repository.log_activity(
+            user.company_id, user.id, "client", "", "import_contacts",
+            f"Imported {imported} contacts ({skipped} skipped)", source_channel="app")
+    return {"imported": imported, "skipped": skipped,
+            "total": len(contacts), "created_ids": created_ids}
+
+
 def _client_rates_payload(record) -> dict:
     d = record.data or {}
     overrides = d.get("service_rate_overrides") or {}
