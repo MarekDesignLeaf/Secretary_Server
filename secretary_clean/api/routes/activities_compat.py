@@ -23,6 +23,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from secretary_clean.api.deps import current_user, get_repository
+from secretary_clean.catalogue import default_rates
 from secretary_clean.core.models import TenantActivityOverrideRequest, UserAccount
 from secretary_clean.core.repository import InMemorySecretaryRepository
 
@@ -145,20 +146,27 @@ def get_tenant_activity_pricing(
     """
     existing = {p.activity_code: p for p in repository.list_tenant_pricing(user.company_id)}
 
-    # Filter by the company's industry_group so the list matches what the user sees
-    # in the company profile. Fall back to all industries if not set.
-    profile = repository.get_tenant_operating_profile(user.company_id)
-    industry_filter = profile.industry_group if profile else None
+    # Multi-industry: the company can have ANY number of industries (Phase A1),
+    # so filter by the full set, not the single legacy industry_group.
+    # No industries set -> show everything.
+    try:
+        industry_codes = {i.industry_code for i in repository.get_tenant_industries(user.company_id)}
+    except Exception:
+        industry_codes = set()
 
     results = []
     for ind in request.app.state.catalogue.industries:
-        if industry_filter and ind.code != industry_filter:
+        if industry_codes and ind.code not in industry_codes:
             continue
         for sub in ind.subtypes:
             if subtype_code and sub.code != subtype_code:
                 continue
             for act in sub.activities:
                 override = existing.get(act.code)
+                # No override -> system default Oxfordshire-area rate, so every
+                # activity comes pre-priced; saving creates an override.
+                preset = default_rates.default_rate(
+                    ind.code, act.name, act.default_pricing_method_code)
                 results.append({
                     "template_id": _cid(act.code),
                     "activity_code": act.code,
@@ -166,7 +174,11 @@ def get_tenant_activity_pricing(
                     "industry_code": ind.code,
                     "subtype_code": sub.code,
                     "pricing_method": override.selected_pricing_method_code if override else act.default_pricing_method_code,
-                    "rate": (override.rate if override.rate is not None else 0.0) if override else 0.0,
+                    "rate": (override.rate if override.rate is not None else 0.0) if override else preset,
+                    "default_rate": preset,
+                    "rate_unit": default_rates.RATE_UNITS.get(
+                        (override.selected_pricing_method_code if override
+                         else act.default_pricing_method_code), "GBP"),
                     "custom_name": override.custom_name or "" if override else "",
                     "is_active": override.is_active if override else True,
                     "enabled_additional_charge_codes": override.enabled_additional_charge_codes if override else [],
