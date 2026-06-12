@@ -115,6 +115,13 @@ COMMAND_TREE = [
             ("comm.list", _t("history", "historie komunikace", "historia"), True),
         ]),
     ]),
+    ("pocasi", _t("Weather", "Počasí", "Pogoda"), Permission.voice_execute, [
+        ("predpoved", _t("Forecast", "Předpověď", "Prognoza"), [
+            ("weather.get", _t("weather today/tomorrow/week/hourly, any place",
+                               "počasí dnes/zítra/na týden/hodinová, i jiná lokalita",
+                               "pogoda dziś/jutro/tydzień/godzinowa"), False),
+        ]),
+    ]),
     ("material", _t("Materials & stock", "Materiál a sklad", "Materiały"), Permission.crm_manage, [
         ("objednavky", _t("Ordering", "Objednávky", "Zamówienia"), [
             ("material.order", _t("order material", "objednej materiál", "zamów materiał"), False),

@@ -261,6 +261,49 @@ def execute_voice_command(
                else f"Vytvořila jsem úkol{when}: {title}.")
         return res(True, msg, action=intent, entity_id=rec.id, data={"task": rec.model_dump(mode="json")})
 
+    if intent == "weather.get":
+        from secretary_clean.core import weather as _w
+        place = (data.get("place") or "").strip()
+        if place:
+            geo = _w.geocode_place(place)
+            if not geo:
+                return res(False, f"Nenašla jsem místo {place}.", status="error", action=intent)
+        else:
+            geo = _w.geocode_place(_w.DEFAULT_PLACE) or {
+                "name": _w.DEFAULT_PLACE, "latitude": 51.752, "longitude": -1.2577}
+        loc = geo["name"]
+        try:
+            if data.get("hourly"):
+                rows = _w.fetch_hourly(geo["latitude"], geo["longitude"], hours=12)
+                parts = []
+                for h in rows[:6]:
+                    hh = h["time"][11:16]
+                    pr = f", {h['precip_prob']}% srážky" if h.get("precip_prob") else ""
+                    parts.append(f"{hh} {h['temp']}°C {_w.describe_code(h['code'])}{pr}")
+                msg = f"Hodinová předpověď, {loc}: " + "; ".join(parts) + "."
+            elif data.get("week"):
+                import datetime as _dt
+                rows = _w.fetch_daily(geo["latitude"], geo["longitude"], days=7)
+                names = ["pondělí", "úterý", "středa", "čtvrtek", "pátek", "sobota", "neděle"]
+                parts = []
+                for d in rows:
+                    y, m, dd = (int(x) for x in d["date"].split("-"))
+                    wd = names[_dt.date(y, m, dd).weekday()]
+                    pr = f", {d['precip_prob']}% déšť" if d.get("precip_prob") else ""
+                    parts.append(f"{wd} {d['tmin']} až {d['tmax']}°C {_w.describe_code(d['code'])}{pr}")
+                msg = f"Týdenní předpověď, {loc}: " + "; ".join(parts) + "."
+            else:
+                rows = _w.fetch_daily(geo["latitude"], geo["longitude"], days=7)
+                target = data.get("date")
+                day = next((d for d in rows if d["date"] == target), rows[0]) if target else rows[0]
+                label = target if target else "Dnes"
+                pr = f", {day['precip_prob']}% pravděpodobnost srážek" if day.get("precip_prob") else ""
+                msg = (f"{label} v {loc}: {_w.describe_code(day['code'])}, "
+                       f"{day['tmin']} až {day['tmax']}°C, vítr {day['wind']} km/h{pr}.")
+        except Exception:  # noqa: BLE001
+            return res(False, "Počasí se teď nepodařilo načíst.", status="error", action=intent)
+        return res(True, msg, action=intent, data={"location": loc})
+
     if intent == "calendar.list":
         start = end = None
         rng = data.get("range")

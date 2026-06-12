@@ -195,6 +195,8 @@ _SEND_WHATSAPP = ("pošli whatsapp", "posli whatsapp", "napiš na whatsapp", "na
                   "zprava pres whatsapp", "pošli přes whatsapp", "posli pres whatsapp",
                   "odpověz na whatsapp", "odpovez na whatsapp", "odpověz mu", "odpovez mu",
                   "odpověz jí", "odpovez ji", "odepiš", "odepis", "reply on whatsapp")
+_WEATHER = ("počasí", "pocasi", "předpověď", "predpoved", "bude pršet", "bude prset",
+            "weather", "forecast", "jaké bude venku", "jake bude venku", "kolik je venku")
 _READ_WHATSAPP = ("přečti zprávy", "precti zpravy", "přečti mi zprávy", "precti mi zpravy",
                   "přečti zprávu", "precti zpravu", "přečti mi zprávu", "precti mi zpravu",
                   "přečti novou", "precti novou", "nová zpráva", "nova zprava",
@@ -243,6 +245,26 @@ def _has(low: str, words) -> bool:
 def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
     """Main entry point. Deterministically classify an utterance."""
     low = " ".join(utterance.lower().split())
+
+    # ----- WEATHER (read-only; before calendar so "počasí zítra" wins) -----
+    if _has(low, _WEATHER):
+        hourly = any(w in low for w in ("hodinov", "po hodinach", "po hodinách", "hourly"))
+        week = any(w in low for w in ("tyden", "týden", "week", "vikend", "víkend"))
+        place = None
+        m = re.search(
+            r"\b(?:v|ve|pro)\s+([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ][\wáčďéěíňóřšťúůýž\-]*"
+            r"(?:\s+[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ][\wáčďéěíňóřšťúůýž\-]*)?)",
+            utterance)
+        if m:
+            place = m.group(1).strip()
+        return ParsedIntent(
+            intent="weather.get",
+            confidence=0.85,
+            entities={"date": parse_date(low, base), "week": week,
+                      "hourly": hourly, "place": place},
+            requires_confirmation=False,
+            reason="Read-only weather query.",
+        )
 
     # ----- CALENDAR SYNC (Google) - check first, very specific -----
     if _has(low, _SYNC_CAL):
