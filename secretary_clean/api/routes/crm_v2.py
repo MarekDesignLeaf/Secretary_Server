@@ -9,10 +9,13 @@ odpovědi, viz konec souboru. Timeline a calendar-feed jsou reálné.
 """
 from __future__ import annotations
 
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 
 from secretary_clean.api.deps import current_user, get_repository, require_permission
 from secretary_clean.core import crm_shapes as shapes
@@ -911,6 +914,33 @@ def list_photos(user: UserAccount = Depends(current_user)):
 @router.get("/notifications")
 def list_notifications(user: UserAccount = Depends(current_user)):
     return []
+
+
+@router.get("/export/csv")
+def export_csv(
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Clients export, same columns as the 440aa04 original."""
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=[
+        "id", "client_code", "display_name", "email_primary", "phone_primary", "status"])
+    writer.writeheader()
+    for r in sorted(_records(repository, "clients", user.company_id),
+                    key=lambda r: (r.name or "").lower()):
+        d = r.data or {}
+        writer.writerow({
+            "id": r.id,
+            "client_code": d.get("client_code") or "",
+            "display_name": r.name,
+            "email_primary": d.get("email_primary") or d.get("email") or "",
+            "phone_primary": d.get("phone_primary") or d.get("phone") or "",
+            "status": r.status or "",
+        })
+    filename = f"export_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+    return Response(
+        content=out.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 @router.get("/calendar-feed")
