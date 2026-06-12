@@ -19,10 +19,37 @@ from secretary_clean.core.repository import InMemorySecretaryRepository
 
 router = APIRouter(prefix="/tenant", tags=["tenant rates"])
 
+# Built-in defaults: average market rates for the Oxfordshire area, carried
+# over from the original backend (commit 440aa04 SERVICE_RATE_DEFAULTS, GBP).
+_BUILTIN_DEFAULT_RATES = [
+    ("hourly_rate", "Hodinová sazba", 27.0),
+    ("garden_maintenance", "Údržba zahrady", 27.0),
+    ("hedge_trimming", "Stříhání živých plotů", 31.0),
+    ("arborist_works", "Arboristické práce", 34.0),
+    ("garden_waste_bulkbag", "Odvoz zahradního odpadu (bulk bag)", 55.0),
+    ("minimum_charge", "Minimální účtovaná částka", 150.0),
+]
+
 
 def _company_currency(repository, company_id: str) -> str:
     company = repository.get_company(company_id)
     return getattr(company, "default_currency", None) or "GBP"
+
+
+def _seed_builtins_if_empty(repository, company_id: str) -> None:
+    """A tenant with no rate types gets the built-in set. Without this the
+    Settings rates section has nothing to edit and its Save button stays
+    disabled (smoke test FAIL: 'sazby nelze ukládat')."""
+    if repository.list_tenant_service_rates(company_id):
+        return
+    currency = _company_currency(repository, company_id)
+    for rate_type, description, rate in _BUILTIN_DEFAULT_RATES:
+        try:
+            repository.create_tenant_service_rate(
+                company_id, rate_type, description=description,
+                rate=rate, currency=currency, is_builtin=True)
+        except ValueError:
+            pass  # concurrent seed — already created
 
 
 @router.get("/default-rates/{tenant_id}")
@@ -31,6 +58,7 @@ def get_default_rates(
     user: UserAccount = Depends(current_user),
     repository: InMemorySecretaryRepository = Depends(get_repository),
 ):
+    _seed_builtins_if_empty(repository, user.company_id)
     return repository.list_tenant_service_rates(user.company_id)
 
 
