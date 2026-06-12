@@ -97,6 +97,13 @@ def _merge_answer_into_data(intent: str, text: str, data: dict) -> dict:
     person = vi.extract_person(text)
     if person:
         d["person"] = person
+    # calendar.create answer to "S kým nebo jaký název?": accept ANY text as the
+    # title (unless the answer was the date/time for the 'when' slot, or it named
+    # a person, both already handled above).
+    if intent == "calendar.create":
+        answered_when = bool(date_iso or hhmm)
+        if not answered_when and not d.get("title") and not d.get("person") and text.strip():
+            d["title"] = text.strip()
     # intent-specific free-text slots. For client.create we collect name, then
     # phone, then address in order: the answer fills the first slot still empty.
     ans = text.strip()
