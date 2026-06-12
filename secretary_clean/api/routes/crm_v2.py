@@ -213,6 +213,82 @@ def add_client_note(
     return {"ok": True, "notes": [shapes.note_out(n) for n in _notes_list(record.data)]}
 
 
+def _client_rates_payload(record) -> dict:
+    d = record.data or {}
+    overrides = d.get("service_rate_overrides") or {}
+    # Effective rates = stored base rates with client overrides applied.
+    return {
+        "client_id": record.id,
+        "service_rates": {**(d.get("service_rates") or {}), **overrides},
+        "service_rate_overrides": overrides,
+        "has_individual_service_rates": bool(overrides),
+    }
+
+
+@router.get("/clients/{client_id}/service-rates")
+def get_client_service_rates(
+    client_id: str,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "clients", client_id, user.company_id)
+    return _client_rates_payload(record)
+
+
+@router.put("/clients/{client_id}/service-rates")
+def update_client_service_rates(
+    client_id: str,
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Replaces the whole override map (440aa04 semantics): body is a flat
+    {rate_key: rate} dict, only numeric values > 0 are kept."""
+    _get_or_404(repository, "clients", client_id, user.company_id)
+    normalized: dict[str, float] = {}
+    for key, value in (payload or {}).items():
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            continue
+        if rate > 0:
+            normalized[str(key)] = rate
+    record = repository.update_crm_record(
+        "clients", client_id, user.company_id,
+        CRMUpdateRequest(data={"service_rate_overrides": normalized}))
+    repository.log_activity(
+        user.company_id, user.id, "client", client_id, "update_service_rates",
+        f"Service rate overrides set ({len(normalized)} keys)", source_channel="app")
+    return _client_rates_payload(record)
+
+
+@router.put("/clients/{client_id}/rate")
+def update_client_rate(
+    client_id: str,
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Single default hourly rate (440aa04: stored on the client and mirrored
+    into the hourly_rate override; rate 0 clears it)."""
+    record = _get_or_404(repository, "clients", client_id, user.company_id)
+    rate = float(payload.get("default_hourly_rate") or 0)
+    overrides = dict((record.data or {}).get("service_rate_overrides") or {})
+    if rate > 0:
+        overrides["hourly_rate"] = rate
+    else:
+        overrides.pop("hourly_rate", None)
+    updated = repository.update_crm_record(
+        "clients", client_id, user.company_id,
+        CRMUpdateRequest(data={"default_hourly_rate": rate if rate > 0 else None,
+                               "service_rate_overrides": overrides}))
+    repository.log_activity(
+        user.company_id, user.id, "client", client_id, "update_rate",
+        f"Default rate: {rate}", source_channel="app")
+    return {"id": updated.id, "display_name": updated.name,
+            "default_hourly_rate": (updated.data or {}).get("default_hourly_rate")}
+
+
 # ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
