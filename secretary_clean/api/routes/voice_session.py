@@ -20,6 +20,7 @@ This module intentionally does NOT implement:
 from __future__ import annotations
 
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -145,8 +146,28 @@ _CONFIRM_WORDS = {"confirm", "yes", "save", "ok", "done",
                   "potwierdź", "tak", "zapisz"}
 
 _CANCEL_WORDS = {"cancel", "stop", "abort", "discard",
-                 "zrušit", "zrusit", "smazat",
-                 "anuluj", "przerwij"}
+                 "zrusit", "zrus", "smazat", "omyl", "konec",
+                 "neplatny prikaz", "anuluj", "przerwij"}
+
+
+def _norm(s: str) -> str:
+    """Lowercase, strip diacritics, collapse separators — STT output differs
+    from stored names exactly in these (smoke test FAIL: 'SMOKE-Novák' vs
+    'smoke novak')."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
+
+
+def _is_cancel(text: str) -> bool:
+    norm = _norm(text)
+    if not norm:
+        return False
+    if norm in _CANCEL_WORDS:
+        return True
+    # Short utterances containing a cancel word ("tak to zruš") count too;
+    # long ones do not, so dictated notes can still mention the words.
+    return len(norm.split()) <= 4 and any(w in norm for w in _CANCEL_WORDS)
 
 
 def _is_negative(text: str) -> bool:
@@ -185,11 +206,25 @@ def _parse_date(text: str) -> str | None:
     return None
 
 
+# "nový klient" with or without diacritics, optionally followed by the name.
+_NEW_CLIENT_RE = re.compile(
+    r"^\s*(new\s+client|nov[yý]\s+klient|nowego\s+klienta|nowy\s+klient|new|nov[yý]|nowy)\b[\s,:-]*",
+    re.IGNORECASE)
+
+
 def _find_clients(name: str, repository, company_id: str) -> list:
-    """Return CRMRecord list matching name substring."""
-    records = repository.list_crm_records("clients", company_id)
-    q = name.strip().lower()
-    return [r for r in records if q in r.name.lower()]
+    """Return CRMRecord list matching the name, diacritics/separator-insensitive."""
+    records = [r for r in repository.list_crm_records("clients", company_id)
+               if r.status != "deleted"]
+    q = _norm(name)
+    if not q:
+        return []
+    hits = []
+    for r in records:
+        n = _norm(r.name)
+        if q in n or all(token in n for token in q.split()):
+            hits.append(r)
+    return hits
 
 
 def _find_users(text: str, repository, company_id: str) -> tuple[list, list]:
@@ -199,11 +234,11 @@ def _find_users(text: str, repository, company_id: str) -> tuple[list, list]:
     tokens = [t.strip() for t in re.split(r"[,;&]+|\band\b|\ba\b|\bi\b", text, flags=re.IGNORECASE) if t.strip()]
     matched, not_found = [], []
     for token in tokens:
-        q = token.lower()
+        q = _norm(token)
         hits = [u for u in users
-                if q in u.display_name.lower()
-                or (u.first_name and q in u.first_name.lower())
-                or (u.last_name and q in u.last_name.lower())]
+                if q in _norm(u.display_name)
+                or (u.first_name and q in _norm(u.first_name))
+                or (u.last_name and q in _norm(u.last_name))]
         if hits:
             matched.append(hits[0])
         else:
@@ -300,17 +335,30 @@ def voice_session_input(
     reply = ""
     next_step = step
 
+    # ── CANCEL works at EVERY step, not only in summary ──────────────────────
+    if _is_cancel(text):
+        sess["state"] = "cancelled"
+        _touch(sess)
+        repository.save_voice_session(sess)
+        return SessionResponse(
+            session_id=sess["id"],
+            step="done",
+            prompt=("Session cancelled. Nothing was saved." if lang == "en" else
+                    "Zrušeno. Nic se neuložilo." if lang == "cs" else
+                    "Anulowano. Nic nie zapisano."),
+        )
+
     # ── CLIENT ────────────────────────────────────────────────────────────────
     if step == "client":
-        wants_new = any(x in low for x in
-                        ["new client", "nový klient", "nowego klienta",
-                         "new", "nový", "nowy"])
-        if wants_new and len(text.split()) <= 2:
+        # Diacritics-insensitive: STT often yields "novy klient" for "nový klient".
+        new_match = _NEW_CLIENT_RE.match(text)
+        wants_new = bool(new_match)
+        remainder = text[new_match.end():].strip() if new_match else ""
+        if wants_new and not remainder:
             next_step = "client_name"
             reply = _prompt("client_name", lang)
         else:
-            # strip "new client" prefix if name follows
-            name_q = re.sub(r"^(new client|nový klient|nowego klienta|new|nový|nowy)\s*", "", low).strip() or text
+            name_q = remainder if wants_new else text
             matches = _find_clients(name_q, repository, user.company_id)
             if len(matches) == 1:
                 sess["client_id"] = matches[0].id
@@ -451,26 +499,9 @@ def voice_session_input(
         summary = _build_summary(sess)
         reply = summary + "\n\n" + _prompt("summary", lang)
 
-    # ── SUMMARY ──────────────────────────────────────────────────────────────
+    # ── SUMMARY (cancel is handled globally above) ───────────────────────────
     elif step == "summary":
-        if any(x in low for x in _CANCEL_WORDS):
-            sess["state"] = "cancelled"
-            reply = (
-                "Session cancelled."
-                if lang == "en" else
-                "Sezení zrušeno."
-                if lang == "cs" else
-                "Sesja anulowana."
-            )
-            _touch(sess)
-            repository.save_voice_session(sess)
-            return SessionResponse(
-                session_id=sess["id"],
-                step="done",
-                prompt=reply,
-            )
-
-        elif any(x in low for x in _CONFIRM_WORDS):
+        if any(x in low for x in _CONFIRM_WORDS):
             next_step = "confirm"
 
         elif "client" in low or "klient" in low:

@@ -24,7 +24,7 @@ def get_version(request: Request):
     try:
         ver = importlib.metadata.version("secretary-clean")
     except importlib.metadata.PackageNotFoundError:
-        ver = "1.0.0"
+        ver = "1.0.1"
     repo = getattr(request.app.state, "repository", None)
     storage = "postgresql" if repo and "Postgres" in type(repo).__name__ else "in_memory"
     db_url_set = bool(os.environ.get("DATABASE_URL"))

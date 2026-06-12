@@ -38,7 +38,8 @@ from secretary_clean.core import voice_slots as vsl
 router = APIRouter(prefix="/voice", tags=["voice foundation"])
 
 PENDING_TTL_MIN = 30
-_CANCEL_WORDS = ("zrus", "zrusit", "cancel", "nech to byt", "to staci", "stop", "nechci", "zapomen na to", "uz ne", "konec")
+_CANCEL_WORDS = ("zrus", "zrusit", "cancel", "nech to byt", "to staci", "stop", "nechci",
+                 "zapomen na to", "uz ne", "konec", "omyl", "neplatny prikaz", "anuluj")
 
 
 def _lang_ctx(repository, user: UserAccount, client_id: str | None):
