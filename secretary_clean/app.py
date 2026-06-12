@@ -24,6 +24,7 @@ from secretary_clean.api.routes import (
     language,
     tenant_pricing,
     tenant_rates,
+    translate,
     users,
     voice,
     voice_session,
@@ -168,6 +169,7 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(assistant.router, prefix="/api/v1")
     app.include_router(admin.router, prefix="/api/v1")
     app.include_router(whatsapp.router, prefix="/api/v1")
+    app.include_router(translate.router, prefix="/api/v1")
     return app
 
 

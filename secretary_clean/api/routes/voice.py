@@ -23,6 +23,7 @@ from secretary_clean.core import help_content
 from secretary_clean.core.models import (
     CalendarEventCreate,
     CalendarEventUpdate,
+    CRMUpdateRequest,
     PendingVoiceAction,
     Permission,
     UserAccount,
@@ -386,7 +387,6 @@ def execute_voice_command(
             return res(False, "Nenašla jsem odpovídající úkol k dokončení. Zkus to upřesnit.",
                        status="error", action=intent)
         target = matched[0]
-        from secretary_clean.core.models import CRMUpdateRequest
         updated = repository.update_crm_record("tasks", target.id, user.company_id,
                                                CRMUpdateRequest(status="done"))
         return res(True, f"Označila jsem úkol jako hotový: {updated.name}.", action=intent,
@@ -452,7 +452,6 @@ def execute_voice_command(
             return res(False, "Nenašla jsem odpovídající zakázku. Zkus to upřesnit.",
                        status="error", action=intent)
         target = matched[0]
-        from secretary_clean.core.models import CRMUpdateRequest
         updated = repository.update_crm_record("jobs", target.id, user.company_id,
                                                CRMUpdateRequest(status=new_status))
         return res(True, f"Změnila jsem stav zakázky {updated.name} na {new_status}.", action=intent,
@@ -485,8 +484,47 @@ def execute_voice_command(
         return res(True, f"Mám {len(comms)} záznamů: " + ", ".join(parts) + ".", action=intent,
                    data={"communications": [c.model_dump(mode="json") for c in comms], "count": len(comms)})
 
+    if intent == "whatsapp.read":
+        from secretary_clean.core import translation as _tr
+        person = (data.get("person") or "").strip().lower()
+        inbox = [c for c in repository.list_crm_records("communications", user.company_id)
+                 if (c.data or {}).get("type") == "whatsapp"
+                 and (c.data or {}).get("direction") == "in"
+                 and not (c.data or {}).get("read")]
+        if person:
+            inbox = [c for c in inbox
+                     if person in ((c.data or {}).get("contact") or "").lower()]
+        if not inbox:
+            return res(True, "Žádné nové zprávy na WhatsAppu.", action=intent,
+                       data={"unread": 0})
+        inbox.sort(key=lambda c: c.created_at, reverse=True)
+        profile = repository.get_tenant_operating_profile(user.company_id)
+        internal = getattr(profile, "default_internal_language_code", None)
+        auto_in = bool(getattr(profile, "auto_translate_customer_to_internal", True))
+        spoken_parts = []
+        for c in inbox[:3]:
+            d = c.data or {}
+            text = d.get("note") or ""
+            if auto_in and internal and _tr.is_configured():
+                ok_t, translated, _err = _tr.translate_text(text, internal)
+                if ok_t and translated:
+                    text = translated
+            spoken_parts.append(f"Od {d.get('contact') or 'neznámého'}: {text}")
+            repository.update_crm_record(
+                "communications", c.id, user.company_id,
+                CRMUpdateRequest(data={**d, "read": True}))
+        more = len(inbox) - len(spoken_parts)
+        suffix = f" A ještě {more} dalších." if more > 0 else ""
+        msg = (f"Máš {len(inbox)} " +
+               ("novou zprávu. " if len(inbox) == 1 else
+                "nové zprávy. " if len(inbox) <= 4 else "nových zpráv. ") +
+               " ".join(spoken_parts) + suffix)
+        return res(True, msg, action=intent,
+                   data={"unread": len(inbox), "read_now": len(spoken_parts)})
+
     if intent == "whatsapp.send":
         from secretary_clean.core import whatsapp as _wa
+        from secretary_clean.api.routes.whatsapp import outbound_text_for
         if not _wa.is_configured():
             return res(False, "WhatsApp není na serveru nakonfigurovaný.",
                        status="error", action=intent)
@@ -498,15 +536,20 @@ def execute_voice_command(
         # Resolve the client's phone from CRM by name match.
         phone = None
         client_name = person
+        client_record = None
         for c in repository.list_crm_records("clients", user.company_id):
             if person and person.lower() in (c.name or "").lower():
                 phone = (c.data or {}).get("phone")
                 client_name = c.name
+                client_record = c
                 break
         if not phone:
             return res(False, f"Nenašla jsem telefon klienta {person}. Přidej ho do kontaktu.",
                        status="error", action=intent)
-        ok, mid, err = _wa.send_text(phone, message)
+        # Internal language -> customer language rule (tenant profile + client preference).
+        text_to_send, lang_meta = outbound_text_for(
+            repository, user.company_id, client_record, message)
+        ok, mid, err = _wa.send_text(phone, text_to_send)
         if not ok:
             return res(False, f"WhatsApp se nepodařilo odeslat: {err}",
                        status="error", action=intent)
@@ -515,9 +558,15 @@ def execute_voice_command(
                                      f"whatsapp - {client_name}",
                                      {"source": "voice", "type": "whatsapp",
                                       "direction": "out", "contact": client_name,
-                                      "phone": phone, "note": message, "wa_message_id": mid})
-        return res(True, f"Odeslala jsem WhatsApp {client_name}: {message}", action=intent,
-                   data={"wa_message_id": mid})
+                                      "phone": phone, "note": text_to_send,
+                                      "wa_message_id": mid,
+                                      "target_language": lang_meta.get("customer_language"),
+                                      **({"original_text": message}
+                                         if lang_meta.get("translated") else {})})
+        confirm = (f"Odeslala jsem WhatsApp {client_name}: {message}"
+                   + (" (přeloženo do jazyka zákazníka)." if lang_meta.get("translated") else ""))
+        return res(True, confirm, action=intent,
+                   data={"wa_message_id": mid, "translated": lang_meta.get("translated", False)})
 
     return res(False, f"Intent '{intent}' zatim neumim vykonat.", status="error", action=intent)
 

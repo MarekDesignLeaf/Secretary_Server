@@ -1965,6 +1965,13 @@ class PostgresSecretaryRepository:
         self.reset_user_password(user.id, new_password)
         return user
 
+    def list_company_ids(self) -> list[str]:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM clean_companies ORDER BY created_at")
+                rows = cur.fetchall()
+        return [str(r[0]) for r in rows]
+
     # ------------------------------------------------------------------
     # Tenant service rates (clean_tenant_service_rates)
     # ------------------------------------------------------------------

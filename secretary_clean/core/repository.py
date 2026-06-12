@@ -340,6 +340,9 @@ class InMemorySecretaryRepository:
     def get_company(self, company_id: str) -> CompanyProfile | None:
         return self.companies.get(company_id)
 
+    def list_company_ids(self) -> list[str]:
+        return list(self.companies.keys())
+
     def update_company(self, company_id: str, profile: CompanyProfile) -> CompanyProfile:
         if company_id not in self.companies:
             raise KeyError("Company not found")
