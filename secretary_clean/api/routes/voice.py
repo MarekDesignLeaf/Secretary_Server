@@ -261,6 +261,50 @@ def execute_voice_command(
                else f"Vytvořila jsem úkol{when}: {title}.")
         return res(True, msg, action=intent, entity_id=rec.id, data={"task": rec.model_dump(mode="json")})
 
+    if intent == "client.set_address":
+        from secretary_clean.core import address_extract
+        person = (data.get("person") or "").strip().lower()
+        if not person:
+            # "doplň adresu klientovi Novák" — name after klient(ovi/a).
+            import re as _re
+            m = _re.search(r"klient(?:ovi|a)?\s+([^\d,]+)$",
+                           (data.get("raw") or payload.utterance), flags=_re.IGNORECASE)
+            if m:
+                person = m.group(1).strip().lower()
+        clients = [c for c in repository.list_crm_records("clients", user.company_id)
+                   if c.status != "deleted"]
+        client = None
+        if person:
+            client = next((c for c in clients if person in (c.name or "").lower()
+                           or (c.name or "").lower() in person), None)
+        if client is None:
+            return res(False, "Kterému klientovi mám adresu doplnit?",
+                       status="needs_more_info", action=intent, missing=["person"],
+                       question="Kterému klientovi?")
+        # Most recent inbound message from this client/contact.
+        comms = [c for c in repository.list_crm_records("communications", user.company_id)
+                 if (c.data or {}).get("direction") == "in"
+                 and (str((c.data or {}).get("client_id") or "") == client.id
+                      or (client.name or "").lower() in str((c.data or {}).get("contact") or "").lower())]
+        comms.sort(key=lambda c: c.created_at, reverse=True)
+        address = None
+        for c in comms:
+            address = address_extract.extract_address((c.data or {}).get("note") or "")
+            if address:
+                break
+        if not address:
+            return res(False, f"V žádné zprávě od {client.name} jsem nenašla adresu.",
+                       status="error", action=intent)
+        repository.update_crm_record(
+            "clients", client.id, user.company_id,
+            CRMUpdateRequest(data={"billing_address_line1": address, "address": address,
+                                   "address_source": "message"}))
+        repository.log_activity(
+            user.company_id, user.id, "client", client.id, "address_filled",
+            f"Adresa doplněna ze zprávy: {address}", source_channel="voice")
+        return res(True, f"Adresu klienta {client.name} jsem nastavila na {address}.",
+                   action=intent, entity_id=client.id, data={"address": address})
+
     if intent == "weather.get":
         from secretary_clean.core import weather as _w
         place = (data.get("place") or "").strip()

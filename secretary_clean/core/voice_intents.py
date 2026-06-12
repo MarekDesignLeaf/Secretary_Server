@@ -197,6 +197,10 @@ _SEND_WHATSAPP = ("pošli whatsapp", "posli whatsapp", "napiš na whatsapp", "na
                   "odpověz jí", "odpovez ji", "odepiš", "odepis", "reply on whatsapp")
 _WEATHER = ("počasí", "pocasi", "předpověď", "predpoved", "bude pršet", "bude prset",
             "weather", "forecast", "jaké bude venku", "jake bude venku", "kolik je venku")
+_SET_ADDRESS = ("doplň adresu", "dopln adresu", "ulož adresu", "uloz adresu",
+                "nastav adresu", "zapiš adresu", "zapis adresu", "adresa z zprávy",
+                "adresu ze zprávy", "adresu ze zpravy", "doplň adresu klientovi",
+                "set address", "save address", "fill address")
 _READ_WHATSAPP = ("přečti zprávy", "precti zpravy", "přečti mi zprávy", "precti mi zpravy",
                   "přečti zprávu", "precti zpravu", "přečti mi zprávu", "precti mi zpravu",
                   "přečti novou", "precti novou", "nová zpráva", "nova zprava",
@@ -384,6 +388,17 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
                       "date": date_iso, "time": hhmm, "start_at": start},
             requires_confirmation=True,
             reason="Task creation; confirmation required.",
+        )
+
+    # ----- CLIENT SET ADDRESS (from latest inbound message) -----
+    if _has(low, _SET_ADDRESS):
+        person = extract_person(utterance)
+        return ParsedIntent(
+            intent="client.set_address",
+            confidence=0.8,
+            entities={"person": person},
+            requires_confirmation=False,
+            reason="Fill client address from their latest message.",
         )
 
     # ----- WHATSAPP READ (read-only, before send so "přečti" wins) -----

@@ -514,7 +514,60 @@ def create_communication(
     repository: InMemorySecretaryRepository = Depends(get_repository),
 ):
     record = _create(repository, "communications", user, payload)
-    return shapes.communication_out(record, _client_names(repository, user.company_id))
+    # Incoming message? Try to fill the client's address from its text.
+    filled = None
+    if str((record.data or {}).get("direction") or "").lower() == "in":
+        filled = autofill_client_address_from_comm(repository, user, record)
+    out = shapes.communication_out(record, _client_names(repository, user.company_id))
+    if filled:
+        out["address_filled_for_client_id"] = filled["client_id"]
+        out["address_filled"] = filled["address"]
+    return out
+
+
+def autofill_client_address_from_comm(repository, user, comm_record) -> dict | None:
+    """If an inbound message contains an address and its client has none yet,
+    fill billing_address_line1 (used by navigation). Returns {client_id,address}
+    or None. Never overwrites an existing address."""
+    from secretary_clean.core import address_extract
+    d = comm_record.data or {}
+    text = d.get("note") or d.get("message") or ""
+    address = address_extract.extract_address(text)
+    if not address:
+        return None
+
+    clients = [c for c in _records(repository, "clients", user.company_id)]
+    client = None
+    cid = d.get("client_id")
+    if cid:
+        client = next((c for c in clients if c.id == str(cid)), None)
+    if client is None:
+        contact = str(d.get("contact") or "").strip().lower()
+        if contact:
+            client = next((c for c in clients if contact in (c.name or "").lower()), None)
+    if client is None:
+        phone = str(d.get("phone") or "")
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if digits:
+            client = next(
+                (c for c in clients
+                 if "".join(ch for ch in str((c.data or {}).get("phone") or "") if ch.isdigit()) == digits),
+                None)
+    if client is None:
+        return None
+
+    cd = client.data or {}
+    if cd.get("billing_address_line1") or cd.get("address"):
+        return None  # never overwrite
+
+    repository.update_crm_record(
+        "clients", client.id, user.company_id,
+        CRMUpdateRequest(data={"billing_address_line1": address, "address": address,
+                               "address_source": "message"}))
+    repository.log_activity(
+        user.company_id, user.id, "client", client.id, "address_filled",
+        f"Adresa doplněna ze zprávy: {address}", source_channel="app")
+    return {"client_id": client.id, "address": address}
 
 
 # ---------------------------------------------------------------------------

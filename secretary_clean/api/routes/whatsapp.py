@@ -153,11 +153,21 @@ def webhook_receive(
                 wa_from = str(msg.get("from") or "")
                 client = find_client_by_phone(repository, company_id, wa_from)
                 contact = client.name if client else (profile_names.get(wa_from) or wa_from)
-                repository.create_crm_record(
+                comm = repository.create_crm_record(
                     "communications", company_id, f"whatsapp - {contact}",
                     {"source": "whatsapp_webhook", "type": "whatsapp", "direction": "in",
                      "contact": contact, "client_id": client.id if client else None,
                      "phone": wa_from, "note": text, "wa_message_id": mid, "read": False})
+                # Auto-fill the client's address if the message contains one.
+                try:
+                    import types as _types
+                    from secretary_clean.api.routes.crm_v2 import (
+                        autofill_client_address_from_comm as _autofill)
+                    _autofill(repository,
+                              _types.SimpleNamespace(id=None, company_id=company_id),
+                              comm)
+                except Exception:  # noqa: BLE001
+                    pass
                 existing_ids.add(mid)
                 stored += 1
     return {"status": "received", "stored": stored}
