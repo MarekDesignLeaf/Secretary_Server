@@ -32,6 +32,24 @@ CREATE EXTENSION IF NOT EXISTS citext;
 
 # Extra tables required by the Postgres repository that are not in schema.sql
 _EXTRA_DDL = """
+CREATE TABLE IF NOT EXISTS clean_tenant_service_rates (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    rate_type TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    rate NUMERIC(12,2) NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'GBP',
+    is_builtin BOOLEAN NOT NULL DEFAULT FALSE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (company_id, rate_type)
+);
+
+CREATE INDEX IF NOT EXISTS clean_tenant_service_rates_company_idx
+    ON clean_tenant_service_rates(company_id, sort_order, rate_type);
+
 CREATE TABLE IF NOT EXISTS clean_leads (
     id UUID PRIMARY KEY,
     company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,

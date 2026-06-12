@@ -1966,6 +1966,124 @@ class PostgresSecretaryRepository:
         return user
 
     # ------------------------------------------------------------------
+    # Tenant service rates (clean_tenant_service_rates)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _service_rate_row(row: dict) -> dict:
+        return {
+            "id": str(row["id"]),
+            "company_id": str(row["company_id"]),
+            "rate_type": row["rate_type"],
+            "description": row["description"],
+            "rate": float(row["rate"]),
+            "currency": row["currency"],
+            "is_builtin": row["is_builtin"],
+            "is_active": row["is_active"],
+            "sort_order": row["sort_order"],
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+            "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+        }
+
+    def list_tenant_service_rates(self, company_id: str) -> list[dict]:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM clean_tenant_service_rates
+                    WHERE company_id = %s AND is_active = TRUE
+                    ORDER BY sort_order, rate_type
+                    """,
+                    (company_id,),
+                )
+                rows = cur.fetchall()
+        return [self._service_rate_row(dict(r)) for r in rows]
+
+    def create_tenant_service_rate(
+        self, company_id: str, rate_type: str, description: str = "",
+        rate: float = 0.0, currency: str = "GBP", is_builtin: bool = False,
+    ) -> dict:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, is_active FROM clean_tenant_service_rates "
+                    "WHERE company_id = %s AND rate_type = %s",
+                    (company_id, rate_type),
+                )
+                existing = cur.fetchone()
+                if existing and existing["is_active"]:
+                    raise ValueError(f"Rate type '{rate_type}' already exists")
+                if existing:
+                    # Re-activate a soft-deleted rate type instead of violating
+                    # the (company_id, rate_type) unique constraint.
+                    cur.execute(
+                        """
+                        UPDATE clean_tenant_service_rates
+                        SET description = %s, rate = %s, currency = %s,
+                            is_builtin = %s, is_active = TRUE, updated_at = now()
+                        WHERE id = %s
+                        RETURNING *
+                        """,
+                        (description, rate, currency, is_builtin, existing["id"]),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO clean_tenant_service_rates
+                            (id, company_id, rate_type, description, rate, currency,
+                             is_builtin, is_active, sort_order)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE,
+                                COALESCE((SELECT MAX(sort_order) FROM clean_tenant_service_rates
+                                          WHERE company_id = %s), 0) + 1)
+                        RETURNING *
+                        """,
+                        (str(uuid4()), company_id, rate_type, description, rate,
+                         currency, is_builtin, company_id),
+                    )
+                row = cur.fetchone()
+            conn.commit()
+        return self._service_rate_row(dict(row))
+
+    def set_tenant_service_rate_amounts(
+        self, company_id: str, amounts: dict[str, float]
+    ) -> list[dict]:
+        """Bulk rate update for existing rate types; unknown keys are ignored."""
+        if amounts:
+            with _PooledConnection(self._pool) as conn:
+                with conn.cursor() as cur:
+                    for rate_type, rate in amounts.items():
+                        cur.execute(
+                            """
+                            UPDATE clean_tenant_service_rates
+                            SET rate = %s, updated_at = now()
+                            WHERE company_id = %s AND rate_type = %s AND is_active = TRUE
+                            """,
+                            (float(rate), company_id, rate_type),
+                        )
+                conn.commit()
+        return self.list_tenant_service_rates(company_id)
+
+    def delete_tenant_service_rate(self, company_id: str, rate_type: str) -> None:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, is_builtin, is_active FROM clean_tenant_service_rates "
+                    "WHERE company_id = %s AND rate_type = %s",
+                    (company_id, rate_type),
+                )
+                row = cur.fetchone()
+                if not row or not row["is_active"]:
+                    raise KeyError(f"Rate type '{rate_type}' not found")
+                if row["is_builtin"]:
+                    raise ValueError("Built-in rate types cannot be deleted")
+                cur.execute(
+                    "UPDATE clean_tenant_service_rates "
+                    "SET is_active = FALSE, updated_at = now() WHERE id = %s",
+                    (row["id"],),
+                )
+            conn.commit()
+
+    # ------------------------------------------------------------------
     # Biometrics
     # ------------------------------------------------------------------
 

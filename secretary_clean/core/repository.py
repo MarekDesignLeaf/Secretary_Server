@@ -935,6 +935,69 @@ class InMemorySecretaryRepository:
         return invoice
 
     # ------------------------------------------------------------------
+    # Tenant service rates (clean_tenant_service_rates)
+    # ------------------------------------------------------------------
+
+    def _service_rates_store(self) -> dict:
+        if not hasattr(self, "_tenant_service_rates"):
+            self._tenant_service_rates: dict[str, dict[str, dict]] = {}
+        return self._tenant_service_rates
+
+    def list_tenant_service_rates(self, company_id: str) -> list[dict]:
+        rows = list(self._service_rates_store().get(company_id, {}).values())
+        rows = [dict(r) for r in rows if r.get("is_active", True)]
+        rows.sort(key=lambda r: (r.get("sort_order", 0), r.get("rate_type", "")))
+        return rows
+
+    def create_tenant_service_rate(
+        self, company_id: str, rate_type: str, description: str = "",
+        rate: float = 0.0, currency: str = "GBP", is_builtin: bool = False,
+    ) -> dict:
+        store = self._service_rates_store().setdefault(company_id, {})
+        if rate_type in store and store[rate_type].get("is_active", True):
+            raise ValueError(f"Rate type '{rate_type}' already exists")
+        now = datetime.now(timezone.utc).isoformat()
+        row = {
+            "id": str(uuid4()),
+            "company_id": company_id,
+            "rate_type": rate_type,
+            "description": description,
+            "rate": float(rate),
+            "currency": currency,
+            "is_builtin": bool(is_builtin),
+            "is_active": True,
+            "sort_order": max((r.get("sort_order", 0) for r in store.values()), default=0) + 1,
+            "created_at": now,
+            "updated_at": now,
+        }
+        store[rate_type] = row
+        return dict(row)
+
+    def set_tenant_service_rate_amounts(
+        self, company_id: str, amounts: dict[str, float]
+    ) -> list[dict]:
+        """Bulk rate update for existing rate types; unknown keys are ignored."""
+        store = self._service_rates_store().get(company_id, {})
+        now = datetime.now(timezone.utc).isoformat()
+        for rate_type, rate in amounts.items():
+            row = store.get(rate_type)
+            if row and row.get("is_active", True):
+                row["rate"] = float(rate)
+                row["updated_at"] = now
+        return self.list_tenant_service_rates(company_id)
+
+    def delete_tenant_service_rate(self, company_id: str, rate_type: str) -> None:
+        store = self._service_rates_store().get(company_id, {})
+        row = store.get(rate_type)
+        if not row or not row.get("is_active", True):
+            raise KeyError(f"Rate type '{rate_type}' not found")
+        if row.get("is_builtin"):
+            raise ValueError("Built-in rate types cannot be deleted")
+        # Soft-delete, consistent with the rest of the clean backend.
+        row["is_active"] = False
+        row["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    # ------------------------------------------------------------------
     # Biometrics (in-memory stubs)
     # ------------------------------------------------------------------
 

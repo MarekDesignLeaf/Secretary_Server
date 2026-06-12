@@ -23,6 +23,7 @@ from secretary_clean.api.routes import (
     google_calendar,
     language,
     tenant_pricing,
+    tenant_rates,
     users,
     voice,
     voice_session,
@@ -155,6 +156,7 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(catalogue.router, prefix="/api/v1")
     app.include_router(language.router, prefix="/api/v1")
     app.include_router(tenant_pricing.router, prefix="/api/v1")
+    app.include_router(tenant_rates.router, prefix="/api/v1")
     app.include_router(crm_v2.router, prefix="/api/v1")
     app.include_router(work_reports.router, prefix="/api/v1")
     app.include_router(calendar.router, prefix="/api/v1")
