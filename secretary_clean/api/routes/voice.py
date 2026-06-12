@@ -247,9 +247,18 @@ def execute_voice_command(
     if intent == "task.create":
         title = data.get("title")
         person = data.get("person")
-        rec = repository.create_crm_record("tasks", user.company_id, title,
-                                           {"source": "voice", "assignee": person})
-        msg = f"Vytvořila jsem úkol pro {person}: {title}." if person else f"Vytvořila jsem úkol: {title}."
+        task_data: dict = {"source": "voice", "assignee": person}
+        # Spoken date ("na úterý", "zítra") becomes the planned date so the
+        # task shows in the calendar dot markers and on the Today screen.
+        if data.get("date"):
+            task_data["planned_date"] = data["date"]
+            task_data["deadline"] = data["date"]
+        if data.get("start_at"):
+            task_data["planned_start_at"] = data["start_at"]
+        rec = repository.create_crm_record("tasks", user.company_id, title, task_data)
+        when = f" na {data['date']}" if data.get("date") else ""
+        msg = (f"Vytvořila jsem úkol pro {person}{when}: {title}." if person
+               else f"Vytvořila jsem úkol{when}: {title}.")
         return res(True, msg, action=intent, entity_id=rec.id, data={"task": rec.model_dump(mode="json")})
 
     if intent == "calendar.list":

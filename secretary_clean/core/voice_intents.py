@@ -348,10 +348,16 @@ def parse_intent(utterance: str, base: datetime | None = None) -> ParsedIntent:
                 title = utterance[pos + len(kw):].strip(" :,-")
                 break
         title = title or None
+        # "vytvoř úkol na úterý ..." — the date must become the planned date,
+        # otherwise the task never shows in the calendar / Today screen.
+        date_iso = parse_date(utterance)
+        hhmm = parse_time(utterance)
+        start = _combine(date_iso, hhmm) if date_iso else None
         return ParsedIntent(
             intent="task.create",
             confidence=0.75,
-            entities={"person": person, "raw": utterance, "title": title},
+            entities={"person": person, "raw": utterance, "title": title,
+                      "date": date_iso, "time": hhmm, "start_at": start},
             requires_confirmation=True,
             reason="Task creation; confirmation required.",
         )

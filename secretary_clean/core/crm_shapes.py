@@ -102,7 +102,7 @@ def task_out(r: CRMRecord, client_names: dict[str, str] | None = None) -> dict:
         "taskType": _get(d, "taskType", "task_type", default="interni_poznamka"),
         "priority": d.get("priority") or "bezna",
         "createdAt": iso(r.created_at),
-        "deadline": d.get("deadline"),
+        "deadline": _get(d, "deadline", "due_date"),
         "plannedDate": _get(d, "plannedDate", "planned_date"),
         "plannedStartAt": _get(d, "plannedStartAt", "planned_start_at"),
         "plannedEndAt": _get(d, "plannedEndAt", "planned_end_at"),
