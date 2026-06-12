@@ -78,6 +78,28 @@ def test_webhook_stores_inbound_and_dedupes(monkeypatch):
     assert c["message_summary"] == "Dobrý den, kdy přijdete?"
 
 
+def test_device_forwarded_message_is_readable_by_voice(monkeypatch):
+    """On-device notification listener posts to /crm/communications; the voice
+    'přečti zprávy' command must then read it (same path as the Meta webhook)."""
+    client, headers = _bootstrap_logged_in_client(monkeypatch)
+
+    # What WhatsAppNotificationListener.forwardToBackend sends:
+    res = client.post("/api/v1/crm/communications", headers=headers, json={
+        "message_summary": "WhatsApp od Pan Novák",
+        "type": "whatsapp", "direction": "in", "contact": "Pan Novák",
+        "note": "Dobrý den, můžete přijet zítra?", "read": False,
+        "source": "notification"})
+    assert res.status_code in (200, 201)
+
+    monkeypatch.setattr(tr, "is_configured", lambda: False)  # no translation needed
+    out = client.post("/api/v1/voice/execute", headers=headers,
+                      json={"utterance": "přečti zprávy"}).json()
+    assert out["executed"] is True
+    assert out["resolved_intent"] == "whatsapp.read"
+    assert "Pan Novák" in out["message"]
+    assert "zítra" in out["message"]
+
+
 def test_translate_endpoint(monkeypatch):
     client, headers = _bootstrap_logged_in_client(monkeypatch)
 
