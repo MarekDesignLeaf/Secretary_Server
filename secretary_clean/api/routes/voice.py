@@ -431,25 +431,40 @@ def execute_voice_command(
                    data={"pushed": pushed, "skipped": skipped, "failed": failed})
 
     if intent in ("calendar.delete", "calendar.update"):
-        # Find the target event by person (matched in title) and/or date.
+        from datetime import datetime as _dt, timedelta as _td
+
         person = (data.get("person") or "").strip()
         date_iso = data.get("date")
+        # Declension/diacritics-tolerant name match: "s Novákem" must find the
+        # event titled "Schůzka s Novák". Compare normalized stems (first 4 chars).
+        def _name_match(title: str) -> bool:
+            if not person:
+                return True
+            tnorm = _strip_diacritics(title.lower())
+            pstem = _strip_diacritics(person.lower())[:4]
+            if not pstem:
+                return True
+            return any(w.startswith(pstem) for w in tnorm.split())
+
+        now = datetime.now(timezone.utc)
         candidates = repository.list_calendar_events(user.company_id)
-        def _matches(ev):
-            ok = True
-            if person:
-                ok = ok and (person.lower() in (ev.title or "").lower())
-            if date_iso:
-                ok = ok and (ev.start_at.date().isoformat() == date_iso)
-            return ok
-        matched = [e for e in candidates if _matches(e)]
+
+        if intent == "calendar.delete":
+            # For delete, a spoken date refers to the event's CURRENT day.
+            matched = [e for e in candidates if _name_match(e.title or "")
+                       and (not date_iso or e.start_at.date().isoformat() == date_iso)]
+        else:
+            # For move, the spoken date is the DESTINATION — never filter by it.
+            # Match by person; prefer upcoming events.
+            matched = [e for e in candidates if _name_match(e.title or "")]
+            upcoming = [e for e in matched if e.start_at >= now - _td(hours=1)]
+            matched = upcoming or matched
+
         if not matched:
             who = f" s {person}" if person else ""
             return res(False, f"Nenašla jsem schůzku{who} k úpravě. Zkus to upřesnit.",
                        status="error", action=intent)
-        if len(matched) > 1:
-            matched = sorted(matched, key=lambda e: e.start_at)
-        target = matched[0]
+        target = sorted(matched, key=lambda e: e.start_at)[0]
 
         if intent == "calendar.delete":
             ok = repository.delete_calendar_event(target.id, user.company_id)
@@ -458,20 +473,29 @@ def execute_voice_command(
                            entity_id=target.id)
             return res(False, "Schůzku se nepodařilo zrušit.", status="error", action=intent)
 
-        # calendar.update — move to a new time
-        new_start = data.get("new_start")
-        if not new_start:
-            return res(False, "Na kdy mám schůzku přesunout? Řekni datum a čas.",
+        # calendar.update — move to another day (and/or time)
+        if not date_iso and not data.get("time"):
+            return res(False, "Na kdy mám schůzku přesunout? Řekni den, případně i čas.",
                        status="needs_more_info", action=intent,
                        missing=["new_start"], question="Na kdy mám schůzku přesunout?")
-        from datetime import datetime as _dt
+        # Keep the original time when only a day was said; keep the day when only
+        # a time was said.
+        orig = target.start_at
+        new_date = date_iso or orig.date().isoformat()
+        new_time = data.get("time") or orig.strftime("%H:%M")
         try:
-            ns = _dt.fromisoformat(new_start)
+            ns = _dt.fromisoformat(f"{new_date}T{new_time}:00+00:00")
         except Exception:
-            return res(False, "Nerozuměla jsem novému času. Zkus to znovu.",
+            return res(False, "Nerozuměla jsem novému termínu. Zkus to znovu.",
                        status="error", action=intent)
-        upd = CalendarEventUpdate(start_at=ns)
+        # Preserve the event's duration.
+        new_end = None
+        if target.end_at:
+            new_end = ns + (target.end_at - orig)
+        upd = CalendarEventUpdate(start_at=ns, end_at=new_end)
         updated = repository.update_calendar_event(target.id, user.company_id, upd)
+        repository.add_calendar_sync_log(user.company_id, updated.id, "backend",
+                                         "updated_on_backend", detail="moved via voice")
         return res(True, f"Přesunula jsem schůzku {updated.title} na {ns.strftime('%d.%m. %H:%M')}.",
                    action=intent, entity_id=updated.id,
                    data={"event": updated.model_dump(mode="json")})
