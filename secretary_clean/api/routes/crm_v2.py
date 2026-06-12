@@ -10,6 +10,7 @@ odpovědi, viz konec souboru. Timeline a calendar-feed jsou reálné.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -296,6 +297,42 @@ def add_job_note(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     new = record.data.get("notes", [])[-1]
     return shapes.note_out(new, parent_id=job_id)
+
+
+@router.get("/jobs/{job_id}/audit")
+def get_job_audit_log(
+    job_id: str,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "jobs", job_id, user.company_id)
+    return (record.data or {}).get("audit_log") or []
+
+
+@router.post("/jobs/{job_id}/audit", status_code=201)
+def add_job_audit_entry(
+    job_id: str,
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "jobs", job_id, user.company_id)
+    entry = {
+        "id": str(uuid4()),
+        "job_id": job_id,
+        "action_type": str(payload.get("action_type") or "note"),
+        "description": str(payload.get("description") or ""),
+        "user_name": user.display_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    audit = list((record.data or {}).get("audit_log") or [])
+    audit.append(entry)
+    repository.update_crm_record(
+        "jobs", job_id, user.company_id, CRMUpdateRequest(data={"audit_log": audit}))
+    repository.log_activity(
+        user.company_id, user.id, "job", job_id,
+        entry["action_type"], entry["description"], source_channel="app")
+    return entry
 
 
 # ---------------------------------------------------------------------------
