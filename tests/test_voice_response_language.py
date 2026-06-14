@@ -63,3 +63,29 @@ def test_polish_followup_question_is_translated(monkeypatch):
     assert out["status"] == "needs_more_info"
     assert out["question"].startswith("[Polish] ")
     assert out["message"].startswith("[Polish] ")
+
+
+def test_czech_company_with_english_user_pref_stays_czech(monkeypatch):
+    """Regression: company internal language is Czech, but the owner's personal
+    preferred_language_code is en-GB. The assistant must answer in Czech (the
+    internal language) and never translate — talking to internal staff with no
+    client in context uses the internal language, not the user's stray pref."""
+    monkeypatch.setenv("SECRETARY_CLEAN_JWT_SECRET", "test-secret-for-clean-backend")
+    client = TestClient(create_app())
+    company = client.post("/api/v1/bootstrap/first-company", json={
+        "legal_name": "Czech Co",
+        "default_internal_language_code": "cs-CZ",
+        "default_customer_language_code": "en-GB"}).json()
+    client.post("/api/v1/bootstrap/first-admin", json={
+        "company_id": company["id"], "email": "marek@example.com",
+        "display_name": "Marek", "password": "very-secure-password",
+        "preferred_language_code": "en-GB"})  # personal pref differs from internal
+    tokens = client.post("/api/v1/auth/login", json={
+        "email": "marek@example.com", "password": "very-secure-password"}).json()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    monkeypatch.setattr(tr, "translate_text",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not translate")))
+    out = client.post("/api/v1/voice/execute", headers=headers,
+                      json={"utterance": "vytvoř úkol zavolat dodavateli"}).json()
+    assert out["executed"] is True
+    assert "úkol" in out["message"].lower()

@@ -80,27 +80,52 @@ def resolve_language_context(
     user: UserAccount,
     client_language_code: str | None,
 ) -> LanguageContext:
-    internal = normalize_language_code(
-        user.preferred_language_code or profile.default_internal_language_code,
-        profile.default_internal_language_code,
-    )
+    tenant_internal = normalize_language_code(profile.default_internal_language_code)
+    # In single-internal mode the company speaks ONE internal language. A stray
+    # per-user preference must not flip the assistant to another language.
+    if profile.internal_language_mode.value == "single":
+        internal = tenant_internal
+    else:
+        internal = normalize_language_code(
+            user.preferred_language_code or profile.default_internal_language_code,
+            profile.default_internal_language_code,
+        )
     customer = normalize_language_code(
         client_language_code or profile.default_customer_language_code,
         profile.default_customer_language_code,
     )
-    voice_input = customer if profile.voice_input_strategy.value in {"client_preferred", "detect_from_context"} else internal
-    if profile.voice_input_strategy.value == "user_preferred":
+
+    # A specific client is in context only when client_language_code is given.
+    # Without a client the assistant is talking to internal staff, so BOTH voice
+    # input and output must use the internal language regardless of strategy.
+    has_client = bool(client_language_code)
+
+    if not has_client:
         voice_input = internal
-    voice_output = customer if profile.voice_output_strategy.value == "client_preferred" else internal
-    if profile.voice_output_strategy.value == "tenant_default":
-        voice_output = normalize_language_code(profile.default_customer_language_code)
+        voice_output = internal
+    else:
+        vi = profile.voice_input_strategy.value
+        if vi in {"client_preferred", "detect_from_context"}:
+            voice_input = customer
+        elif vi == "user_preferred":
+            voice_input = internal
+        else:  # tenant_default
+            voice_input = internal
+
+        vo = profile.voice_output_strategy.value
+        if vo == "client_preferred":
+            voice_output = customer
+        elif vo == "tenant_default":
+            voice_output = normalize_language_code(profile.default_customer_language_code)
+        else:  # user_preferred / detect_from_context
+            voice_output = internal
 
     return LanguageContext(
         internal_language_code=internal,
         customer_language_code=customer,
         voice_input_language_code=voice_input,
         voice_output_language_code=voice_output,
-        translate_customer_to_internal=profile.auto_translate_customer_to_internal and customer != internal,
-        translate_internal_to_customer=profile.auto_translate_internal_to_customer and internal != customer,
-        resolution_source="client_preferred" if client_language_code else "tenant_defaults",
+        translate_customer_to_internal=profile.auto_translate_customer_to_internal and customer != internal and has_client,
+        translate_internal_to_customer=profile.auto_translate_internal_to_customer and internal != customer and has_client,
+        resolution_source="client_preferred" if has_client else "tenant_defaults",
     )

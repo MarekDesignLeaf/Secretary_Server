@@ -169,10 +169,12 @@ def execute_voice_command(
     questions when required information is missing (Phase A5.2)."""
     lang_ctx = _lang_ctx(repository, user, payload.client_id)
 
-    # Voice responses are authored in Czech. The team language can be cs/en/pl;
-    # for en/pl we translate the response (and follow-up question) so the
-    # assistant answers in the user's language. Czech stays native & instant.
-    _app_lang = (user.preferred_language_code or "").split("-")[0].lower()
+    # Voice responses are authored in Czech. Reply language comes from the
+    # backend-resolved voice_output language (single source of truth): internal
+    # language for staff, customer language only when a client is in context.
+    # Never read user.preferred_language_code directly here — that bypassed the
+    # resolver and made the assistant answer Marek in English.
+    _app_lang = (getattr(lang_ctx, "voice_output_language_code", "") or "").split("-")[0].lower()
     if _app_lang not in ("cs", "en", "pl"):
         _prof = repository.get_tenant_operating_profile(user.company_id)
         _app_lang = (getattr(_prof, "default_internal_language_code", "") or "cs").split("-")[0].lower()
