@@ -120,3 +120,85 @@ def test_recognition_requires_auth(monkeypatch):
     monkeypatch.setenv("SECRETARY_CLEAN_JWT_SECRET", "test-secret-for-clean-backend")
     client = TestClient(create_app())
     assert client.post("/api/v1/plants/identify", files={"images": _img()}).status_code == 401
+
+
+def test_plant_identify_prefers_plantnet(monkeypatch):
+    """When PLANTNET_API_KEY is set, plant ID uses Pl@ntNet, not OpenAI vision."""
+    client, headers = _bootstrap_logged_in_client(monkeypatch)
+    monkeypatch.setenv("PLANTNET_API_KEY", "pn-test-key")
+    monkeypatch.setattr(nr, "is_configured", lambda: False)  # no OpenAI -> no care tips
+    # _vision must NOT be called when Pl@ntNet answers.
+    monkeypatch.setattr(nr, "_vision",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("vision called")))
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"results": [{
+                "score": 0.91,
+                "species": {
+                    "scientificNameWithoutAuthor": "Lavandula angustifolia",
+                    "commonNames": ["Lavender", "Levandule"],
+                    "genus": {"scientificNameWithoutAuthor": "Lavandula"},
+                    "family": {"scientificNameWithoutAuthor": "Lamiaceae"}}}]}
+
+    captured = {}
+    import httpx
+    def _post(url, **kw):
+        captured["url"] = url
+        captured["api_key"] = kw["params"]["api-key"]
+        return _Resp()
+    monkeypatch.setattr(httpx, "post", _post)
+
+    res = client.post("/api/v1/plants/identify", headers=headers,
+                      files={"images": _img()},
+                      data={"language": "cs", "organs_json": '["leaf"]'}).json()
+    assert "identify/all" in captured["url"]
+    assert captured["api_key"] == "pn-test-key"
+    assert res["database"] == "Pl@ntNet"
+    assert res["scientific_name"] == "Lavandula angustifolia"
+    assert res["family"] == "Lamiaceae"
+    assert res["score"] == 0.91
+
+
+def test_plant_identify_falls_back_to_vision_without_plantnet(monkeypatch):
+    """No PLANTNET_API_KEY -> OpenAI vision path is used (unchanged behaviour)."""
+    client, headers = _bootstrap_logged_in_client(monkeypatch)
+    monkeypatch.delenv("PLANTNET_API_KEY", raising=False)
+    monkeypatch.setattr(nr, "is_configured", lambda: True)
+    monkeypatch.setattr(nr, "_vision", lambda *a, **k: {
+        "display_name": "Levandule", "scientific_name": "Lavandula angustifolia",
+        "score": 0.88, "spoken_summary": "Na fotce je levandule."})
+    res = client.post("/api/v1/plants/identify", headers=headers,
+                      files={"images": _img()}, data={"language": "cs"}).json()
+    assert res["database"] == "OpenAI Vision"
+    assert res["display_name"] == "Levandule"
+
+
+def test_plant_disease_uses_plantnet(monkeypatch):
+    """Disease assessment uses Pl@ntNet /diseases when the key is present."""
+    client, headers = _bootstrap_logged_in_client(monkeypatch)
+    monkeypatch.setenv("PLANTNET_API_KEY", "pn-test-key")
+    monkeypatch.setattr(nr, "is_configured", lambda: False)  # no OpenAI enrich
+    monkeypatch.setattr(nr, "_vision",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("vision called")))
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"results": [{"label": "Powdery mildew", "name": "1ERYSF", "score": 0.82}]}
+
+    captured = {}
+    import httpx
+    def _post(url, **kw):
+        captured["url"] = url
+        return _Resp()
+    monkeypatch.setattr(httpx, "post", _post)
+
+    res = client.post("/api/v1/plants/health-assessment", headers=headers,
+                      files={"images": _img()}, data={"language": "cs"}).json()
+    assert "diseases/identify" in captured["url"]
+    assert res["database"] == "Pl@ntNet"
+    assert res["is_healthy"] is False
+    assert res["top_issue_name"] == "Powdery mildew"
+    assert res["top_issue_probability"] == 0.82

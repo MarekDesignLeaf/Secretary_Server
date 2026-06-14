@@ -45,6 +45,21 @@ async def _first_image(images: list[UploadFile]) -> bytes:
     return await images[0].read() if images else b""
 
 
+async def _all_images(images: list[UploadFile], limit: int = 5) -> list[bytes]:
+    return [await img.read() for img in (images or [])[:limit]]
+
+
+def _parse_organs(organs_json: str) -> list[str]:
+    import json as _json
+    try:
+        val = _json.loads(organs_json or "[]")
+        if isinstance(val, list):
+            return [str(o) for o in val if o]
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
 @router.post("/plants/identify")
 async def identify_plant(
     images: list[UploadFile] = File(...),
@@ -57,7 +72,9 @@ async def identify_plant(
     location_source: str | None = Form(default=None),
     user: UserAccount = Depends(current_user),
 ):
-    result = nr.identify_plant(await _first_image(images), language)
+    all_imgs = await _all_images(images)
+    result = nr.identify_plant(all_imgs[0] if all_imgs else b"", language,
+                               images=all_imgs, organs=_parse_organs(organs_json))
     _record(user, "plant", result, captured_at, latitude, longitude)
     return result
 
@@ -73,7 +90,8 @@ async def assess_plant_health(
     location_source: str | None = Form(default=None),
     user: UserAccount = Depends(current_user),
 ):
-    result = nr.assess_health(await _first_image(images), language)
+    all_imgs = await _all_images(images)
+    result = nr.assess_health(all_imgs[0] if all_imgs else b"", language, images=all_imgs)
     _record(user, "plant_health", result, captured_at, latitude, longitude)
     return result
 

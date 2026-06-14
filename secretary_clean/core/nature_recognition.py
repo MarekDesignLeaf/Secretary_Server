@@ -56,7 +56,205 @@ def _vision(image_bytes: bytes, system: str, user: str) -> dict | None:
         return None
 
 
-def identify_plant(image_bytes: bytes, language: str | None = None) -> dict:
+# ── Pl@ntNet: dedicated botanical engine. PRIMARY for species + disease when
+#    PLANTNET_API_KEY is set; OpenAI vision stays as graceful fallback. ──
+
+_PLANTNET_ID_URL = "https://my-api.plantnet.org/v2/identify/all"
+_PLANTNET_DISEASE_URL = "https://my-api.plantnet.org/v2/diseases/identify"
+_PLANTNET_ORGANS = {"leaf", "flower", "fruit", "bark", "habit", "other", "auto"}
+
+
+def _plantnet_key() -> str:
+    for k in ("PLANTNET_API_KEY", "PLANT_NET_API_KEY", "PLANTNET_KEY", "PLANT_API_KEY"):
+        v = os.environ.get(k)
+        if v:
+            return v
+    return ""
+
+
+def plantnet_is_configured() -> bool:
+    return bool(_plantnet_key())
+
+
+def _plantnet_lang(code: str | None) -> str:
+    c = (code or "").split("-")[0].lower()
+    return c if c in ("en", "cs", "pl", "de", "fr", "es", "sk", "ro") else "en"
+
+
+def _plantnet_care_tips(language, display_name, scientific_name):
+    if not is_configured():
+        return None
+    lang = _lang(language)
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        resp = client.chat.completions.create(
+            model=os.environ.get("OPENAI_TRANSLATE_MODEL", "gpt-4o-mini"),
+            max_tokens=120, temperature=0.2,
+            messages=[
+                {"role": "system",
+                 "content": f"You are a gardener. Write in {lang}. 1-2 short practical care sentences."},
+                {"role": "user",
+                 "content": f"Plant: {display_name} ({scientific_name}). Brief care tips "
+                            f"(light, water, soil) for a UK landscaping team."},
+            ])
+        return (resp.choices[0].message.content or "").strip() or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _plantnet_identify(images, organs, language):
+    key = _plantnet_key()
+    if not key or not images:
+        return None
+    import httpx
+    imgs = [b for b in images[:5] if b]
+    if not imgs:
+        return None
+    orgs = [o if o in _PLANTNET_ORGANS else "auto" for o in (organs or [])]
+    while len(orgs) < len(imgs):
+        orgs.append("auto")
+    orgs = orgs[:len(imgs)]
+    files = [("images", (f"img{i}.jpg", b, "image/jpeg")) for i, b in enumerate(imgs)]
+    try:
+        resp = httpx.post(
+            _PLANTNET_ID_URL,
+            params={"api-key": key, "lang": _plantnet_lang(language), "nb-results": 5},
+            data=[("organs", o) for o in orgs],
+            files=files, timeout=45.0)
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    results = raw.get("results") if isinstance(raw, dict) else None
+    if not isinstance(results, list) or not results:
+        return None
+
+    def shape(r):
+        sp = r.get("species") if isinstance(r.get("species"), dict) else {}
+        genus = sp.get("genus") if isinstance(sp.get("genus"), dict) else {}
+        family = sp.get("family") if isinstance(sp.get("family"), dict) else {}
+        common = sp.get("commonNames") or []
+        sci = sp.get("scientificNameWithoutAuthor") or sp.get("scientificName") or ""
+        return {"scientific_name": sci, "display_name": (common[0] if common else sci),
+                "common_names": common,
+                "family": family.get("scientificNameWithoutAuthor"),
+                "genus": genus.get("scientificNameWithoutAuthor"),
+                "score": float(r.get("score") or 0.0)}
+
+    shaped = [shape(r) for r in results if isinstance(r, dict)]
+    shaped = [s for s in shaped if s["scientific_name"]]
+    if not shaped:
+        return None
+    top = shaped[0]
+    pct = int(round(top["score"] * 100))
+    code = (language or "").split("-")[0].lower()
+    spoken = _tr(code,
+                 f"This is most likely {top['display_name']} ({top['scientific_name']}), confidence {pct}%.",
+                 f"Nejspíš je to {top['display_name']} ({top['scientific_name']}), jistota {pct} %.",
+                 f"Najprawdopodobniej to {top['display_name']} ({top['scientific_name']}), pewność {pct}%.")
+    return {
+        "database": "Pl@ntNet",
+        "display_name": top["display_name"], "scientific_name": top["scientific_name"],
+        "common_names": top["common_names"], "family": top["family"],
+        "genus": top["genus"], "score": top["score"], "organs": orgs,
+        "guidance": _plantnet_care_tips(language, top["display_name"], top["scientific_name"]),
+        "spoken_summary": spoken,
+        "suggestions": [
+            {"display_name": s["display_name"], "scientific_name": s["scientific_name"],
+             "common_names": s["common_names"], "score": s["score"],
+             "family": s["family"], "genus": s["genus"]} for s in shaped[:5]],
+    }
+
+
+def _disease_text(language, issue_name, prob, is_healthy):
+    code = (language or "").split("-")[0].lower()
+    pct = int(round(prob * 100))
+    if is_healthy:
+        return None, None, _tr(code,
+            "The plant looks healthy — no clear disease detected.",
+            "Rostlina vypadá zdravě — žádná zřetelná choroba nenalezena.",
+            "Roślina wygląda zdrowo — nie wykryto wyraźnej choroby.")
+    basic = _tr(code,
+                f"Likely issue: {issue_name} (confidence {pct}%).",
+                f"Pravděpodobný problém: {issue_name} (jistota {pct} %).",
+                f"Prawdopodobny problem: {issue_name} (pewność {pct}%).")
+    if not is_configured():
+        return None, None, basic
+    lang = _lang(language)
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        resp = client.chat.completions.create(
+            model=os.environ.get("OPENAI_TRANSLATE_MODEL", "gpt-4o-mini"),
+            max_tokens=240, temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system",
+                 "content": f"You are a plant pathologist. Write in {lang}. Return JSON."},
+                {"role": "user",
+                 "content": f"A plant photo was flagged with: {issue_name} (confidence {pct}%). "
+                            f"Return JSON keys: description (1-2 sentences), "
+                            f"guidance (treatment + prevention, 1-2 sentences), "
+                            f"spoken_summary (one natural sentence naming the issue and confidence)."},
+            ])
+        data = json.loads(resp.choices[0].message.content or "{}")
+        return data.get("description"), data.get("guidance"), data.get("spoken_summary") or basic
+    except Exception:  # noqa: BLE001
+        return None, None, basic
+
+
+def _plantnet_disease(images, language):
+    key = _plantnet_key()
+    if not key or not images:
+        return None
+    import httpx
+    imgs = [b for b in images[:5] if b]
+    if not imgs:
+        return None
+    files = [("images", (f"img{i}.jpg", b, "image/jpeg")) for i, b in enumerate(imgs)]
+    try:
+        resp = httpx.post(
+            _PLANTNET_DISEASE_URL,
+            params={"api-key": key, "lang": _plantnet_lang(language)},
+            files=files, timeout=45.0)
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    results = raw.get("results") if isinstance(raw, dict) else None
+    if not isinstance(results, list) or not results:
+        return None
+    top = next((r for r in results if isinstance(r, dict)), None)
+    if not top:
+        return None
+    issue_name = _flatten_text(top.get("label")) or _flatten_text(top.get("name")) or ""
+    prob = _score(top.get("score"))
+    is_healthy = prob < 0.15 or not issue_name
+    desc, guidance, spoken = _disease_text(language, issue_name, prob, is_healthy)
+    return {
+        "database": "Pl@ntNet",
+        "is_healthy": is_healthy,
+        "health_probability": round(1.0 - prob, 4),
+        "top_issue_name": issue_name or None,
+        "top_issue_common_names": _flatten_list(top.get("commonNames")),
+        "top_issue_probability": prob,
+        "top_issue_description": desc,
+        "guidance": guidance,
+        "spoken_summary": spoken,
+        "suggestions": [
+            {"name": _flatten_text(r.get("label")) or _flatten_text(r.get("name")),
+             "probability": _score(r.get("score"))}
+            for r in results[:5] if isinstance(r, dict)],
+    }
+
+
+def identify_plant(image_bytes: bytes, language: str | None = None,
+                   images: list[bytes] | None = None,
+                   organs: list[str] | None = None) -> dict:
+    pn = _plantnet_identify(images or [image_bytes], organs, language)
+    if pn is not None:
+        return pn
     lang = _lang(language)
     raw = _vision(
         image_bytes,
@@ -83,7 +281,11 @@ def identify_plant(image_bytes: bytes, language: str | None = None) -> dict:
     }
 
 
-def assess_health(image_bytes: bytes, language: str | None = None) -> dict:
+def assess_health(image_bytes: bytes, language: str | None = None,
+                  images: list[bytes] | None = None) -> dict:
+    pn = _plantnet_disease(images or [image_bytes], language)
+    if pn is not None:
+        return pn
     lang = _lang(language)
     raw = _vision(
         image_bytes,
