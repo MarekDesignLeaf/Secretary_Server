@@ -89,3 +89,27 @@ def test_czech_company_with_english_user_pref_stays_czech(monkeypatch):
                       json={"utterance": "vytvoř úkol zavolat dodavateli"}).json()
     assert out["executed"] is True
     assert "úkol" in out["message"].lower()
+
+
+def test_voice_session_ignores_client_language_uses_internal(monkeypatch):
+    """Work-report session is staff-facing (no client). The session prompt must
+    be the tenant internal language (Czech), regardless of the client-sent
+    'language' field — which used to be trusted verbatim."""
+    from secretary_clean.api.routes.voice_session import _PROMPTS
+    monkeypatch.setenv("SECRETARY_CLEAN_JWT_SECRET", "test-secret-for-clean-backend")
+    client = TestClient(create_app())
+    company = client.post("/api/v1/bootstrap/first-company", json={
+        "legal_name": "Czech Co",
+        "default_internal_language_code": "cs-CZ",
+        "default_customer_language_code": "en-GB"}).json()
+    client.post("/api/v1/bootstrap/first-admin", json={
+        "company_id": company["id"], "email": "marek@example.com",
+        "display_name": "Marek", "password": "very-secure-password",
+        "preferred_language_code": "en-GB"})
+    tokens = client.post("/api/v1/auth/login", json={
+        "email": "marek@example.com", "password": "very-secure-password"}).json()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    resp = client.post("/api/v1/voice/session/start", headers=headers,
+                       json={"language": "en"})
+    assert resp.status_code == 200
+    assert resp.json()["prompt"] == _PROMPTS["client"]["cs"]

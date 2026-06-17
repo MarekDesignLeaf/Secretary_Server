@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from secretary_clean.api.deps import get_repository, require_permission
+from secretary_clean.core.language import resolve_language_context
 from secretary_clean.core.models import (
     Permission,
     UserAccount,
@@ -277,7 +278,7 @@ def _build_summary(sess: dict) -> str:
 # ── Pydantic I/O models ───────────────────────────────────────────────────────
 
 class SessionStartRequest(BaseModel):
-    language: str = "en"
+    language: str = "en"  # accepted for wire compat; IGNORED — backend resolves internal language
     work_date: str | None = None
 
 
@@ -308,7 +309,15 @@ def voice_session_start(
 ):
     """Start a new voice Work Report session."""
     work_date = payload.work_date or _now().date().isoformat()
-    lang = payload.language[:2] if len(payload.language) >= 2 else "en"
+    # A work-report session is staff-facing: there is NO client in context, so the
+    # language MUST be the tenant's resolved internal language — NOT whatever the
+    # client app sent (payload.language is ignored). Mirrors /voice/execute and
+    # honours internal_language_mode="single".
+    profile = repository.get_tenant_operating_profile(user.company_id)
+    lang_ctx = resolve_language_context(profile=profile, user=user, client_language_code=None)
+    lang = (getattr(lang_ctx, "voice_output_language_code", "") or "en").split("-")[0].lower()
+    if lang not in ("cs", "en", "pl"):
+        lang = (getattr(profile, "default_internal_language_code", "") or "cs").split("-")[0].lower()
     sess = _create_session(repository, user.company_id, user.id, lang, work_date)
     return SessionResponse(
         session_id=sess["id"],

@@ -1,5 +1,10 @@
 """Voice task.create must keep the spoken date (calendar dot fix)."""
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
+
+
+def _utc_today():
+    """Match the parser, which derives relative dates from UTC now."""
+    return datetime.now(timezone.utc).date()
 
 from fastapi.testclient import TestClient
 
@@ -30,7 +35,7 @@ def _bootstrap_logged_in_client(monkeypatch):
 
 
 def _next_weekday(wd: int) -> str:
-    today = date.today()
+    today = _utc_today()
     delta = (wd - today.weekday()) % 7 or 7
     return (today + timedelta(days=delta)).isoformat()
 
@@ -57,7 +62,7 @@ def test_voice_task_with_tomorrow_and_time(monkeypatch):
     client.post("/api/v1/voice/execute", headers=headers,
                 json={"utterance": "vytvoř úkol zítra v 9 zavolat dodavateli"})
     t = client.get("/api/v1/crm/tasks", headers=headers).json()[0]
-    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    tomorrow = (_utc_today() + timedelta(days=1)).isoformat()
     assert t["plannedDate"] == tomorrow
     assert t["plannedStartAt"].startswith(tomorrow)
 

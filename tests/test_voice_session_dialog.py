@@ -9,7 +9,10 @@ def _bootstrap_logged_in_client(monkeypatch):
     client = TestClient(create_app())
     company = client.post(
         "/api/v1/bootstrap/first-company",
-        json={"legal_name": "Voice Session Ltd"},
+        # Czech-language dialog tests: the work-report session now follows the
+        # tenant internal language, so make it Czech for these Czech utterances.
+        json={"legal_name": "Voice Session Ltd",
+              "default_internal_language_code": "cs-CZ"},
     ).json()
     client.post(
         "/api/v1/bootstrap/first-admin",
