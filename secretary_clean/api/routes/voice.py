@@ -29,6 +29,7 @@ from secretary_clean.core.models import (
     UserAccount,
     VoiceExecuteRequest,
     VoiceExecuteResult,
+    VoicePendingLearning,
     VoiceResolveRequest,
     VoiceResolveResult,
 )
@@ -78,6 +79,22 @@ def _entities_from_text(intent: str, text: str) -> dict:
     return d
 _CANCEL_WORDS = ("zrus", "zrusit", "cancel", "nech to byt", "to staci", "stop", "nechci",
                  "zapomen na to", "uz ne", "konec", "omyl", "neplatny prikaz", "anuluj")
+
+# Voice Command Learning (Phase 3): the "teach me this command" dialog.
+_LEARN_PROMPT = ("Tomuto příkazu zatím nerozumím. K čemu ho mám přiřadit? "
+                 "Řekni známý příkaz, třeba „vytvoř klienta“, nebo řekni zruš.")
+_LEARN_RETRY = ("Nerozumím, ke kterému příkazu to patří. Řekni známý příkaz, "
+                "třeba „vytvoř úkol“, nebo řekni zruš.")
+_LEARN_MAX_ATTEMPTS = 2
+
+
+def _should_learn_unknown(utterance: str) -> bool:
+    """Only offer to learn for a short, command-like unknown — not a long
+    dictation, an empty string, or a bare cancel word."""
+    if vres.is_pure_cancel(utterance):
+        return False
+    words = vsyn.normalize(utterance).split()
+    return 1 <= len(words) <= 6
 
 
 def _lang_ctx(repository, user: UserAccount, client_id: str | None):
@@ -223,6 +240,70 @@ def execute_voice_command(
         if pending and pending.status != "needs_more_info":
             pending = None  # already finished/cancelled — treat as fresh
 
+    # ── Learning-dialog continuation (Phase 3) ────────────────────────────
+    # A pending "alias.learn" turn collects the command the unknown phrase maps
+    # to. Handled entirely here so it never falls into normal slot-filling.
+    if pending and pending.intent == "alias.learn":
+        cd = dict(pending.collected_data or {})
+        pl = (repository.get_voice_pending_learning(cd.get("learning_id"), user.company_id)
+              if cd.get("learning_id") else None)
+        unknown_phrase = cd.get("unknown_phrase") or (pl.unknown_phrase if pl else "")
+
+        def _finish_learning(state, pa_status):
+            if pl:
+                pl.state = state
+                repository.update_voice_pending_learning(pl)
+            pending.status = pa_status
+            repository.update_pending_action(pending)
+
+        # Spec cancel words: omyl / zruš / neplatný příkaz / to nic / zapomeň …
+        if vres.is_pure_cancel(payload.utterance):
+            _finish_learning("CANCELLED", "cancelled")
+            vls.record_event(repository, user.company_id, user.id, unknown_phrase, "CANCELLED")
+            return res(False, "Dobře, nic neukládám.", status="cancelled",
+                       pending_id=pending.id)
+
+        target = vls.resolve_target_intent(payload.utterance)
+        if not target:
+            attempt = int(cd.get("attempt", 0)) + 1
+            if attempt >= _LEARN_MAX_ATTEMPTS:
+                _finish_learning("CANCELLED", "cancelled")
+                vls.record_event(repository, user.company_id, user.id, unknown_phrase,
+                                 "UNKNOWN", metadata={"gave_up": True})
+                return res(False, "Nevadí, zkusíme to jindy.", status="cancelled",
+                           pending_id=pending.id)
+            cd["attempt"] = attempt
+            pending.collected_data = cd
+            pending.last_question = _LEARN_RETRY
+            repository.update_pending_action(pending)
+            return res(False, _LEARN_RETRY, status="needs_more_info",
+                       question=_LEARN_RETRY, missing=["target"], pending_id=pending.id)
+
+        # Target is a known command → create/refresh the alias.
+        norm = vsyn.normalize(unknown_phrase)
+        existing = vls.find_exact_alias(repository, user.company_id, user.id, norm)
+        if existing is not None:
+            existing.raw_phrase = unknown_phrase
+            existing.target_intent = target
+            existing.status = vls.status_for(target)
+            repository.update_voice_alias(existing)
+            alias = existing
+        else:
+            alias = vls.new_alias(user.company_id, user.id, unknown_phrase, target,
+                                  created_by=user.id)
+            repository.create_voice_alias(alias)
+        _finish_learning("COMPLETED", "executed")
+        rtype = "USER_ALIAS" if alias.status == "ACTIVE" else "PENDING_ALIAS"
+        vls.record_event(repository, user.company_id, user.id, unknown_phrase, rtype,
+                         resolved_intent=target, created_alias_id=alias.id)
+        if alias.status == "ACTIVE":
+            msg = f"Rozumím. Příště „{unknown_phrase}“ provedu jako {target}."
+        else:
+            msg = (f"Zapamatováno. „{unknown_phrase}“ spustí {target}, "
+                   f"jakmile tu funkci přidáme.")
+        return res(True, msg, status="executed", action="alias.create",
+                   entity_id=alias.id, data={"alias": alias.model_dump(mode="json")})
+
     # Cancel phrases cancel an active pending action
     if pending and _is_cancel(payload.utterance):
         pending.status = "cancelled"
@@ -306,8 +387,33 @@ def execute_voice_command(
                         learn_source = "AI_FALLBACK"
                         _learn(user.company_id, payload.utterance, intent)  # learning
             if not intent:
+                # Unknown → record it, and for a command-like phrase open the
+                # learning dialog instead of a dead end (Phase 3). The dialog
+                # rides the existing pending_action round-trip, so the client
+                # needs no change. resolved_intent stays None (nothing resolved).
                 vls.record_event(repository, user.company_id, user.id,
                                  payload.utterance, "UNKNOWN")
+                if _should_learn_unknown(payload.utterance):
+                    _now = datetime.now(timezone.utc)
+                    pl = VoicePendingLearning(
+                        id=str(uuid.uuid4()), company_id=user.company_id, user_id=user.id,
+                        unknown_phrase=payload.utterance,
+                        normalized_unknown_phrase=vsyn.normalize(payload.utterance),
+                        state="WAITING_FOR_TARGET", attempt_count=0, created_at=_now,
+                        expires_at=_now + timedelta(minutes=PENDING_TTL_MIN))
+                    repository.create_voice_pending_learning(pl)
+                    pa = PendingVoiceAction(
+                        id=str(uuid.uuid4()), company_id=user.company_id, user_id=user.id,
+                        intent="alias.learn", status="needs_more_info",
+                        collected_data={"learning_id": pl.id,
+                                        "unknown_phrase": payload.utterance, "attempt": 0},
+                        missing_fields=["target"], last_question=_LEARN_PROMPT,
+                        created_at=_now, updated_at=_now,
+                        expires_at=_now + timedelta(minutes=PENDING_TTL_MIN))
+                    repository.create_pending_action(pa)
+                    return res(False, _LEARN_PROMPT, status="needs_more_info",
+                               question=_LEARN_PROMPT, missing=["target"],
+                               pending_id=pa.id)
                 return res(False, "Nerozuměl jsem příkazu. Můžeš to říct jinak?",
                            status="error")
 

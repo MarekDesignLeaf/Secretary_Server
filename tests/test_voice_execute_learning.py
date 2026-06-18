@@ -47,11 +47,13 @@ def test_pending_alias_via_execute_does_not_execute(monkeypatch):
     assert out["action"] == "invoice.from_work_report"
 
 
-def test_unknown_utterance_records_unknown_event(monkeypatch):
+def test_unknown_utterance_opens_dialog_and_records_event(monkeypatch):
     client, headers = _bootstrap(monkeypatch)
     out = client.post("/api/v1/voice/execute", headers=headers,
                       json={"utterance": "qwerty zxcvb plugh"}).json()
-    assert out["status"] == "error"
+    # Phase 3: unknown command → learning dialog (not a flat error).
+    assert out["status"] == "needs_more_info"
+    assert out["pending_action_id"]
     evs = client.get("/api/v1/voice/learning/events", headers=headers).json()["events"]
     assert any(e["resolution_type"] == "UNKNOWN" for e in evs)
 

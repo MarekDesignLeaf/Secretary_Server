@@ -18,13 +18,20 @@ def _client(monkeypatch):
     return c, {"Authorization": f"Bearer {tok['access_token']}"}
 
 
-def test_unknown_phrasing_without_ai_is_graceful(monkeypatch):
+def test_unknown_phrasing_without_ai_opens_learning_dialog(monkeypatch):
     c, h = _client(monkeypatch)
     monkeypatch.setattr(ai_intent, "is_configured", lambda: False)
     out = c.post("/api/v1/voice/execute", headers=h,
                  json={"utterance": "ňuňuňu blě blě"}).json()
-    assert out["status"] == "error"
-    assert "jinak" in out["message"].lower() or "nerozum" in out["message"].lower()
+    # New behavior (Voice Command Learning Phase 3): a short unknown command
+    # opens the "teach me" dialog instead of a dead-end error. resolved_intent
+    # stays None (nothing was resolved); the client drives the follow-up via
+    # the existing pending_action round-trip.
+    assert out["executed"] is False
+    assert out["resolved_intent"] is None
+    assert out["status"] == "needs_more_info"
+    assert "nerozum" in out["message"].lower()
+    assert out["pending_action_id"]
 
 
 def test_ai_classifies_unknown_phrasing_and_learns(monkeypatch):
