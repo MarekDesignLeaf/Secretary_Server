@@ -41,6 +41,7 @@ from secretary_clean.core import voice_resolver as vres
 from secretary_clean.core import voice_intent_registry as vreg
 from secretary_clean.core import voice_synonyms as vsyn
 from secretary_clean.core import voice_learning_service as vls
+from secretary_clean.core import contact_validation as cval
 
 router = APIRouter(prefix="/voice", tags=["voice foundation"])
 
@@ -95,6 +96,31 @@ def _should_learn_unknown(utterance: str) -> bool:
         return False
     words = vsyn.normalize(utterance).split()
     return 1 <= len(words) <= 6
+
+
+def _normalize_voice_contact_fields(intent: str, data: dict):
+    """For contact-writing voice intents, normalize + validate phone/email in
+    `data` (in place). On a malformed value, clear it and return (slot, message)
+    so the dialog re-asks; otherwise (None, None). A bad number like "1234" is
+    never stored on a client."""
+    if intent != "client.create":
+        return None, None
+    if data.get("phone"):
+        norm, err = cval.normalize_phone(data["phone"])
+        if err:
+            bad = data["phone"]
+            data["phone"] = None
+            return "phone", (f"Telefon „{bad}“ {err}. "
+                             f"Řekni platné telefonní číslo klienta.")
+        data["phone"] = norm
+    if data.get("email"):
+        norm, err = cval.normalize_email(data["email"])
+        if err:
+            bad = data["email"]
+            data["email"] = None
+            return "email", f"E-mail „{bad}“ {err}. Řekni platný e-mail klienta."
+        data["email"] = norm
+    return None, None
 
 
 def _lang_ctx(repository, user: UserAccount, client_id: str | None):
@@ -440,6 +466,31 @@ def execute_voice_command(
             pid_out = new_pending.id
         return res(False, question, status="needs_more_info", action=intent,
                    data=data, missing=missing, question=question, pending_id=pid_out)
+
+    # ── Field-format validation: a malformed phone/email must not be saved ──
+    # Treat the bad field as missing and re-ask (e.g. phone "1234" is rejected).
+    _bad_slot, _bad_msg = _normalize_voice_contact_fields(intent, data)
+    if _bad_slot:
+        now = datetime.now(timezone.utc)
+        if pending:
+            pending.collected_data = data
+            pending.missing_fields = [_bad_slot]
+            pending.last_question = _bad_msg
+            pending.status = "needs_more_info"
+            repository.update_pending_action(pending)
+            pid_out = pending.id
+        else:
+            new_pending = PendingVoiceAction(
+                id=str(uuid.uuid4()), company_id=user.company_id, user_id=user.id,
+                intent=intent, status="needs_more_info", collected_data=data,
+                missing_fields=[_bad_slot], last_question=_bad_msg,
+                created_at=now, updated_at=now,
+                expires_at=now + timedelta(minutes=PENDING_TTL_MIN),
+            )
+            repository.create_pending_action(new_pending)
+            pid_out = new_pending.id
+        return res(False, _bad_msg, status="needs_more_info", action=intent,
+                   data=data, missing=[_bad_slot], question=_bad_msg, pending_id=pid_out)
 
     # All required info present → mark pending ready/executed then run the action.
     if pending:

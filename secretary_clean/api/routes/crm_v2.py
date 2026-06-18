@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
 from secretary_clean.api.deps import current_user, get_repository, require_permission
+from secretary_clean.core import contact_validation as cval
 from secretary_clean.core import crm_shapes as shapes
 from secretary_clean.core.models import (
     CRMRecord,
@@ -55,6 +56,9 @@ def _client_names(repository, company_id: str) -> dict[str, str]:
 
 
 def _create(repository, module: str, user: UserAccount, payload: dict) -> CRMRecord:
+    payload, _errs = cval.validate_and_normalize(payload)
+    if _errs:
+        raise HTTPException(status_code=422, detail=" ".join(_errs))
     name, status, data = shapes.split_payload(module, payload)
     if not name:
         raise HTTPException(status_code=422, detail="Name/title is required")
@@ -70,6 +74,9 @@ def _create(repository, module: str, user: UserAccount, payload: dict) -> CRMRec
 
 def _update(repository, module: str, record_id: str, user: UserAccount, payload: dict) -> CRMRecord:
     _get_or_404(repository, module, record_id, user.company_id)
+    payload, _errs = cval.validate_and_normalize(payload)
+    if _errs:
+        raise HTTPException(status_code=422, detail=" ".join(_errs))
     name, status, data = shapes.split_payload(module, payload)
     req = CRMUpdateRequest(name=name or None, status=payload.get(shapes.STATUS_KEYS[module]) and status or None, data=data or None)
     record = repository.update_crm_record(module, record_id, user.company_id, req)
@@ -225,28 +232,32 @@ def sync_contacts(
     """Bulk-import device contacts as clients. Body: {contacts:[{name,phone,email}]}.
     Skips duplicates (by phone/email/name); never creates a second copy."""
     contacts = payload.get("contacts") or []
-    imported, skipped = 0, 0
+    imported, skipped, invalid = 0, 0, 0
     created_ids = []
     for c in contacts:
         name = str(c.get("name") or "").strip()
-        phone = str(c.get("phone") or "").strip()
+        # Normalize + validate: a malformed phone/email is dropped, never stored.
+        phone, perr = cval.normalize_phone(c.get("phone"))
+        email, eerr = cval.normalize_email(c.get("email"))
+        if perr or eerr:
+            invalid += 1
         if not name and not phone:
-            continue
-        email = str(c.get("email") or "").strip() or None
+            continue  # nothing usable (empty, or the only identifier was invalid)
         if repository.find_duplicate_client(user.company_id, name=name or None,
                                             phone=phone or None, email=email) is not None:
             skipped += 1
             continue
         rec = repository.create_crm_record(
             "clients", user.company_id, name or phone,
-            {"source": "import", "phone": phone or None, "email": email})
+            {"source": "import", "phone": phone, "email": email})
         created_ids.append(rec.id)
         imported += 1
-    if imported:
+    if imported or invalid:
         repository.log_activity(
             user.company_id, user.id, "client", "", "import_contacts",
-            f"Imported {imported} contacts ({skipped} skipped)", source_channel="app")
-    return {"imported": imported, "skipped": skipped,
+            f"Imported {imported} contacts ({skipped} skipped, {invalid} invalid)",
+            source_channel="app")
+    return {"imported": imported, "skipped": skipped, "invalid": invalid,
             "total": len(contacts), "created_ids": created_ids}
 
 
