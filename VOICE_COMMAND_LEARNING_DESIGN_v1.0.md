@@ -6,7 +6,10 @@
 > Calendar, Vercel, or any learning engine for prices / business rules /
 > client data. Those are explicitly out of scope.
 
-Status: design approved → implementation in 5 phases (see §13).
+Status: **Phases 1–4 implemented & green (backend suite 133 passed).** Phase 5
+(Android) deferred as not required — the learning dialog rides the existing
+pending-action round-trip the client already drives, and the alias/intents/events
+endpoints await a future admin UI (§11). See §13 for per-phase status.
 Author: backend. Source of truth: backend + PostgreSQL.
 
 ---
@@ -377,27 +380,30 @@ delete, and remap — all already covered by the alias + events endpoints.
 
 ## 13. Implementation phases (commit + report after each)
 
-- **Phase 1 — Resolver core (code-only, no DB).**
+- **Phase 1 — Resolver core (code-only, no DB). ✅ DONE (commit a473feb).**
   `voice_intent_registry.py`, `voice_synonyms.py`, `voice_resolver.py`
   (normalize → builtin synonym → parse → score → confidence band → ambiguity).
   Tests: synonym match, ambiguity, confidence bands. No schema change.
-- **Phase 2 — Durable aliases + learning events.**
+- **Phase 2 — Durable aliases + learning events. ✅ DONE (commit ab52621).**
   4 tables (additive migration) + in-memory repo models; alias lookup wired into
   the resolver (stage C); `voice/execute` writes a learning event each call.
   Endpoints: GET `/voice/intents`, GET/POST/PUT/DELETE `/voice/aliases`,
   GET `/voice/learning/events`, POST `/voice/learning/resolve`. Tests: alias
   match, soft delete, permission-at-execution, event written.
-- **Phase 3 — Learning dialog + pending learnings.**
+- **Phase 3 — Learning dialog + pending learnings. ✅ DONE (commit fc17868).**
   Unknown → "Tomuto příkazu zatím nerozumím…" → map to known command → ACTIVE /
-  PENDING / admin-queue; cancel words; max-two re-asks; `pending_learnings`
-  state machine. Tests: unknown→learn, omyl/neplatný cancel, two-ask limit.
-- **Phase 4 — Pending activation + admin endpoints polish.**
-  `activate_pending_aliases()` on startup; finalize audit endpoints. Tests:
-  pending→active after implement, events audit.
-- **Phase 5 — Android wiring (only if required).**
-  Move client-side alias storage to call the backend alias endpoints; keep
-  Android as a thin client (text in, spoken result out). No business logic moves
-  to the client.
+  PENDING; cancel words; max-two re-asks; `pending_learnings` state machine.
+  Tests: unknown→learn, omyl/neplatný cancel, two-ask limit.
+- **Phase 4 — Pending activation + admin endpoints polish. ✅ DONE (commit d354708).**
+  `_activate_pending_aliases()` on startup + POST /voice/learning/activate-pending.
+  Tests: pending→active after implement, idempotent, tenant-scoped endpoint.
+- **Phase 5 — Android wiring. ⏸ DEFERRED (not required).**
+  The learning dialog already works through the existing pending-action
+  round-trip the client drives for slot-filling, so no client change is needed
+  for the core capability. Moving the client's local alias store to the backend
+  endpoints, and a Settings admin screen for aliases/events, are future
+  enhancements — to be done only when an admin UI is built. Android stays a thin
+  client (text in, spoken result out); no business logic moves to it.
 
 After each phase: run the full backend test suite, commit on
 `clean-first-install-api`, list changed files, what changed / didn't, the
