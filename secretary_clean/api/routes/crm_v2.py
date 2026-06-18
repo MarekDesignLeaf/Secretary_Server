@@ -940,12 +940,18 @@ def convert_lead_to_client(
 ):
     lead = _get_or_404(repository, "leads", lead_id, user.company_id)
     d = lead.data or {}
-    client = repository.create_crm_record("clients", user.company_id, lead.name, {
+    # Canonicalize the contact fields copied onto the new client — this is the
+    # one client-create path that doesn't go through _create(), so validate here
+    # too (lead fields are normally pre-validated, but never store a bad number).
+    client_data, _errs = cval.validate_and_normalize({
         "email_primary": d.get("contact_email"),
         "phone_primary": d.get("contact_phone"),
         "source": "lead",
         "lead_id": lead.id,
     })
+    if _errs:
+        raise HTTPException(status_code=422, detail=" ".join(_errs))
+    client = repository.create_crm_record("clients", user.company_id, lead.name, client_data)
     repository.update_crm_record("leads", lead_id, user.company_id,
                                  CRMUpdateRequest(status="converted",
                                                   data={"client_id": client.id}))

@@ -107,6 +107,25 @@ def _say(client, headers, utterance, pending_id=None):
     return client.post("/api/v1/voice/execute", headers=headers, json=body).json()
 
 
+def test_lead_create_rejects_bad_contact_phone(monkeypatch):
+    client, headers = _bootstrap(monkeypatch)
+    r = client.post("/api/v1/crm/leads", headers=headers,
+                    json={"contact_name": "Zájemce", "contact_phone": "1234"})
+    assert r.status_code == 422
+
+
+def test_lead_to_client_conversion_normalizes_phone(monkeypatch):
+    client, headers = _bootstrap(monkeypatch)
+    lead = client.post("/api/v1/crm/leads", headers=headers,
+                       json={"contact_name": "Zájemce", "contact_phone": "777 123 456",
+                             "contact_email": "Z@Example.com"}).json()
+    conv = client.post(f"/api/v1/crm/leads/{lead['id']}/convert-to-client", headers=headers)
+    assert conv.status_code == 200
+    body = conv.json()
+    assert body["phone_primary"] == "777123456"
+    assert body["email_primary"] == "z@example.com"
+
+
 def test_voice_client_create_reasks_on_bad_phone(monkeypatch):
     client, headers = _bootstrap(monkeypatch)
     out = _say(client, headers, "vytvoř klienta Jan Novák")
