@@ -154,6 +154,30 @@ def resolve_preview(
     }
 
 
+# ── Activate pending aliases for this tenant (ops/admin) ──────────────────────
+@router.post("/learning/activate-pending")
+def activate_pending(
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Flip this tenant's PENDING aliases to ACTIVE once their target intent is
+    implemented. The same pass runs automatically on every server boot (§10);
+    this endpoint lets an admin trigger it without a restart."""
+    impl = reg.implemented_intents()
+    activated = []
+    for a in repository.list_voice_aliases(user.company_id, status="PENDING",
+                                           include_global=False):
+        if a.target_intent in impl:
+            a.status = "ACTIVE"
+            repository.update_voice_alias(a)
+            vls.record_event(repository, user.company_id, a.created_by, a.raw_phrase,
+                             "PENDING_ALIAS", resolved_intent=a.target_intent,
+                             created_alias_id=a.id, metadata={"activated": True})
+            activated.append(a)
+    return {"count": len(activated),
+            "activated": [a.model_dump(mode="json") for a in activated]}
+
+
 # ── Learning-event audit ──────────────────────────────────────────────────────
 @router.get("/learning/events")
 def list_events(

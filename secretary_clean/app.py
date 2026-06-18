@@ -134,9 +134,28 @@ def _seed_from_env(repository) -> None:
         log.error("Seed failed: %s", exc)
 
 
+def _activate_pending_aliases(repository) -> None:
+    """Voice Command Learning §10: on boot, flip PENDING voice aliases to ACTIVE
+    once their target intent is implemented. Idempotent and best-effort — must
+    never block startup (e.g. when the table isn't migrated yet)."""
+    try:
+        from secretary_clean.core import voice_intent_registry as vreg
+        from secretary_clean.core import voice_learning_service as vls
+        activated = repository.activate_pending_voice_aliases(vreg.implemented_intents())
+        for a in activated:
+            vls.record_event(repository, a.company_id, a.created_by, a.raw_phrase,
+                             "PENDING_ALIAS", resolved_intent=a.target_intent,
+                             created_alias_id=a.id, metadata={"activated_on_boot": True})
+        if activated:
+            log.info("Activated %d pending voice alias(es) on startup", len(activated))
+    except Exception as exc:
+        log.warning("Pending voice-alias activation skipped: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _seed_from_env(app.state.repository)
+    _activate_pending_aliases(app.state.repository)
     yield
 
 
