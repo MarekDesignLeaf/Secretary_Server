@@ -571,6 +571,64 @@ class PendingVoiceAction(BaseModel):
     expires_at: datetime | None = None
 
 
+class VoiceCommandAlias(BaseModel):
+    """A learned phrase→intent translation (Voice Command Learning, Phase 2).
+
+    An alias is ONLY a translation, never a permission grant — the target
+    intent's permission is always checked at execution time."""
+    id: str
+    company_id: str
+    user_id: str | None = None           # None = company-wide alias
+    raw_phrase: str
+    normalized_phrase: str
+    target_intent: str
+    language_code: str | None = None
+    status: str = "ACTIVE"               # ACTIVE / PENDING / DISABLED / REJECTED
+    confidence: float = 1.0
+    source: str = "user_learning"
+    created_by: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    last_used_at: datetime | None = None
+    use_count: int = 0
+    is_global: bool = False
+
+
+class VoiceLearningEvent(BaseModel):
+    """An append-only audit record of one resolution (Voice Command Learning)."""
+    id: str
+    company_id: str
+    user_id: str | None = None
+    raw_input: str
+    normalized_input: str | None = None
+    resolved_intent: str | None = None
+    # BUILTIN_SYNONYM / USER_ALIAS / PENDING_ALIAS / UNKNOWN / CANCELLED /
+    # AMBIGUOUS / FAILED_PERMISSION / FAILED_VALIDATION
+    resolution_type: str
+    confidence: float | None = None
+    was_executed: bool = False
+    was_confirmed: bool = False
+    created_alias_id: str | None = None
+    created_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class VoicePendingLearning(BaseModel):
+    """An in-progress 'teach me this command' dialog (Voice Command Learning,
+    Phase 3 state machine)."""
+    id: str
+    company_id: str
+    user_id: str | None = None
+    unknown_phrase: str
+    normalized_unknown_phrase: str | None = None
+    # WAITING_FOR_TARGET / WAITING_FOR_CONFIRMATION / CANCELLED / COMPLETED / EXPIRED
+    state: str = "WAITING_FOR_TARGET"
+    attempt_count: int = 0
+    created_at: datetime
+    expires_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class VoiceExecuteRequest(BaseModel):
     utterance: str
     confirmed: bool = False

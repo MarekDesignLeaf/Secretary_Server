@@ -49,6 +49,9 @@ from secretary_clean.core.models import (
     CalendarSyncLogEntry,
     GoogleCalendarAccount,
     PendingVoiceAction,
+    VoiceCommandAlias,
+    VoiceLearningEvent,
+    VoicePendingLearning,
     TenantLanguage,
     TenantLanguageChoice,
     TenantOperatingProfile,
@@ -2587,6 +2590,193 @@ class PostgresSecretaryRepository:
                 )
             conn.commit()
         return action
+
+    # ------------------------------------------------------------------
+    # Voice Command Learning (Phase 2/3): aliases, learning events, pending
+    # learnings. An alias is a phrase→intent translation only; permission is
+    # re-checked at execution by the caller.
+    # ------------------------------------------------------------------
+    def _row_to_voice_alias(self, row: dict) -> VoiceCommandAlias:
+        return VoiceCommandAlias(
+            id=str(row["id"]), company_id=str(row["company_id"]),
+            user_id=str(row["user_id"]) if row.get("user_id") else None,
+            raw_phrase=row["raw_phrase"], normalized_phrase=row["normalized_phrase"],
+            target_intent=row["target_intent"], language_code=row.get("language_code"),
+            status=row["status"], confidence=float(row["confidence"]),
+            source=row["source"],
+            created_by=str(row["created_by"]) if row.get("created_by") else None,
+            created_at=row["created_at"], updated_at=row["updated_at"],
+            last_used_at=row.get("last_used_at"), use_count=row["use_count"],
+            is_global=row["is_global"])
+
+    def create_voice_alias(self, alias: VoiceCommandAlias) -> VoiceCommandAlias:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_voice_command_aliases (id, company_id, user_id, raw_phrase, normalized_phrase, target_intent, language_code, status, confidence, source, created_by, last_used_at, use_count, is_global) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (alias.id, alias.company_id, alias.user_id, alias.raw_phrase,
+                     alias.normalized_phrase, alias.target_intent, alias.language_code,
+                     alias.status, alias.confidence, alias.source, alias.created_by,
+                     alias.last_used_at, alias.use_count, alias.is_global))
+            conn.commit()
+        return alias
+
+    def get_voice_alias(self, alias_id: str, company_id: str) -> VoiceCommandAlias | None:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM clean_voice_command_aliases WHERE id=%s AND (company_id=%s OR is_global=TRUE)",
+                    (alias_id, company_id))
+                row = cur.fetchone()
+        return self._row_to_voice_alias(row) if row else None
+
+    def list_voice_aliases(self, company_id: str, status: str | None = None,
+                           include_global: bool = True) -> list[VoiceCommandAlias]:
+        clause = "(company_id=%s" + (" OR is_global=TRUE" if include_global else "") + ")"
+        params: list = [company_id]
+        if status is not None:
+            clause += " AND status=%s"
+            params.append(status)
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"SELECT * FROM clean_voice_command_aliases WHERE {clause} ORDER BY created_at",
+                    tuple(params))
+                rows = cur.fetchall()
+        return [self._row_to_voice_alias(r) for r in rows]
+
+    def find_voice_alias(self, company_id: str, normalized_phrase: str,
+                         user_id: str | None = None) -> VoiceCommandAlias | None:
+        # user-scoped first, then company-wide, then global; ACTIVE before PENDING.
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM clean_voice_command_aliases
+                       WHERE normalized_phrase=%s AND status IN ('ACTIVE','PENDING')
+                         AND (company_id=%s OR is_global=TRUE)
+                       ORDER BY
+                         (CASE WHEN company_id=%s AND user_id=%s THEN 0
+                               WHEN company_id=%s AND user_id IS NULL THEN 1
+                               WHEN is_global THEN 2 ELSE 3 END),
+                         (status <> 'ACTIVE'), created_at
+                       LIMIT 1""",
+                    (normalized_phrase, company_id, company_id, user_id, company_id))
+                row = cur.fetchone()
+        return self._row_to_voice_alias(row) if row else None
+
+    def update_voice_alias(self, alias: VoiceCommandAlias) -> VoiceCommandAlias:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE clean_voice_command_aliases SET raw_phrase=%s, normalized_phrase=%s, target_intent=%s, language_code=%s, status=%s, confidence=%s, last_used_at=%s, use_count=%s, is_global=%s, updated_at=now() WHERE id=%s",
+                    (alias.raw_phrase, alias.normalized_phrase, alias.target_intent,
+                     alias.language_code, alias.status, alias.confidence,
+                     alias.last_used_at, alias.use_count, alias.is_global, alias.id))
+            conn.commit()
+        return alias
+
+    def touch_voice_alias(self, alias_id: str, company_id: str) -> VoiceCommandAlias | None:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE clean_voice_command_aliases SET use_count=use_count+1, last_used_at=now() WHERE id=%s AND (company_id=%s OR is_global=TRUE)",
+                    (alias_id, company_id))
+            conn.commit()
+        return self.get_voice_alias(alias_id, company_id)
+
+    def activate_pending_voice_aliases(self, implemented_intents) -> list[VoiceCommandAlias]:
+        intents = list(implemented_intents)
+        if not intents:
+            return []
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "UPDATE clean_voice_command_aliases SET status='ACTIVE', updated_at=now() WHERE status='PENDING' AND target_intent = ANY(%s) RETURNING *",
+                    (intents,))
+                rows = cur.fetchall()
+            conn.commit()
+        return [self._row_to_voice_alias(r) for r in rows]
+
+    def _row_to_learning_event(self, row: dict) -> VoiceLearningEvent:
+        return VoiceLearningEvent(
+            id=str(row["id"]), company_id=str(row["company_id"]),
+            user_id=str(row["user_id"]) if row.get("user_id") else None,
+            raw_input=row["raw_input"], normalized_input=row.get("normalized_input"),
+            resolved_intent=row.get("resolved_intent"),
+            resolution_type=row["resolution_type"],
+            confidence=float(row["confidence"]) if row.get("confidence") is not None else None,
+            was_executed=row["was_executed"], was_confirmed=row["was_confirmed"],
+            created_alias_id=str(row["created_alias_id"]) if row.get("created_alias_id") else None,
+            created_at=row["created_at"], metadata=row.get("metadata") or {})
+
+    def record_voice_learning_event(self, event: VoiceLearningEvent) -> VoiceLearningEvent:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_voice_learning_events (id, company_id, user_id, raw_input, normalized_input, resolved_intent, resolution_type, confidence, was_executed, was_confirmed, created_alias_id, metadata) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                    (event.id, event.company_id, event.user_id, event.raw_input,
+                     event.normalized_input, event.resolved_intent, event.resolution_type,
+                     event.confidence, event.was_executed, event.was_confirmed,
+                     event.created_alias_id, json.dumps(event.metadata)))
+            conn.commit()
+        return event
+
+    def list_voice_learning_events(self, company_id: str, limit: int = 100) -> list[VoiceLearningEvent]:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM clean_voice_learning_events WHERE company_id=%s ORDER BY created_at DESC LIMIT %s",
+                    (company_id, limit))
+                rows = cur.fetchall()
+        return [self._row_to_learning_event(r) for r in rows]
+
+    def _row_to_pending_learning(self, row: dict) -> VoicePendingLearning:
+        return VoicePendingLearning(
+            id=str(row["id"]), company_id=str(row["company_id"]),
+            user_id=str(row["user_id"]) if row.get("user_id") else None,
+            unknown_phrase=row["unknown_phrase"],
+            normalized_unknown_phrase=row.get("normalized_unknown_phrase"),
+            state=row["state"], attempt_count=row["attempt_count"],
+            created_at=row["created_at"], expires_at=row.get("expires_at"),
+            metadata=row.get("metadata") or {})
+
+    def create_voice_pending_learning(self, pl: VoicePendingLearning) -> VoicePendingLearning:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clean_voice_pending_learnings (id, company_id, user_id, unknown_phrase, normalized_unknown_phrase, state, attempt_count, expires_at, metadata) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                    (pl.id, pl.company_id, pl.user_id, pl.unknown_phrase,
+                     pl.normalized_unknown_phrase, pl.state, pl.attempt_count,
+                     pl.expires_at, json.dumps(pl.metadata)))
+            conn.commit()
+        return pl
+
+    def get_voice_pending_learning(self, pl_id: str, company_id: str) -> VoicePendingLearning | None:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM clean_voice_pending_learnings WHERE id=%s AND company_id=%s",
+                    (pl_id, company_id))
+                row = cur.fetchone()
+        return self._row_to_pending_learning(row) if row else None
+
+    def get_active_voice_pending_learning(self, company_id: str, user_id: str | None):
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM clean_voice_pending_learnings WHERE company_id=%s AND user_id IS NOT DISTINCT FROM %s AND state IN ('WAITING_FOR_TARGET','WAITING_FOR_CONFIRMATION') ORDER BY created_at DESC LIMIT 1",
+                    (company_id, user_id))
+                row = cur.fetchone()
+        return self._row_to_pending_learning(row) if row else None
+
+    def update_voice_pending_learning(self, pl: VoicePendingLearning) -> VoicePendingLearning:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE clean_voice_pending_learnings SET state=%s, attempt_count=%s, expires_at=%s, metadata=%s::jsonb WHERE id=%s",
+                    (pl.state, pl.attempt_count, pl.expires_at, json.dumps(pl.metadata), pl.id))
+            conn.commit()
+        return pl
 
     # ------------------------------------------------------------------
     # Phase G3: Google Calendar account / sync log (tokens never logged)

@@ -263,6 +263,83 @@ CREATE TABLE IF NOT EXISTS clean_google_calendar_sync_log (
 );
 CREATE INDEX IF NOT EXISTS clean_gcal_synclog_company_idx
     ON clean_google_calendar_sync_log(company_id, created_at);
+
+-- Voice Command Learning (Phase 2): durable aliases, learning events, pending
+-- learnings, and an optional registry export cache. Purely additive.
+CREATE TABLE IF NOT EXISTS clean_voice_command_aliases (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    user_id UUID,
+    raw_phrase TEXT NOT NULL,
+    normalized_phrase TEXT NOT NULL,
+    target_intent TEXT NOT NULL,
+    language_code TEXT,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    source TEXT NOT NULL DEFAULT 'user_learning',
+    created_by UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    is_global BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS clean_voice_aliases_uq
+    ON clean_voice_command_aliases(
+        company_id, normalized_phrase,
+        COALESCE(user_id, '00000000-0000-0000-0000-000000000000'::uuid));
+CREATE INDEX IF NOT EXISTS clean_voice_aliases_lookup_idx
+    ON clean_voice_command_aliases(company_id, status, normalized_phrase);
+
+CREATE TABLE IF NOT EXISTS clean_voice_learning_events (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    user_id UUID,
+    raw_input TEXT NOT NULL,
+    normalized_input TEXT,
+    resolved_intent TEXT,
+    resolution_type TEXT NOT NULL,
+    confidence DOUBLE PRECISION,
+    was_executed BOOLEAN NOT NULL DEFAULT FALSE,
+    was_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_alias_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    metadata JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS clean_voice_events_company_idx
+    ON clean_voice_learning_events(company_id, created_at);
+
+CREATE TABLE IF NOT EXISTS clean_voice_pending_learnings (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    user_id UUID,
+    unknown_phrase TEXT NOT NULL,
+    normalized_unknown_phrase TEXT,
+    state TEXT NOT NULL DEFAULT 'WAITING_FOR_TARGET',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS clean_voice_pending_learn_idx
+    ON clean_voice_pending_learnings(company_id, state);
+
+CREATE TABLE IF NOT EXISTS clean_voice_intent_registry (
+    intent_code TEXT PRIMARY KEY,
+    module TEXT,
+    description TEXT,
+    required_permission TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    is_implemented BOOLEAN NOT NULL DEFAULT FALSE,
+    requires_confirmation BOOLEAN NOT NULL DEFAULT FALSE,
+    supported_languages JSONB NOT NULL DEFAULT '[]',
+    canonical_phrases JSONB NOT NULL DEFAULT '[]',
+    synonyms JSONB NOT NULL DEFAULT '[]',
+    required_entities JSONB NOT NULL DEFAULT '[]',
+    optional_entities JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 # Column additions for existing tables (safe to run multiple times)

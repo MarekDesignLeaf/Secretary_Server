@@ -40,6 +40,9 @@ from .models import (
     CalendarSyncOutcome,
     CalendarSyncLogEntry,
     PendingVoiceAction,
+    VoiceCommandAlias,
+    VoiceLearningEvent,
+    VoicePendingLearning,
     UserAccount,
     WorkReportCreate,
 )
@@ -56,6 +59,10 @@ class InMemorySecretaryRepository:
         self.calendar_events: dict[str, CalendarEvent] = {}  # Phase A3: event_id -> CalendarEvent
         self.calendar_sync_log: list = []  # Phase A5: list[CalendarSyncLogEntry]
         self.pending_voice_actions: dict[str, PendingVoiceAction] = {}  # Phase A5.2
+        # Voice Command Learning (Phase 2/3)
+        self.voice_aliases: dict[str, VoiceCommandAlias] = {}
+        self.voice_learning_events: list[VoiceLearningEvent] = []
+        self.voice_pending_learnings: dict[str, VoicePendingLearning] = {}
         self.google_accounts: dict[str, GoogleCalendarAccount] = {}  # Phase G3 (key=company_id)
         self.google_mappings: list = []  # Phase G3 dicts: company_id, backend_event_id, google_event_id
         self.google_sync_log: list = []  # Phase G3 dicts
@@ -1299,6 +1306,109 @@ class InMemorySecretaryRepository:
         action.updated_at = _dt.now(_tz.utc)
         self.pending_voice_actions[action.id] = action
         return action
+
+    # ------------------------------------------------------------------
+    # Voice Command Learning (Phase 2/3): aliases, learning events, pending
+    # learnings. An alias is only a phrase→intent translation; permission is
+    # always re-checked at execution by the caller.
+    # ------------------------------------------------------------------
+    def create_voice_alias(self, alias: VoiceCommandAlias) -> VoiceCommandAlias:
+        self.voice_aliases[alias.id] = alias
+        return alias
+
+    def get_voice_alias(self, alias_id: str, company_id: str) -> VoiceCommandAlias | None:
+        a = self.voice_aliases.get(alias_id)
+        if not a or (a.company_id != company_id and not a.is_global):
+            return None
+        return a
+
+    def list_voice_aliases(self, company_id: str, status: str | None = None,
+                           include_global: bool = True) -> list[VoiceCommandAlias]:
+        out = []
+        for a in self.voice_aliases.values():
+            if a.company_id == company_id or (include_global and a.is_global):
+                if status is None or a.status == status:
+                    out.append(a)
+        return sorted(out, key=lambda a: a.created_at)
+
+    def find_voice_alias(self, company_id: str, normalized_phrase: str,
+                         user_id: str | None = None) -> VoiceCommandAlias | None:
+        """Resolve a normalized phrase to its best alias, preferring the
+        user's own, then a company-wide one, then a system-global one. Only
+        ACTIVE/PENDING aliases are returned."""
+        cands = [a for a in self.voice_aliases.values()
+                 if a.normalized_phrase == normalized_phrase
+                 and a.status in ("ACTIVE", "PENDING")]
+
+        def pick(pred):
+            m = [a for a in cands if pred(a)]
+            # ACTIVE before PENDING, then most recent.
+            m.sort(key=lambda a: (a.status != "ACTIVE", a.created_at), reverse=False)
+            return m[0] if m else None
+
+        return (
+            (pick(lambda a: a.company_id == company_id and a.user_id == user_id)
+             if user_id else None)
+            or pick(lambda a: a.company_id == company_id and a.user_id is None)
+            or pick(lambda a: a.is_global)
+        )
+
+    def update_voice_alias(self, alias: VoiceCommandAlias) -> VoiceCommandAlias:
+        from datetime import datetime as _dt, timezone as _tz
+        alias.updated_at = _dt.now(_tz.utc)
+        self.voice_aliases[alias.id] = alias
+        return alias
+
+    def touch_voice_alias(self, alias_id: str, company_id: str) -> VoiceCommandAlias | None:
+        from datetime import datetime as _dt, timezone as _tz
+        a = self.get_voice_alias(alias_id, company_id)
+        if a:
+            a.use_count += 1
+            a.last_used_at = _dt.now(_tz.utc)
+            self.voice_aliases[a.id] = a
+        return a
+
+    def activate_pending_voice_aliases(self, implemented_intents) -> list[VoiceCommandAlias]:
+        """Flip PENDING aliases to ACTIVE once their target intent is implemented."""
+        from datetime import datetime as _dt, timezone as _tz
+        activated = []
+        for a in self.voice_aliases.values():
+            if a.status == "PENDING" and a.target_intent in implemented_intents:
+                a.status = "ACTIVE"
+                a.updated_at = _dt.now(_tz.utc)
+                activated.append(a)
+        return activated
+
+    def record_voice_learning_event(self, event: VoiceLearningEvent) -> VoiceLearningEvent:
+        self.voice_learning_events.append(event)
+        return event
+
+    def list_voice_learning_events(self, company_id: str, limit: int = 100) -> list[VoiceLearningEvent]:
+        evs = [e for e in self.voice_learning_events if e.company_id == company_id]
+        evs.sort(key=lambda e: e.created_at, reverse=True)
+        return evs[:limit]
+
+    # ---- pending learnings (Phase 3 dialog state machine) ----
+    def create_voice_pending_learning(self, pl: VoicePendingLearning) -> VoicePendingLearning:
+        self.voice_pending_learnings[pl.id] = pl
+        return pl
+
+    def get_voice_pending_learning(self, pl_id: str, company_id: str) -> VoicePendingLearning | None:
+        pl = self.voice_pending_learnings.get(pl_id)
+        if not pl or pl.company_id != company_id:
+            return None
+        return pl
+
+    def get_active_voice_pending_learning(self, company_id: str, user_id: str | None):
+        for pl in self.voice_pending_learnings.values():
+            if (pl.company_id == company_id and pl.user_id == user_id
+                    and pl.state in ("WAITING_FOR_TARGET", "WAITING_FOR_CONFIRMATION")):
+                return pl
+        return None
+
+    def update_voice_pending_learning(self, pl: VoicePendingLearning) -> VoicePendingLearning:
+        self.voice_pending_learnings[pl.id] = pl
+        return pl
 
     # ------------------------------------------------------------------
     # Phase G3: Google Calendar account / mappings / sync log

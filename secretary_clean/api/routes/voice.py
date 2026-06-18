@@ -36,6 +36,10 @@ from secretary_clean.core.repository import InMemorySecretaryRepository
 from secretary_clean.core import ai_intent
 from secretary_clean.core import voice_intents as vi
 from secretary_clean.core import voice_slots as vsl
+from secretary_clean.core import voice_resolver as vres
+from secretary_clean.core import voice_intent_registry as vreg
+from secretary_clean.core import voice_synonyms as vsyn
+from secretary_clean.core import voice_learning_service as vls
 
 router = APIRouter(prefix="/voice", tags=["voice foundation"])
 
@@ -226,29 +230,84 @@ def execute_voice_command(
         return res(False, "Dobře, akci jsem zrušila.", status="cancelled",
                    action=pending.intent, pending_id=pending.id)
 
+    learn_source = "PARSER"   # how a FRESH utterance resolved (for learning events)
     if pending:
         intent = pending.intent
         data = _merge_answer_into_data(intent, payload.utterance, pending.collected_data)
     else:
-        parsed = vi.parse_intent(payload.utterance)
-        intent = parsed.intent
-        data = dict(parsed.entities) if intent else {}
-        if not intent:
-            # Deterministic parser failed → learned cache → AI intent detection.
-            learned = _recall_learned(user.company_id, payload.utterance)
-            if learned:
-                intent = learned
-                # Re-extract entities for this intent from the utterance.
-                reparsed = vi.parse_intent(payload.utterance)
-                data = dict(reparsed.entities) if reparsed.intent == intent else \
-                    _entities_from_text(intent, payload.utterance)
-            else:
-                ai = ai_intent.classify(payload.utterance, getattr(lang_ctx, "internal", None))
-                if ai:
-                    intent = ai["intent"]
-                    data = ai["entities"]
-                    _learn(user.company_id, payload.utterance, intent)  # learning
+        # ── Voice Command Learning resolution order ────────────────────────
+        # 1) A deliberately-taught tenant/user ALIAS wins (translation, not a
+        #    grant — the intent's permission is still enforced below/at exec).
+        _norm = vsyn.normalize(payload.utterance)
+        _alias = repository.find_voice_alias(user.company_id, _norm, user.id)
+        if _alias and _alias.status == "ACTIVE":
+            intent = _alias.target_intent
+            learn_source = "USER_ALIAS"
+            repository.touch_voice_alias(_alias.id, user.company_id)
+            _rp = vi.parse_intent(payload.utterance)
+            data = dict(_rp.entities) if _rp.intent == intent \
+                else _entities_from_text(intent, payload.utterance)
+        elif _alias and _alias.status == "PENDING":
+            # Taught, but the target module is not implemented yet.
+            vls.record_event(repository, user.company_id, user.id, payload.utterance,
+                             "PENDING_ALIAS", resolved_intent=_alias.target_intent)
+            _ri = vreg.get(_alias.target_intent)
+            return res(False, _ri.fallback_message if _ri else
+                       "Tento příkaz zatím neumím vykonat.",
+                       status="error", action=_alias.target_intent)
+        else:
+            # 2) Deterministic parser (UNCHANGED — preserves all prior behaviour).
+            parsed = vi.parse_intent(payload.utterance)
+            intent = parsed.intent
+            data = dict(parsed.entities) if intent else {}
             if not intent:
+                # 3) Pre-built synonym dictionary fills the gap BEFORE the AI
+                #    fallback, and surfaces ambiguity instead of guessing.
+                _alias_lookup = vls.build_alias_lookup(repository, user.company_id, user.id)
+                _resolution = vres.resolve(payload.utterance, alias_lookup=_alias_lookup)
+                if _resolution.is_ambiguous and len(_resolution.candidates) >= 2:
+                    _a, _b = _resolution.candidates[0][0], _resolution.candidates[1][0]
+                    _da = (vreg.get(_a).description if vreg.get(_a) else _a)
+                    _db = (vreg.get(_b).description if vreg.get(_b) else _b)
+                    _q = f"Nerozumím přesně. Myslíš {_da}, nebo {_db}?"
+                    vls.record_event(repository, user.company_id, user.id,
+                                     payload.utterance, "AMBIGUOUS",
+                                     metadata={"candidates": [_a, _b]})
+                    return res(False, _q, status="needs_more_info", action=None,
+                               question=_q, data={"candidates": [_a, _b]})
+                if _resolution.intent and _resolution.source in ("BUILTIN_SYNONYM", "USER_ALIAS"):
+                    intent = _resolution.intent
+                    learn_source = _resolution.source
+                    if not _resolution.is_implemented:
+                        vls.record_event(repository, user.company_id, user.id,
+                                         payload.utterance, "PENDING_ALIAS",
+                                         resolved_intent=intent)
+                        _ri = vreg.get(intent)
+                        return res(False, _ri.fallback_message if _ri else
+                                   "Tento příkaz zatím neumím vykonat.",
+                                   status="error", action=intent)
+                    _rp = vi.parse_intent(payload.utterance)
+                    data = dict(_rp.entities) if _rp.intent == intent \
+                        else _entities_from_text(intent, payload.utterance)
+            if not intent:
+                # 4) Learned cache → AI intent detection (UNCHANGED).
+                learned = _recall_learned(user.company_id, payload.utterance)
+                if learned:
+                    intent = learned
+                    learn_source = "USER_ALIAS"
+                    reparsed = vi.parse_intent(payload.utterance)
+                    data = dict(reparsed.entities) if reparsed.intent == intent else \
+                        _entities_from_text(intent, payload.utterance)
+                else:
+                    ai = ai_intent.classify(payload.utterance, getattr(lang_ctx, "internal", None))
+                    if ai:
+                        intent = ai["intent"]
+                        data = ai["entities"]
+                        learn_source = "AI_FALLBACK"
+                        _learn(user.company_id, payload.utterance, intent)  # learning
+            if not intent:
+                vls.record_event(repository, user.company_id, user.id,
+                                 payload.utterance, "UNKNOWN")
                 return res(False, "Nerozuměl jsem příkazu. Můžeš to říct jinak?",
                            status="error")
 
@@ -282,6 +341,24 @@ def execute_voice_command(
         pending.missing_fields = []
         pending.status = "executed"
         repository.update_pending_action(pending)
+
+    # ── Permission enforced AT EXECUTION ───────────────────────────────────
+    # An alias/synonym is only a translation: resolving "udělej fakturu" never
+    # grants invoice permission. The intent's own permission is checked here,
+    # exactly as if the canonical phrase had been spoken. (No-op for the roles
+    # that can use voice today — all of them hold crm.manage — but it is the
+    # enforcement point that makes the alias-is-not-a-grant guarantee real.)
+    _req_perm = vreg.required_permission(intent)
+    if _req_perm and _req_perm not in {p.value for p in user.permissions}:
+        vls.record_event(repository, user.company_id, user.id, payload.utterance,
+                         "FAILED_PERMISSION", resolved_intent=intent)
+        return res(False, "Na tento příkaz nemáš oprávnění.",
+                   status="error", action=intent)
+
+    # ── Learning event: a fresh utterance resolved and is about to execute ─
+    if not pending and intent:
+        vls.record_event(repository, user.company_id, user.id, payload.utterance,
+                         learn_source, resolved_intent=intent, was_executed=True)
 
     # ── EXECUTE (all required info present) ────────────────────────────────
     if intent == "work_report.start":
