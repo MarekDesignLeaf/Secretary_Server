@@ -175,16 +175,72 @@ def _is_negative(text: str) -> bool:
     return text.strip().lower() in _NEGATIVE
 
 
+# Spoken number words (diacritics-stripped) → value, cs + en + pl. People say
+# hours as words ("osm", "osm a půl", "dvanáct hodin") far more than as digits,
+# and STT then has no digit to parse — so the work report wrongly rejected them.
+_NUM_ONES = {
+    # 0–19, Czech
+    "nula": 0, "jedna": 1, "jeden": 1, "jednu": 1, "jednou": 1, "dva": 2, "dve": 2,
+    "tri": 3, "ctyri": 4, "pet": 5, "sest": 6, "sedm": 7, "osm": 8, "devet": 9,
+    "deset": 10, "jedenact": 11, "dvanact": 12, "trinact": 13, "ctrnact": 14,
+    "patnact": 15, "sestnact": 16, "sedmnact": 17, "osmnact": 18, "devatenact": 19,
+    # English
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19,
+    # Polish
+    "dwie": 2, "trzy": 3, "cztery": 4, "piec": 5, "szesc": 6, "siedem": 7,
+    "osiem": 8, "dziewiec": 9, "dziesiec": 10, "jedenascie": 11, "dwanascie": 12,
+    "trzynascie": 13, "czternascie": 14, "pietnascie": 15, "szesnascie": 16,
+    "siedemnascie": 17, "osiemnascie": 18, "dziewietnascie": 19,
+}
+_NUM_TENS = {
+    "dvacet": 20, "tricet": 30, "ctyricet": 40, "padesat": 50, "sedesat": 60,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "dwadziescia": 20, "trzydziesci": 30, "czterdziesci": 40, "piecdziesiat": 50,
+    "szescdziesiat": 60,
+}
+_NUM_FRACTIONS = {
+    "pul": 0.5, "pol": 0.5, "half": 0.5,
+    "ctvrt": 0.25, "quarter": 0.25, "cwierc": 0.25,
+}
+
+
+def _strip_diacritics(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "")
+                   if not unicodedata.combining(c))
+
+
 def _parse_hours(text: str) -> float | None:
-    text = text.strip().lower()
-    # "half" → 0.5, "quarter" → 0.25
-    text = text.replace("half", "0.5").replace("quarter", "0.25")
-    text = text.replace(",", ".")
-    # extract first number
-    m = re.search(r"(\d+(?:\.\d+)?)", text)
-    if m:
-        return float(m.group(1))
-    return None
+    """Parse hours from digits OR spoken number words (cs/en/pl), incl. fractions.
+    Examples: "8", "8.5", "8,5", "8 a půl", "osm", "osm a půl", "dvanáct hodin",
+    "půl" → 0.5, "tři čtvrtě" → 0.75. Returns None only when no number is found."""
+    norm = _strip_diacritics((text or "").strip().lower()).replace(",", ".")
+    total = 0.0
+    frac = 0.0
+    matched = False
+    # "three quarters" / "tři čtvrtě" / "trzy czwarte" → 0.75. Strip the phrase
+    # first so its words ("tri") aren't also counted as a separate number.
+    for ph in ("tri ctvrte", "three quarters", "three quarter", "trzy czwarte"):
+        if ph in norm:
+            frac = 0.75
+            matched = True
+            norm = norm.replace(ph, " ")
+            break
+    for tok in (t for t in re.split(r"[^a-z0-9.]+", norm) if t):
+        dm = re.search(r"\d+(?:\.\d+)?", tok)
+        if dm:
+            total += float(dm.group()); matched = True
+        elif tok in _NUM_TENS:
+            total += _NUM_TENS[tok]; matched = True
+        elif tok in _NUM_ONES:
+            total += _NUM_ONES[tok]; matched = True
+        elif tok in _NUM_FRACTIONS and frac == 0.0:
+            frac = _NUM_FRACTIONS[tok]; matched = True
+    if not matched:
+        return None
+    return total + frac
 
 
 def _parse_date(text: str) -> str | None:
