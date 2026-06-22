@@ -340,6 +340,34 @@ CREATE TABLE IF NOT EXISTS clean_voice_intent_registry (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Shared Contacts Directory: an address book grouped by sections, separate from
+-- CRM clients. clean_contacts is a generic CRM-record table (id/name/status/data
+-- like the others); clean_contact_sections holds the per-company groups.
+CREATE TABLE IF NOT EXISTS clean_contacts (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    data JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS clean_contacts_company_idx
+    ON clean_contacts(company_id, status);
+
+CREATE TABLE IF NOT EXISTS clean_contact_sections (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES clean_companies(id) ON DELETE CASCADE,
+    section_code TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(company_id, section_code)
+);
+CREATE INDEX IF NOT EXISTS clean_contact_sections_company_idx
+    ON clean_contact_sections(company_id, sort_order);
 """
 
 # Column additions for existing tables (safe to run multiple times)

@@ -84,8 +84,11 @@ class InMemorySecretaryRepository:
                 "communications",
                 "work_reports",
                 "leads",
+                "contacts",
             )
         }
+        # Shared Contacts Directory section groups: company_id -> list[dict]
+        self.contact_sections: dict[str, list[dict]] = {}
 
     def bootstrap_status(self) -> BootstrapStatus:
         needs_first_company = not self.companies
@@ -1409,6 +1412,45 @@ class InMemorySecretaryRepository:
     def update_voice_pending_learning(self, pl: VoicePendingLearning) -> VoicePendingLearning:
         self.voice_pending_learnings[pl.id] = pl
         return pl
+
+    # ------------------------------------------------------------------
+    # Shared Contacts Directory — section groups (the contacts themselves are
+    # stored as generic CRM records under the "contacts" module).
+    # ------------------------------------------------------------------
+    def ensure_default_contact_sections(self, company_id: str) -> None:
+        from secretary_clean.core.contact_sections import DEFAULT_CONTACT_SECTIONS
+        if self.contact_sections.get(company_id):
+            return
+        self.contact_sections[company_id] = [
+            {"section_code": code, "display_name": disp, "sort_order": order,
+             "is_default": True}
+            for code, disp, order in DEFAULT_CONTACT_SECTIONS
+        ]
+
+    def list_contact_sections(self, company_id: str) -> list[dict]:
+        self.ensure_default_contact_sections(company_id)
+        return sorted(self.contact_sections.get(company_id, []),
+                      key=lambda s: s["sort_order"])
+
+    def get_contact_section(self, company_id: str, section_code: str) -> dict | None:
+        for s in self.contact_sections.get(company_id, []):
+            if s["section_code"] == section_code:
+                return s
+        return None
+
+    def create_contact_section(self, company_id: str, section_code: str,
+                               display_name: str, sort_order: int = 200,
+                               is_default: bool = False) -> dict:
+        self.ensure_default_contact_sections(company_id)
+        secs = self.contact_sections.setdefault(company_id, [])
+        existing = self.get_contact_section(company_id, section_code)
+        if existing:
+            existing["display_name"] = display_name
+            return existing
+        s = {"section_code": section_code, "display_name": display_name,
+             "sort_order": sort_order, "is_default": is_default}
+        secs.append(s)
+        return s
 
     # ------------------------------------------------------------------
     # Phase G3: Google Calendar account / mappings / sync log

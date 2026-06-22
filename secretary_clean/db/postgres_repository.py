@@ -77,6 +77,7 @@ _CRM_TABLES: dict[str, str] = {
     "communications": "clean_communications",
     "work_reports": "clean_work_reports",
     "leads": "clean_leads",
+    "contacts": "clean_contacts",
 }
 
 _VALID_CRM_MODULES = set(_CRM_TABLES.keys())
@@ -2777,6 +2778,55 @@ class PostgresSecretaryRepository:
                     (pl.state, pl.attempt_count, pl.expires_at, json.dumps(pl.metadata), pl.id))
             conn.commit()
         return pl
+
+    # ------------------------------------------------------------------
+    # Shared Contacts Directory — section groups (contacts live in the generic
+    # "contacts" CRM module table).
+    # ------------------------------------------------------------------
+    def ensure_default_contact_sections(self, company_id: str) -> None:
+        from secretary_clean.core.contact_sections import DEFAULT_CONTACT_SECTIONS
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM clean_contact_sections WHERE company_id=%s",
+                            (company_id,))
+                (n,) = cur.fetchone()
+                if n == 0:
+                    for code, disp, order in DEFAULT_CONTACT_SECTIONS:
+                        cur.execute(
+                            "INSERT INTO clean_contact_sections (id, company_id, section_code, display_name, sort_order, is_default) VALUES (%s,%s,%s,%s,%s,TRUE) ON CONFLICT (company_id, section_code) DO NOTHING",
+                            (str(uuid4()), company_id, code, disp, order))
+            conn.commit()
+
+    def list_contact_sections(self, company_id: str) -> list[dict]:
+        self.ensure_default_contact_sections(company_id)
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT section_code, display_name, sort_order, is_default FROM clean_contact_sections WHERE company_id=%s ORDER BY sort_order, display_name",
+                    (company_id,))
+                return [dict(r) for r in cur.fetchall()]
+
+    def get_contact_section(self, company_id: str, section_code: str) -> dict | None:
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT section_code, display_name, sort_order, is_default FROM clean_contact_sections WHERE company_id=%s AND section_code=%s",
+                    (company_id, section_code))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def create_contact_section(self, company_id: str, section_code: str,
+                               display_name: str, sort_order: int = 200,
+                               is_default: bool = False) -> dict:
+        self.ensure_default_contact_sections(company_id)
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "INSERT INTO clean_contact_sections (id, company_id, section_code, display_name, sort_order, is_default) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (company_id, section_code) DO UPDATE SET display_name=EXCLUDED.display_name RETURNING section_code, display_name, sort_order, is_default",
+                    (str(uuid4()), company_id, section_code, display_name, sort_order, is_default))
+                row = cur.fetchone()
+            conn.commit()
+        return dict(row)
 
     # ------------------------------------------------------------------
     # Phase G3: Google Calendar account / sync log (tokens never logged)
