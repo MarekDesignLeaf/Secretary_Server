@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import urllib.parse
 import urllib.request
+import urllib.error
 import json as _json
 from datetime import datetime, timezone, timedelta
 
@@ -131,6 +132,14 @@ def google_callback(code: str = Query(None), state: str = Query(None),
         acc.token_expires_at = now + timedelta(seconds=tok.get("expires_in", 3600))
         acc.scope = tok.get("scope", GOOGLE_SCOPE)
         acc.status = "connected"
+        # Capture the account email so /status isn't perpetually null (looked broken).
+        try:
+            if acc.access_token:
+                email = _fetch_google_email(acc.access_token)
+                if email:
+                    acc.google_account_email = email
+        except Exception:  # noqa: BLE001 — email is cosmetic, never fail the callback
+            pass
         repository.upsert_google_account(acc)
     except Exception as exc:
         import traceback
@@ -193,33 +202,66 @@ def google_select_calendar(body: SelectedCalendarBody,
     repository.upsert_google_account(acc)
     return {"google_calendar_id": acc.google_calendar_id}
 
-def _push_event_to_google(token: str, calendar_id: str, ev) -> str | None:
-    """Create one event in Google Calendar. Returns the Google event id or None.
-    One-way push (backend -> Google). Tokens/PII are never logged."""
-    body = {
-        "summary": ev.title or "(bez nazvu)",
-        "description": ev.description or "",
-        "location": ev.location or "",
-    }
-    if ev.all_day:
-        body["start"] = {"date": ev.start_at.date().isoformat()}
-        end_date = (ev.end_at or ev.start_at).date().isoformat()
-        body["end"] = {"date": end_date}
-    else:
-        body["start"] = {"dateTime": ev.start_at.isoformat()}
-        end_dt = ev.end_at or (ev.start_at + timedelta(hours=1))
-        body["end"] = {"dateTime": end_dt.isoformat()}
-    url = f"https://www.googleapis.com/calendar/v3/calendars/{urllib.parse.quote(calendar_id)}/events"
-    data = _json.dumps(body).encode()
-    req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Authorization": f"Bearer {token}",
-                                          "Content-Type": "application/json"})
+GOOGLE_API_BASE = "https://www.googleapis.com/calendar/v3"
+
+
+def gapi(method: str, path: str, token: str, body: dict | None = None):
+    """One Google Calendar REST call. Returns (ok, data, err). Errors carry the
+    HTTP status + Google's message (no tokens) so the sync log is diagnosable —
+    the old code swallowed every failure, which made live debugging impossible."""
+    url = path if path.startswith("http") else f"{GOOGLE_API_BASE}{path}"
+    data = _json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": f"Bearer {token}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            created = _json.loads(resp.read().decode())
-        return created.get("id")
-    except Exception:
-        return None
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode() or "{}"
+        return True, (_json.loads(raw) if raw.strip() else {}), None
+    except urllib.error.HTTPError as e:  # type: ignore[attr-defined]
+        try:
+            detail = e.read().decode()[:300]
+        except Exception:  # noqa: BLE001
+            detail = ""
+        return False, {}, f"HTTP {e.code}: {detail}"
+    except Exception as exc:  # noqa: BLE001
+        return False, {}, f"{type(exc).__name__}: {exc}"
+
+
+def _fetch_google_email(token: str) -> str | None:
+    ok, data, _err = gapi("GET", "https://www.googleapis.com/oauth2/v3/userinfo", token)
+    return data.get("email") if ok else None
+
+
+def run_reconcile(repository, acc, token: str) -> dict:
+    """Shared by manual sync and the auto-sync loop."""
+    from secretary_clean.core import google_sync
+    stats = google_sync.reconcile(repository, acc.company_id, acc.google_calendar_id,
+                                  token, gapi)
+    acc.last_sync_at = datetime.now(timezone.utc)
+    repository.upsert_google_account(acc)
+    repository.add_google_sync_log(
+        acc.company_id, "sync", "sync_finished",
+        "ok" if stats["failed"] == 0 else "partial",
+        detail=" ".join(f"{k}={v}" for k, v in stats.items()))
+    return stats
+
+
+class AutoSyncBody(BaseModel):
+    enabled: bool
+
+
+@router.put("/auto-sync")
+def google_set_auto_sync(body: AutoSyncBody,
+                         user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+                         repository: InMemorySecretaryRepository = Depends(get_repository)):
+    acc = repository.get_google_account(user.company_id)
+    if not acc:
+        raise HTTPException(status_code=409, detail="Google not connected")
+    acc.auto_sync_enabled = bool(body.enabled)
+    repository.upsert_google_account(acc)
+    return {"auto_sync_enabled": acc.auto_sync_enabled}
 
 
 @router.post("/sync")
@@ -231,36 +273,10 @@ def google_sync(user: UserAccount = Depends(require_permission(Permission.crm_ma
         raise HTTPException(status_code=409, detail="Google not connected")
     if not acc.google_calendar_id:
         raise HTTPException(status_code=400, detail="No calendar selected")
-
-    # G5: one-way push backend -> Google. Events already mapped are skipped
-    # (dedup via clean_google_calendar_mappings), so re-running sync is safe.
-    backend_events = repository.list_calendar_events(user.company_id)
-    pushed = 0
-    skipped = 0
-    failed = 0
-    for ev in backend_events:
-        existing = repository.get_google_mapping(user.company_id, ev.id)
-        if existing:
-            skipped += 1
-            continue
-        gid = _push_event_to_google(token, acc.google_calendar_id, ev)
-        if gid:
-            repository.set_google_mapping(user.company_id, ev.id, gid)
-            repository.add_google_sync_log(user.company_id, "push", "create", "ok",
-                                           backend_event_id=ev.id, google_event_id=gid)
-            pushed += 1
-        else:
-            repository.add_google_sync_log(user.company_id, "push", "create", "error",
-                                           backend_event_id=ev.id)
-            failed += 1
-
-    acc.last_sync_at = datetime.now(timezone.utc)
-    repository.upsert_google_account(acc)
-    repository.add_google_sync_log(user.company_id, "manual", "sync_finished", "ok",
-                                   detail=f"pushed={pushed} skipped={skipped} failed={failed}")
-    return {"status": "ok", "backend_events": len(backend_events),
-            "pushed": pushed, "skipped": skipped, "failed": failed,
-            "calendar_id": acc.google_calendar_id, "synced_at": acc.last_sync_at.isoformat()}
+    stats = run_reconcile(repository, acc, token)
+    return {"status": "ok" if stats["failed"] == 0 else "partial",
+            "calendar_id": acc.google_calendar_id,
+            "synced_at": acc.last_sync_at.isoformat(), **stats}
 
 
 @router.get("/sync-log")

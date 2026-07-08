@@ -1465,6 +1465,9 @@ class InMemorySecretaryRepository:
         self.google_accounts[account.company_id] = account
         return account
 
+    def list_google_accounts(self) -> list[GoogleCalendarAccount]:
+        return list(self.google_accounts.values())
+
     def get_google_mapping(self, company_id: str, backend_event_id: str):
         for m in self.google_mappings:
             if m["company_id"] == company_id and m["backend_event_id"] == backend_event_id:

@@ -153,11 +153,56 @@ def _activate_pending_aliases(repository) -> None:
         log.warning("Pending voice-alias activation skipped: %s", exc)
 
 
+async def _auto_sync_loop(app: FastAPI):
+    """Periodic Google Calendar reconciliation for tenants that enabled auto-sync.
+    Runs every AUTO_SYNC_INTERVAL_MIN minutes (default 15). Best-effort: a single
+    tenant's failure is logged to its sync log and never stops the loop."""
+    import asyncio
+    interval = int(os.environ.get("AUTO_SYNC_INTERVAL_MIN", "15")) * 60
+    repo = app.state.repository
+    from secretary_clean.api.routes import google_calendar as gc
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            accounts = []
+            try:
+                accounts = repo.list_google_accounts()
+            except Exception:  # noqa: BLE001
+                accounts = []
+            for acc in accounts:
+                if not getattr(acc, "auto_sync_enabled", False):
+                    continue
+                if acc.status != "connected" or not acc.google_calendar_id:
+                    continue
+                try:
+                    token = gc._valid_access_token(repo, acc)
+                    if token:
+                        await asyncio.to_thread(gc.run_reconcile, repo, acc, token)
+                except Exception as exc:  # noqa: BLE001
+                    try:
+                        repo.add_google_sync_log(acc.company_id, "auto", "sync_finished",
+                                                 "error", detail=f"auto-sync: {exc}")
+                    except Exception:  # noqa: BLE001
+                        pass
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 — never let the loop die
+            continue
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
     _seed_from_env(app.state.repository)
     _activate_pending_aliases(app.state.repository)
-    yield
+    task = None
+    if os.environ.get("AUTO_SYNC_ENABLED", "1") != "0":
+        task = asyncio.create_task(_auto_sync_loop(app))
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
 
 
 def create_app(repository=None) -> FastAPI:

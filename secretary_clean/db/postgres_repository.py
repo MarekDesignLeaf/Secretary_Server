@@ -2861,6 +2861,13 @@ class PostgresSecretaryRepository:
             conn.commit()
         return account
 
+    def list_google_accounts(self):
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM clean_google_calendar_accounts")
+                rows = cur.fetchall()
+        return [self._row_to_gaccount(r) for r in rows]
+
     def add_google_sync_log(self, company_id, direction, action, status, backend_event_id=None, google_event_id=None, detail=None):
         import uuid as _uuid
         with _PooledConnection(self._pool) as conn:
