@@ -423,6 +423,57 @@ def add_job_note(
     return shapes.note_out(new, parent_id=job_id)
 
 
+def _append_photo(repository, module: str, record_id: str, company_id: str,
+                  photo: dict, user_id: str) -> dict:
+    """Append a photo (metadata) to a CRM record's data['photos'] list. Photos
+    are stored as metadata (url/caption) on the parent entity — no binary blob
+    handling, no new table. Returns the stored photo dict."""
+    import uuid as _uuid
+    record = _get_or_404(repository, module, record_id, company_id)
+    photos = list((record.data or {}).get("photos") or [])
+    entry = {
+        "id": str(_uuid.uuid4()),
+        "url": (photo.get("url") or "").strip(),
+        "caption": (photo.get("caption") or "").strip(),
+        "content_type": photo.get("content_type"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_by": user_id,
+    }
+    photos.append(entry)
+    repository.update_crm_record(module, record_id, company_id,
+                                 CRMUpdateRequest(data={"photos": photos}))
+    entry["parent_module"] = module
+    entry["parent_id"] = record_id
+    return entry
+
+
+@router.get("/jobs/{job_id}/photos")
+def list_job_photos(
+    job_id: str,
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    record = _get_or_404(repository, "jobs", job_id, user.company_id)
+    photos = list((record.data or {}).get("photos") or [])
+    for p in photos:
+        p.setdefault("parent_module", "jobs")
+        p.setdefault("parent_id", job_id)
+    return photos
+
+
+@router.post("/jobs/{job_id}/photos", status_code=201)
+def add_job_photo(
+    job_id: str,
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    entry = _append_photo(repository, "jobs", job_id, user.company_id, payload, user.id)
+    repository.log_activity(user.company_id, user.id, "job", job_id, "photo_added",
+                            entry.get("caption") or entry.get("url") or "", source_channel="app")
+    return entry
+
+
 @router.get("/jobs/{job_id}/audit")
 def get_job_audit_log(
     job_id: str,
@@ -568,6 +619,36 @@ def create_communication(
         out["address_filled_for_client_id"] = filled["client_id"]
         out["address_filled"] = filled["address"]
     return out
+
+
+@router.post("/communications/import", status_code=201)
+def import_communications(
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Bulk-import communications. Body: {items: [ {type, direction, contact,
+    note, client_id?, ...}, ... ]}. Each item is created like POST
+    /communications; inbound items also try address autofill. Returns counts."""
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise HTTPException(status_code=422, detail="items (list) required")
+    created, filled = 0, 0
+    names = _client_names(repository, user.company_id)
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            rec = _create(repository, "communications", user, it)
+        except HTTPException:
+            # skip malformed rows (e.g. missing name) but keep importing the rest
+            continue
+        created += 1
+        if str((rec.data or {}).get("direction") or "").lower() == "in":
+            if autofill_client_address_from_comm(repository, user, rec):
+                filled += 1
+    return {"imported_count": created, "addresses_filled": filled,
+            "total_communications": len(_records(repository, "communications", user.company_id))}
 
 
 def autofill_client_address_from_comm(repository, user, comm_record) -> dict | None:
@@ -1011,8 +1092,36 @@ def crm_timeline(
 
 
 @router.get("/photos")
-def list_photos(user: UserAccount = Depends(current_user)):
-    return []
+def list_photos(
+    user: UserAccount = Depends(current_user),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Aggregate photo metadata across jobs and clients (stored on each entity's
+    data['photos']). Optional ?job_id / ?client_id filtering is done client-side."""
+    out = []
+    for module in ("jobs", "clients"):
+        for r in _records(repository, module, user.company_id):
+            for p in (r.data or {}).get("photos") or []:
+                out.append({**p, "parent_module": module, "parent_id": r.id})
+    out.sort(key=lambda p: p.get("created_at") or "", reverse=True)
+    return out
+
+
+@router.post("/photos", status_code=201)
+def add_photo(
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Attach a photo to a job or client. Body: {job_id|client_id, url, caption}."""
+    if payload.get("job_id"):
+        module, rid = "jobs", payload["job_id"]
+    elif payload.get("client_id"):
+        module, rid = "clients", payload["client_id"]
+    else:
+        raise HTTPException(status_code=422, detail="job_id or client_id required")
+    entry = _append_photo(repository, module, rid, user.company_id, payload, user.id)
+    return entry
 
 
 @router.get("/notifications")
