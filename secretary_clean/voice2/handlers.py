@@ -140,6 +140,9 @@ def calendar_list(ctx: Ctx, data: dict) -> H:
 
 
 def calendar_sync(ctx: Ctx, data: dict) -> H:
+    # Delegates to the ONE reconciliation path (run_reconcile → core.google_sync),
+    # the same code the REST endpoint and the auto-sync loop use. No duplicate
+    # push loop here — that parallel copy drifted and broke.
     from secretary_clean.api.routes import google_calendar as _gc
     repository, user = ctx.repository, ctx.user
     acc = repository.get_google_account(user.company_id)
@@ -148,28 +151,18 @@ def calendar_sync(ctx: Ctx, data: dict) -> H:
         return H.error("Google kalendář není připojený. Připoj ho v nastavení.")
     if not acc.google_calendar_id:
         return H.error("Nemáš vybraný kalendář pro synchronizaci. Vyber ho v nastavení.")
-    pushed = skipped = failed = 0
-    for ev in repository.list_calendar_events(user.company_id):
-        if repository.get_google_mapping(user.company_id, ev.id):
-            skipped += 1
-            continue
-        gid = _gc._push_event_to_google(token, acc.google_calendar_id, ev)
-        if gid:
-            repository.set_google_mapping(user.company_id, ev.id, gid)
-            repository.add_google_sync_log(user.company_id, "push", "create", "ok",
-                                           backend_event_id=ev.id, google_event_id=gid)
-            pushed += 1
-        else:
-            failed += 1
-    acc.last_sync_at = datetime.now(timezone.utc)
-    repository.upsert_google_account(acc)
-    if pushed == 0 and skipped > 0:
-        msg = "Kalendář je už synchronizovaný, nic nového k nahrání."
-    elif pushed > 0:
-        msg = f"Synchronizováno. Nahrála jsem {pushed} událostí do Google kalendáře."
+    stats = _gc.run_reconcile(repository, acc, token)
+    changed = stats["pushed"] + stats["updated"] + stats["pushed_deleted"] \
+        + stats["pulled"] + stats["pulled_deleted"]
+    if stats["failed"]:
+        msg = (f"Synchronizace proběhla s chybami: nahráno {stats['pushed']}, "
+               f"staženo {stats['pulled']}, {stats['failed']} selhalo.")
+    elif changed == 0:
+        msg = "Kalendář je už synchronizovaný, nic nového."
     else:
-        msg = "Nemáš žádné události k synchronizaci."
-    return H(True, msg, data={"pushed": pushed, "skipped": skipped, "failed": failed})
+        msg = (f"Synchronizováno. Nahráno {stats['pushed']}, staženo {stats['pulled']}, "
+               f"aktualizováno {stats['updated']}.")
+    return H(stats["failed"] == 0, msg, data=stats)
 
 
 def _calendar_target(ctx: Ctx, data: dict, *, for_delete: bool):

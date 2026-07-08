@@ -92,18 +92,41 @@ class LearnAliasRequest(BaseModel):
 
 @router.post("/learn-alias")
 def learn_alias(payload: LearnAliasRequest,
-                user: UserAccount = Depends(require_permission(Permission.crm_manage))):
-    """Adaptive alias learning (legacy endpoint kept for the Android client)."""
+                user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+                repository: InMemorySecretaryRepository = Depends(get_repository)):
+    """Adaptive alias learning (legacy endpoint kept for the Android client).
+
+    Now actually PERSISTS the alias (previously it returned "saved" and stored
+    nothing — the taught phrase was silently dropped). Uses the same learning
+    service as POST /voice/aliases so the two paths stay consistent.
+    """
     from secretary_clean.core import alias_learning as al
+    from secretary_clean.core import voice_learning_service as vls
+    from secretary_clean.core import voice_synonyms as syn
+    from secretary_clean.core import command_tree
+
     if al.is_cancel(payload.answer):
         return {"status": "cancelled", "message": "Dobře, nic neukládám."}
-    intent = al.resolve_target_intent(payload.answer)
+    intent = vls.resolve_target_intent(payload.answer) or al.resolve_target_intent(payload.answer)
     if not intent or not al.is_known(intent):
         return {"status": "unknown_target",
                 "message": "Tomu příkazu nerozumím. Zkus to říct jinak, nebo řekni omyl."}
-    state = al.status_for(intent)
     phrase = payload.phrase.strip()
-    from secretary_clean.core import command_tree
+    norm = syn.normalize(phrase)
+    existing = vls.find_exact_alias(repository, user.company_id, user.id, norm)
+    if existing is not None:
+        existing.raw_phrase = phrase
+        existing.target_intent = intent
+        existing.status = vls.status_for(intent)
+        repository.update_voice_alias(existing)
+        alias = existing
+    else:
+        alias = vls.new_alias(user.company_id, user.id, phrase, intent, created_by=user.id)
+        repository.create_voice_alias(alias)
+    state = alias.status
+    vls.record_event(repository, user.company_id, user.id, phrase,
+                     "USER_ALIAS" if state == "ACTIVE" else "PENDING_ALIAS",
+                     resolved_intent=intent, created_alias_id=alias.id)
     loc = command_tree.locate_intent(intent)
     loc_txt = f" ({loc['module_title']} > {loc['branch_title']})" if loc else ""
     if state == "ACTIVE":
@@ -112,4 +135,4 @@ def learn_alias(payload: LearnAliasRequest,
         msg = (f"Frázi „{phrase}“ jsem přiřadila k příkazu {intent}{loc_txt}. "
                f"Jakmile bude tato funkce dostupná, příkaz začne fungovat.")
     return {"status": "saved", "alias_status": state, "target_intent": intent,
-            "phrase": phrase, "location": loc, "message": msg}
+            "phrase": phrase, "location": loc, "alias_id": alias.id, "message": msg}
