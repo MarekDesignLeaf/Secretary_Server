@@ -25,7 +25,8 @@ def test_intents_export(monkeypatch):
     assert "client.create" in codes
     impl = {i["intent_code"]: i["is_implemented"] for i in out["intents"]}
     assert impl["client.create"] is True
-    assert impl["invoice.from_work_report"] is False
+    assert impl["invoice.from_work_report"] is True   # implemented in v2
+    assert impl["invoice.send"] is False              # still planned
 
 
 def test_teach_active_alias_and_resolve(monkeypatch):
@@ -50,8 +51,8 @@ def test_teach_active_alias_and_resolve(monkeypatch):
 def test_teach_pending_alias_when_target_not_implemented(monkeypatch):
     client, headers = _bootstrap(monkeypatch)
     out = client.post("/api/v1/voice/aliases", headers=headers,
-                      json={"phrase": "zafakturuj to", "answer": "vytvoř fakturu"}).json()
-    assert out["target_intent"] == "invoice.from_work_report"
+                      json={"phrase": "zafakturuj to", "answer": "pošli fakturu"}).json()
+    assert out["target_intent"] == "invoice.send"
     assert out["status"] == "PENDING"
 
 

@@ -20,7 +20,7 @@ def _pending_alias(repo, company_id, target_intent):
 def test_startup_pass_activates_pending_for_implemented_target():
     repo = InMemorySecretaryRepository()
     a_impl = _pending_alias(repo, "c1", "client.create")        # implemented
-    a_plan = _pending_alias(repo, "c1", "invoice.from_work_report")  # not implemented
+    a_plan = _pending_alias(repo, "c1", "invoice.send")  # not implemented
 
     _activate_pending_aliases(repo)
 

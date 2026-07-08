@@ -42,11 +42,14 @@ def test_composition_resolves_novel_verb_object_combo():
     assert r.intent == "client.create"
 
 
-def test_composition_covers_planned_invoice_intent():
+def test_composition_covers_invoice_intent():
     r = vr.resolve("vytvoř fakturu")
     assert r.intent == "invoice.from_work_report"
-    # Known intent, but not executable yet → resolver flags it.
-    assert r.is_implemented is False
+    # Implemented in v2 — and a still-PLANNED intent is flagged correctly.
+    assert r.is_implemented is True
+    r2 = vr.resolve("pošli fakturu")
+    assert r2.intent == "invoice.send"
+    assert r2.is_implemented is False
 
 
 # ── explicit beats composed: no spurious ambiguity ────────────────────────────
@@ -105,8 +108,9 @@ def test_active_alias_hook_resolves():
 
 def test_pending_alias_hook_marks_not_implemented():
     def lookup(norm):
-        return {"intent": "invoice.from_work_report", "confidence": 1.0, "status": "PENDING"}
-    r = vr.resolve("zafakturuj to", alias_lookup=lookup)
+        return {"intent": "invoice.send", "confidence": 1.0, "status": "PENDING"}
+    # Nonsense phrase so no builtin synonym pre-empts the alias hook.
+    r = vr.resolve("kobliha expres blafuj", alias_lookup=lookup)
     assert r.source == "PENDING_ALIAS"
     assert r.is_implemented is False
 
@@ -157,8 +161,9 @@ def test_every_composition_target_is_a_known_intent():
 
 
 def test_planned_intents_are_marked_not_implemented():
-    assert reg.is_implemented("invoice.from_work_report") is False
-    assert reg.is_implemented("quote.create") is False
+    assert reg.is_implemented("invoice.send") is False
+    assert reg.is_implemented("invoice.from_work_report") is True
+    assert reg.is_implemented("quote.create") is True
     assert reg.is_implemented("client.create") is True
 
 

@@ -35,6 +35,12 @@ def test_move_meeting_with_person_to_friday_keeps_time(monkeypatch):
 
     out = client.post("/api/v1/voice/execute", headers=headers,
                       json={"utterance": "přesuň schůzku s Novákem na pátek"}).json()
+    # v2: moving an event is dangerous → explicit confirmation turn.
+    assert out["status"] == "needs_more_info"
+    assert "confirmation" in out["missing_fields"]
+    out = client.post("/api/v1/voice/execute", headers=headers,
+                      json={"utterance": "ano",
+                            "pending_action_id": out["pending_action_id"]}).json()
     assert out["executed"] is True, out
     assert out["resolved_intent"] == "calendar.update"
 

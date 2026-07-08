@@ -155,9 +155,12 @@ def test_voice_send_without_meta_falls_back_to_client(monkeypatch):
 
     out = client.post("/api/v1/voice/execute", headers=headers,
                       json={"utterance": "pošli whatsapp Smith že přijedu v pátek"}).json()
-    if out["status"] == "needs_more_info":
+    for _ in range(3):
+        if out["status"] != "needs_more_info":
+            break
+        answer = "ano" if "confirmation" in out.get("missing_fields", []) else "Smith"
         out = client.post("/api/v1/voice/execute", headers=headers,
-                          json={"utterance": "Smith",
+                          json={"utterance": answer,
                                 "pending_action_id": out["pending_action_id"]}).json()
     assert out["status"] == "client_fallback", out
     assert out["executed"] is False
@@ -182,11 +185,12 @@ def test_voice_send_applies_customer_language_rule(monkeypatch):
 
     out = client.post("/api/v1/voice/execute", headers=headers,
                       json={"utterance": "pošli whatsapp Smith že přijdu zítra v devět"}).json()
-    if out["status"] == "needs_more_info":
-        # Multi-turn: the engine asks who the recipient is.
-        assert "person" in out["missing_fields"]
+    for _ in range(3):
+        if out["status"] != "needs_more_info":
+            break
+        answer = "ano" if "confirmation" in out.get("missing_fields", []) else "Smith"
         out = client.post("/api/v1/voice/execute", headers=headers,
-                          json={"utterance": "Smith",
+                          json={"utterance": answer,
                                 "pending_action_id": out["pending_action_id"]}).json()
     assert out["executed"] is True, out
     # Internal cs-CZ, customer default en-GB -> message goes out translated.

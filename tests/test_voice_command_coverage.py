@@ -6,19 +6,18 @@ from fastapi.testclient import TestClient
 
 from secretary_clean import create_app
 
-_VOICE_PY = Path(__file__).resolve().parents[1] / "secretary_clean" / "api" / "routes" / "voice.py"
 _INTENTS_PY = Path(__file__).resolve().parents[1] / "secretary_clean" / "core" / "voice_intents.py"
 
 
 def test_every_parser_intent_is_executed():
+    from secretary_clean.voice2.handlers import HANDLERS
+    from secretary_clean.core import voice_intent_registry as reg
     emitted = set(re.findall(r'intent="([a-z_.]+)"', _INTENTS_PY.read_text(encoding="utf-8")))
-    voice_src = _VOICE_PY.read_text(encoding="utf-8")
-    executed = set(re.findall(r'intent == "([a-z_.]+)"', voice_src))
-    # tuple form: if intent in ("a", "b")
-    for grp in re.findall(r'intent in \(([^)]+)\)', voice_src):
-        executed |= set(re.findall(r'"([a-z_.]+)"', grp))
-    missing = emitted - executed
-    assert not missing, f"Parser emits intents with no execution branch: {missing}"
+    missing = emitted - set(HANDLERS)
+    assert not missing, f"Parser emits intents with no v2 handler: {missing}"
+    # And every IMPLEMENTED registry intent has a handler (no drift).
+    impl_missing = reg.implemented_intents() - set(HANDLERS)
+    assert not impl_missing, f"Registry marks implemented but no handler: {impl_missing}"
 
 
 def _logged_in(monkeypatch):

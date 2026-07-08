@@ -15,21 +15,24 @@ from __future__ import annotations
 import unicodedata
 
 # Intents the backend can actually execute today. Keep in sync with voice.py
-# execution branches. When a new module ships, add its intent here and pending
-# aliases pointing at it auto-activate via refresh.
-SUPPORTED_INTENTS = {
-    "calendar.create", "calendar.list", "calendar.delete", "calendar.update", "calendar.sync",
-    "client.create", "task.create", "task.list", "task.complete", "job.create", "job.list", "job.change_status", "comm.log", "comm.list", "whatsapp.send", "whatsapp.read", "weather.get", "client.set_address", "client.find", "contacts.import", "work_report.start",
-}
+# v2 rewrite: DERIVED from the intent registry (single source of truth) so the
+# lists can never drift from what the executor actually supports. Planned
+# intents not yet in the registry stay listed so a taught alias can park
+# PENDING and auto-activate when the module ships.
+def _registry_split():
+    from secretary_clean.core import voice_intent_registry as _reg
+    supported = {c for c, s in _reg.REGISTRY.items() if s.is_implemented and s.is_active}
+    planned = {c for c, s in _reg.REGISTRY.items() if not s.is_implemented}
+    return supported, planned
 
-# Intents the system knows about but cannot execute yet (planned). Used to
-# validate that a learning target is a real future command, not gibberish.
-PLANNED_INTENTS = {
-    "client.find", "client.note", "client.archive",
-    "task.assign",
-    "lead.create", "lead.convert",
-    "quote.create", "quote.send", "quote.approve",
-    "invoice.create", "invoice.status", "invoice.list",
+
+SUPPORTED_INTENTS, _REG_PLANNED = _registry_split()
+
+# Future commands known to the learning system but absent from the registry.
+PLANNED_INTENTS = _REG_PLANNED | {
+    "client.archive", "lead.convert",
+    "quote.send", "quote.approve",
+    "invoice.create", "invoice.status",
     "material.order", "material.check",
     "report.jobs",
 }

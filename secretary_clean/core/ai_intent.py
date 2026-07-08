@@ -12,31 +12,21 @@ from __future__ import annotations
 import json
 import os
 
-# Intent catalogue shown to the model: intent -> (description, entity keys).
-# Keep in sync with the execution branches in api/routes/voice.py.
-INTENT_CATALOGUE: dict[str, tuple[str, list[str]]] = {
-    "calendar.create": ("create a meeting/appointment", ["date", "time", "person", "title"]),
-    "calendar.list": ("list upcoming meetings", ["date", "range"]),
-    "calendar.update": ("move/reschedule a meeting to another day/time", ["person", "date", "time"]),
-    "calendar.delete": ("cancel/delete a meeting", ["person", "date"]),
-    "calendar.sync": ("sync calendar with Google", []),
-    "task.create": ("create a task / to-do", ["title", "person", "date", "time"]),
-    "task.list": ("list open tasks", []),
-    "task.complete": ("mark a task as done", ["person", "title"]),
-    "client.create": ("create a new client/customer", ["name", "phone", "address"]),
-    "client.find": ("find a client/contact and read their details", ["query"]),
-    "client.set_address": ("set a client's address from their message", ["person"]),
-    "contacts.import": ("import phone contacts into the CRM", []),
-    "work_report.start": ("start a work report (what was done on a job)", []),
-    "job.create": ("create a job/work order for a client", ["title", "person"]),
-    "job.list": ("list active jobs", []),
-    "job.change_status": ("change a job's status", ["status", "person"]),
-    "comm.log": ("log a phone call/email/communication", ["person", "comm_type"]),
-    "comm.list": ("show communication history", ["person"]),
-    "whatsapp.send": ("send a WhatsApp message", ["person", "message"]),
-    "whatsapp.read": ("read incoming WhatsApp messages", ["person"]),
-    "weather.get": ("weather forecast", ["date", "place", "week", "hourly"]),
-}
+# Intent catalogue shown to the model — DERIVED from the single source of
+# truth (voice_intent_registry) so it can never drift from what the executor
+# actually supports (v2 rewrite: replaces a hand-maintained duplicate list).
+def _build_catalogue() -> dict[str, tuple[str, list[str]]]:
+    from secretary_clean.core import voice_intent_registry as _reg
+    out: dict[str, tuple[str, list[str]]] = {}
+    for code, spec in _reg.REGISTRY.items():
+        if not spec.is_implemented or not spec.is_active:
+            continue
+        out[code] = (spec.description,
+                     list(spec.required_entities) + list(spec.optional_entities))
+    return out
+
+
+INTENT_CATALOGUE: dict[str, tuple[str, list[str]]] = _build_catalogue()
 
 
 def is_configured() -> bool:

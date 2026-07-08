@@ -3,12 +3,10 @@ from fastapi.testclient import TestClient
 
 from secretary_clean import create_app
 from secretary_clean.core import ai_intent
-import secretary_clean.api.routes.voice as voice_routes
 
 
 def _client(monkeypatch):
     monkeypatch.setenv("SECRETARY_CLEAN_JWT_SECRET", "test-secret-for-clean-backend")
-    voice_routes._LEARNED.clear()
     c = TestClient(create_app())
     company = c.post("/api/v1/bootstrap/first-company", json={"legal_name": "AI Ltd"}).json()
     c.post("/api/v1/bootstrap/first-admin", json={

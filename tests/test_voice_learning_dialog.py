@@ -2,12 +2,10 @@
 from fastapi.testclient import TestClient
 
 from secretary_clean import create_app
-import secretary_clean.api.routes.voice as voice_routes
 
 
 def _bootstrap(monkeypatch):
     monkeypatch.setenv("SECRETARY_CLEAN_JWT_SECRET", "test-secret-for-clean-backend")
-    voice_routes._LEARNED.clear()
     client = TestClient(create_app())
     company = client.post("/api/v1/bootstrap/first-company",
                           json={"legal_name": "Dialog Ltd",
@@ -81,10 +79,10 @@ def test_learn_dialog_gives_up_after_two_unclear_answers(monkeypatch):
 
 def test_learn_dialog_pending_when_target_not_implemented(monkeypatch):
     client, headers = _bootstrap(monkeypatch)
-    out = _say(client, headers, "zafakturuj tým")
+    out = _say(client, headers, "kobliha expres blafuj")
     pid = out["pending_action_id"]
-    done = _say(client, headers, "vytvoř fakturu", pid)
+    done = _say(client, headers, "pošli fakturu", pid)
     assert done["executed"] is True
     aliases = client.get("/api/v1/voice/aliases", headers=headers).json()["aliases"]
-    learned = [a for a in aliases if a["target_intent"] == "invoice.from_work_report"]
+    learned = [a for a in aliases if a["target_intent"] == "invoice.send"]
     assert learned and learned[0]["status"] == "PENDING"
