@@ -174,7 +174,13 @@ def get_tenant_activity_pricing(
                     "industry_code": ind.code,
                     "subtype_code": sub.code,
                     "pricing_method": override.selected_pricing_method_code if override else act.default_pricing_method_code,
-                    "rate": (override.rate if override.rate is not None else 0.0) if override else preset,
+                    # A tenant row records which activities are selected
+                    # (is_active) and MAY carry a custom price. When it carries
+                    # no price (rate is NULL — e.g. seeded at onboarding), the
+                    # activity must still show its system default, NOT 0. The old
+                    # `else 0.0` blanked the rate of every *selected* activity,
+                    # which is exactly why "most marked activities had no rate".
+                    "rate": (override.rate if (override and override.rate is not None) else preset),
                     "default_rate": preset,
                     "rate_unit": default_rates.RATE_UNITS.get(
                         (override.selected_pricing_method_code if override
