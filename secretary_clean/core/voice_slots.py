@@ -13,9 +13,10 @@ _SLOTS = {
         ("title_or_person", "S kým nebo jaký název má schůzka mít?"),
     ],
     "client.create": [
+        # Only the name is required — asking for phone AND address on every
+        # voice-created client was too rigid. They can be added later or spoken
+        # in the same sentence ("...telefon 777123456").
         ("name", "Jak se klient jmenuje?"),
-        ("phone", "Jaké je telefonní číslo klienta?"),
-        ("address", "Jaká je adresa klienta?"),
     ],
     "whatsapp.send": [
         ("person", "Komu mám WhatsApp poslat?"),

@@ -245,6 +245,18 @@ _JOB_STATUS_MAP = (
     (("zrušeno", "zruseno", "cancelled", "zrušená"), "zrušeno"),
     (("nová", "nova", "new"), "nová"),
 )
+def map_job_status(text: str) -> str | None:
+    """Map a spoken status phrase to a canonical job status, or None. Public so
+    the continuation (slot-answer) path maps 'hotovo' → 'dokončeno' too."""
+    low = (text or "").lower()
+    for words, canonical in _JOB_STATUS_MAP:
+        if any(w in low for w in words):
+            return canonical
+    if "dokonč" in low or "dokonc" in low:
+        return "dokončeno"
+    return None
+
+
 _CREATE_WR = ("create work report", "new work report", "work report",
               "vytvoř report", "vytvor report", "pracovní výkaz", "pracovni vykaz")
 _NEXT_WORDS = ("next", "dál", "dal", "nejbliž", "nejbliz")

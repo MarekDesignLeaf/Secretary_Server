@@ -18,6 +18,7 @@ from secretary_clean.api.routes import (
     bootstrap,
     calendar,
     catalogue,
+    chat,
     company,
     contacts_directory,
     crm_v2,
@@ -237,6 +238,7 @@ def create_app(repository=None) -> FastAPI:
     app.include_router(backup.router, prefix="/api/v1")
     app.include_router(activities_compat.router, prefix="/api/v1")
     app.include_router(assistant.router, prefix="/api/v1")
+    app.include_router(chat.router, prefix="/api/v1")
     app.include_router(admin.router, prefix="/api/v1")
     app.include_router(whatsapp.router, prefix="/api/v1")
     app.include_router(translate.router, prefix="/api/v1")

@@ -56,8 +56,9 @@ class H:
 
     @staticmethod
     def ask(message, missing, **kw):
+        kw.setdefault("question", message)   # caller may override the question text
         return H(executed=False, message=message, status="needs_more_info",
-                 missing=missing, question=message, **kw)
+                 missing=missing, **kw)
 
 
 def _strip(s: str) -> str:
@@ -436,9 +437,15 @@ def task_assign(ctx: Ctx, data: dict) -> H:
     matched = [t for t in open_tasks
                if any(w in raw or (hint and w in hint)
                       for w in (t.name or "").lower().split() if len(w) > 3)]
-    target = matched[0] if matched else (open_tasks[-1] if open_tasks else None)
-    if target is None:
-        return H.error("Nenašla jsem úkol k přiřazení.")
+    if not matched:
+        # Never silently assign an arbitrary task — ask which one.
+        if len(open_tasks) == 1:
+            matched = open_tasks
+        else:
+            names = ", ".join(t.name for t in open_tasks[:5]) or "žádné"
+            return H.ask(f"Který úkol mám přiřadit {person}? Otevřené: {names}.",
+                         ["target"])
+    target = matched[0]
     d = dict(target.data or {})
     d["assignee"] = person
     updated = repository.update_crm_record("tasks", target.id, user.company_id,
@@ -502,7 +509,8 @@ def job_change_status(ctx: Ctx, data: dict) -> H:
     raw = (data.get("raw") or "").lower()
     ref = data.get("entity_ref") or {}
     jobs = repository.list_crm_records("jobs", user.company_id)
-    active = [j for j in jobs if (j.status or "open") not in ("uzavřeno", "deleted")]
+    active = [j for j in jobs
+              if (j.status or "open") not in ("uzavřeno", "deleted", "zrušeno")]
     if ref.get("kind") == "job":                    # anaphora: "tu zakázku"
         matched = [j for j in active if j.id == ref.get("id")]
     else:

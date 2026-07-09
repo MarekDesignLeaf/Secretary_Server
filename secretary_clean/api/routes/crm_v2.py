@@ -621,6 +621,90 @@ def create_communication(
     return out
 
 
+@router.post("/communications/provider-history-import")
+def provider_history_import(
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Pull provider (e.g. WhatsApp Business) message history into communications.
+
+    No server-side provider history source is configured, so this scans nothing
+    and imports nothing — but returns the shape the app expects instead of a 404,
+    with an honest message. Real message import happens device-side via
+    POST /crm/communications/import.
+    """
+    total = len(_records(repository, "communications", user.company_id))
+    return {"summary": {"scanned": 0, "imported": 0, "updated": 0,
+                        "matched": 0, "unmatched": 0, "total": total,
+                        "message": "Na serveru není napojený zdroj historie zpráv. "
+                                   "Zprávy importuj z telefonu."}}
+
+
+@router.post("/communications/whatsapp-address-sync")
+def whatsapp_address_sync(
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Scan inbound communications for postal addresses and fill the matching
+    client's address when it has none. Body: {apply, overwrite, limit}."""
+    apply = bool(payload.get("apply", True))
+    limit = int(payload.get("limit") or 10000)
+    comms = [r for r in _records(repository, "communications", user.company_id)
+             if str((r.data or {}).get("direction") or "").lower() == "in"][:limit]
+    scanned = 0
+    updated = 0
+    for rec in comms:
+        scanned += 1
+        if not apply:
+            continue
+        if autofill_client_address_from_comm(repository, user, rec):
+            updated += 1
+    return {"summary": {"scanned": scanned, "updated": updated}}
+
+
+@router.put("/notifications/{notification_id}/read")
+def mark_notification_read(
+    notification_id: str,
+    user: UserAccount = Depends(current_user),
+):
+    """Mark a notification read. Notifications aren't persisted server-side yet,
+    so this is idempotent and always succeeds (keeps the client from 404-ing)."""
+    return {"ok": True, "id": notification_id, "read": True}
+
+
+@router.post("/import", status_code=201)
+def import_records(
+    payload: dict,
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """Generic bulk import into a CRM table. Body: {table, rows: [ {...}, ... ]}.
+    Allowed tables: clients, leads, communications, tasks, jobs. Each row is
+    created like the matching POST; malformed rows are skipped, not fatal."""
+    table = (payload.get("table") or "clients").strip()
+    allowed = {"clients", "leads", "communications", "tasks", "jobs"}
+    if table not in allowed:
+        raise HTTPException(status_code=422,
+                            detail=f"Unsupported table '{table}'. Allowed: {sorted(allowed)}")
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=422, detail="rows (list) required")
+    imported, skipped = 0, 0
+    for row in rows:
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        try:
+            _create(repository, table, user, row)
+            imported += 1
+        except HTTPException:
+            skipped += 1
+    return {"table": table, "imported_count": imported, "skipped_count": skipped,
+            "total_in_table": len(_records(repository, table, user.company_id))}
+
+
 @router.post("/communications/import", status_code=201)
 def import_communications(
     payload: dict,

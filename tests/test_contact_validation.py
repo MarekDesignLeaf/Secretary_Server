@@ -126,19 +126,12 @@ def test_lead_to_client_conversion_normalizes_phone(monkeypatch):
     assert body["email_primary"] == "z@example.com"
 
 
-def test_voice_client_create_reasks_on_bad_phone(monkeypatch):
+def test_voice_client_create_needs_only_name(monkeypatch):
+    # v2 UX: creating a client by voice needs only a name — no forced phone/
+    # address questions. Phone/email validation still guards the REST create
+    # (covered by the other tests in this file).
     client, headers = _bootstrap(monkeypatch)
     out = _say(client, headers, "vytvoř klienta Jan Novák")
-    pid = out["pending_action_id"]
-    assert "telefon" in out["message"].lower()
-
-    _say(client, headers, "1234", pid)               # bad phone (asked address next)
-    addr = _say(client, headers, "Hlavní 5 Praha", pid)
-    # All slots filled → phone "1234" is rejected, dialog re-asks for the phone.
-    assert addr["status"] == "needs_more_info"
-    assert "telefon" in addr["message"].lower()
-
-    done = _say(client, headers, "777 123 456", pid)
-    assert done["executed"] is True
+    assert out["executed"] is True, out
     stored = client.get("/api/v1/crm/clients", headers=headers).json()
-    assert any(c["phone_primary"] == "777123456" for c in stored)
+    assert any((c.get("display_name") or c.get("name")) == "Jan Novák" for c in stored)

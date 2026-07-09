@@ -133,7 +133,11 @@ def _merge_answer(intent: str, text: str, data: dict) -> dict:
     ans = text.strip()
     for slot in _ANSWER_ORDER.get(intent, ()):
         if not d.get(slot):
-            d[slot] = ans
+            # normalize known enum-ish slots instead of storing raw text (P1-5)
+            if slot == "new_status":
+                d[slot] = vi.map_job_status(ans) or ans
+            else:
+                d[slot] = ans
             break
     return d
 
@@ -258,7 +262,13 @@ class Engine:
         if pending and pending.intent == "alias.learn":
             return self._continue_learning(pending)
 
-        if pending and _is_cancel(payload.utterance):
+        if pending and pending.intent == "__ambiguous__":
+            return self._continue_ambiguous(pending)
+
+        # Cancel a pending action ONLY on a whole-utterance cancel ("zruš to",
+        # "omyl"), never on a substring — a dictated note/message that merely
+        # contains "stop"/"nechci"/"konec" must be captured, not aborted (P0-3).
+        if pending and vres.is_pure_cancel(payload.utterance):
             pending.status = "cancelled"
             repository.update_pending_action(pending)
             return self.res(False, "Dobře, akci jsem zrušila.", status="cancelled",
@@ -351,6 +361,48 @@ class Engine:
         raise _Reply(self.res(False, prefix + question, status=status, action=intent,
                               data=data, needs_confirm=needs_confirm,
                               missing=missing, question=question, pending_id=pid))
+
+    # -- ambiguity disambiguation follow-up (P1-7) ------------------------------
+    def _continue_ambiguous(self, pending) -> VoiceExecuteResult:
+        payload, repository = self.payload, self.repository
+        cd = dict(pending.collected_data or {})
+        candidates = cd.get("candidates") or []
+        descs = cd.get("desc") or []
+        orig = cd.get("orig_text") or ""
+        ans = vsyn.normalize(payload.utterance)
+        if vres.is_pure_cancel(payload.utterance) or not candidates:
+            pending.status = "cancelled"
+            repository.update_pending_action(pending)
+            return self.res(False, "Dobře, nic nedělám.", status="cancelled",
+                            pending_id=pending.id)
+        chosen = None
+        if any(w in ans for w in ("prvni", "prvni", "jedna", "jedna", "1", "first")):
+            chosen = candidates[0]
+        elif any(w in ans for w in ("druh", "dva", "2", "second")):
+            chosen = candidates[1] if len(candidates) > 1 else candidates[0]
+        else:
+            # match the answer against the candidate descriptions / a fresh parse
+            for cand, desc in zip(candidates, descs):
+                dn = vsyn.normalize(desc or "")
+                if dn and any(w in dn for w in ans.split() if len(w) > 3):
+                    chosen = cand
+                    break
+            if chosen is None:
+                rp = vi.parse_intent(payload.utterance)
+                if rp.intent in candidates:
+                    chosen = rp.intent
+        if chosen is None:
+            q = pending.last_question or "Řekni prosím první, nebo druhé."
+            return self.res(False, q, status="needs_more_info", question=q,
+                            missing=["choice"], pending_id=pending.id)
+        pending.status = "executed"
+        repository.update_pending_action(pending)
+        # Re-run the ORIGINAL utterance's entities against the chosen intent.
+        data = nlu.entities_from_text(chosen, orig or payload.utterance)
+        ctx = nlu.SegmentContext()
+        self._process_step(chosen, data, "PARSER", ctx, queue=[],
+                           raw=orig or payload.utterance)
+        return self._final_result()
 
     # -- learning dialog (ported from v1, unchanged semantics) ------------------
     def _continue_learning(self, pending) -> VoiceExecuteResult:
@@ -450,8 +502,21 @@ class Engine:
             q = f"Nerozumím přesně. Myslíš {da}, nebo {db}?"
             vls.record_event(repository, user.company_id, user.id, text, "AMBIGUOUS",
                              metadata={"candidates": [a, b]})
+            # Park a pending so the user can actually answer (P1-7). The follow-up
+            # is handled by _continue_ambiguous.
+            now = datetime.now(timezone.utc)
+            pa = PendingVoiceAction(
+                id=str(uuid.uuid4()), company_id=user.company_id, user_id=user.id,
+                intent="__ambiguous__", status="needs_more_info",
+                collected_data={"candidates": [a, b], "orig_text": text,
+                                "desc": [da, db]},
+                missing_fields=["choice"], last_question=q,
+                created_at=now, updated_at=now,
+                expires_at=now + timedelta(minutes=PENDING_TTL_MIN))
+            repository.create_pending_action(pa)
             raise _Reply(self.res(False, q, status="needs_more_info", action=None,
-                                  question=q, data={"candidates": [a, b]}))
+                                  question=q, data={"candidates": [a, b]},
+                                  pending_id=pa.id))
         if resolution.intent and resolution.source in ("BUILTIN_SYNONYM", "USER_ALIAS"):
             if not resolution.is_implemented:
                 vls.record_event(repository, user.company_id, user.id, text,
@@ -546,9 +611,20 @@ class Engine:
         if pending:
             self._finish_pending(pending, data)
 
+        # Confirmation is server-driven: a fresh dangerous intent ALWAYS goes
+        # through the dry-run + "ano" turn. A client-sent payload.confirmed does
+        # NOT bypass it (P2-16); only the engine's own _confirmed flag (set when
+        # the user actually said "ano") counts.
         self._execute_step(intent, data, source, ctx, queue=queue,
-                           confirmed=bool(self.payload.confirmed)
-                           or bool(data.get("_confirmed")), raw=raw)
+                           confirmed=bool(data.get("_confirmed")), raw=raw)
+
+    def _fail_step(self, intent, raw, message, ctx, queue):
+        """Record a failed command and CONTINUE the batch — one clause failing
+        must not discard the report of clauses that already succeeded (P2-14).
+        For a lone command this still surfaces the error via _final_result."""
+        self.commands.append({"utterance": raw, "intent": intent, "executed": False,
+                              "status": "error", "message": message})
+        self._continue_queue(ctx, queue)
 
     def _execute_step(self, intent: str, data: dict, source: str,
                       ctx: nlu.SegmentContext, *, queue: list, confirmed: bool,
@@ -561,19 +637,13 @@ class Engine:
             vls.record_event(repository, user.company_id, user.id,
                              raw or self.payload.utterance, "FAILED_PERMISSION",
                              resolved_intent=intent)
-            self.commands.append({"utterance": raw, "intent": intent,
-                                  "executed": False, "status": "error",
-                                  "message": "Na tento příkaz nemáš oprávnění."})
-            raise _Reply(self.res(False, "Na tento příkaz nemáš oprávnění.",
-                                  status="error", action=intent))
+            return self._fail_step(intent, raw, "Na tento příkaz nemáš oprávnění.",
+                                   ctx, queue)
 
         handler = HANDLERS.get(intent)
         if handler is None:
-            self.commands.append({"utterance": raw, "intent": intent,
-                                  "executed": False, "status": "error",
-                                  "message": f"Intent '{intent}' zatim neumim vykonat."})
-            raise _Reply(self.res(False, f"Intent '{intent}' zatim neumim vykonat.",
-                                  status="error", action=intent))
+            return self._fail_step(intent, raw, f"Intent '{intent}' zatim neumim vykonat.",
+                                   ctx, queue)
 
         base_utter = raw or self.payload.utterance
 
@@ -593,10 +663,7 @@ class Engine:
                 if pre.status == "needs_more_info":
                     self._park(intent, data, pre.question or pre.message,
                                pre.missing or ["value"], queue)
-                self.commands.append({"utterance": raw, "intent": intent,
-                                      "executed": False, "status": "error",
-                                      "message": pre.message})
-                raise _Reply(self.res(False, pre.message, status="error", action=intent))
+                return self._fail_step(intent, raw, pre.message, ctx, queue)
             desc = vreg.get(intent).description if vreg.get(intent) else intent
             q = (pre.message if pre is not None and pre.status == "ready"
                  else f"Mám opravdu provést: {desc}? Řekni ano, nebo zruš.")
@@ -613,19 +680,16 @@ class Engine:
         try:
             h: H = handler(hctx, data)
         except Exception as exc:  # noqa: BLE001 — a failed step must be reported, not a 500
-            self.commands.append({"utterance": raw, "intent": intent,
-                                  "executed": False, "status": "error",
-                                  "message": f"Akce selhala: {exc}."})
-            raise _Reply(self.res(False, f"Akce selhala: {exc}.", status="error",
-                                  action=intent))
+            return self._fail_step(intent, raw, f"Akce selhala: {exc}.", ctx, queue)
 
         if h.status == "needs_more_info":
             self._park(intent, data, h.question or h.message, h.missing or ["value"],
                        queue)
 
-        # read-back verification of writes
+        # read-back verification of writes — only when there is a concrete field
+        # to check (an empty expected map would "verify" vacuously; P2-11).
         verification = None
-        if h.executed and h.verify_kind and h.entity_id:
+        if h.executed and h.verify_kind and h.entity_id and h.verify_expected:
             vr = vfy.run(repository, user.company_id,
                          vfy.VerifySpec(kind=h.verify_kind, entity_id=h.entity_id,
                                         expected=h.verify_expected))

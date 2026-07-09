@@ -65,16 +65,35 @@ def run(repository, company_id: str, spec: VerifySpec) -> VerifyResult:
     ok_all = True
     for f, expected in (spec.expected or {}).items():
         actual = _get(rec, f)
-        ok = _loose_eq(expected, actual)
+        ok = _field_eq(f, expected, actual)
         checked[f] = {"expected": expected, "actual": actual, "ok": ok}
         ok_all = ok_all and ok
     return VerifyResult(verified=ok_all, checked=checked)
 
 
-def _loose_eq(expected, actual) -> bool:
+def _field_eq(field_name: str, expected, actual) -> bool:
     if expected is None:
         return True
+    # datetime fields (e.g. start_at): compare the instant, tolerating tz-naive
+    # vs tz-aware and trailing-Z formatting differences (P2-12).
+    if field_name in ("start_at",) and isinstance(expected, str) and isinstance(actual, str):
+        return _same_instant(expected, actual)
     if isinstance(expected, str) and isinstance(actual, str):
-        return expected.strip().lower() == actual.strip().lower() or \
-            expected.strip().lower() in actual.strip().lower()
+        # exact match after normalizing whitespace/case — no loose substring,
+        # which used to let a partially-wrong value pass verification (P2-10).
+        return expected.strip().lower() == actual.strip().lower()
     return expected == actual
+
+
+def _same_instant(a: str, b: str) -> bool:
+    from datetime import datetime, timezone
+    def _p(s):
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:  # noqa: BLE001
+            return None
+    da, db = _p(a), _p(b)
+    if da and db:
+        return da == db
+    return a.strip() == b.strip()

@@ -38,19 +38,16 @@ def test_multi_command_one_sentence_creates_two_records(monkeypatch):
     assert len(tasks) >= 1 and len(jobs) >= 1
 
 
-def test_multi_command_parks_queue_when_first_needs_slot(monkeypatch):
+def test_multi_command_client_then_task(monkeypatch):
     c, h = _client(monkeypatch)
-    # client.create asks for phone/address → the engine parks BUT remembers the
-    # queued second command and runs it after the dialog completes.
+    # client.create now needs only a name, so both clauses complete in one shot.
     out = _exec(c, h, "vytvoř klienta Jan Novák a vytvoř úkol zavolat dodavateli")
-    assert out["status"] == "needs_more_info"
-    pid = out["pending_action_id"]
-    out = _exec(c, h, "+420777123456", pid)        # phone
-    if out["status"] == "needs_more_info":
-        out = _exec(c, h, "Hlavní 1, Praha", pid)  # address
-    # After finishing the client, the queued task ran too.
-    tasks = c.get("/api/v1/crm/tasks", headers=h).json()
-    assert len(tasks) >= 1
+    cmds = out["data"]["commands"]
+    assert len(cmds) == 2
+    assert cmds[0]["intent"] == "client.create" and cmds[0]["executed"]
+    assert cmds[1]["intent"] == "task.create" and cmds[1]["executed"]
+    assert len(c.get("/api/v1/crm/clients", headers=h).json()) >= 1
+    assert len(c.get("/api/v1/crm/tasks", headers=h).json()) >= 1
 
 
 def test_write_is_verified_by_read_back(monkeypatch):
