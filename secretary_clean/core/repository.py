@@ -1191,6 +1191,16 @@ class InMemorySecretaryRepository:
         del self.calendar_events[event_id]
         return True
 
+    def purge_imported_calendar_events(self, company_id: str) -> int:
+        """Bulk-delete events with created_by IS NULL (the buggy pull-imports)
+        and their Google mappings. Returns the number of events removed."""
+        to_del = [e.id for e in self.calendar_events.values()
+                  if e.company_id == company_id and not e.created_by]
+        for eid in to_del:
+            self.calendar_events.pop(eid, None)
+            self.delete_google_mapping(company_id, eid)
+        return len(to_del)
+
     # ------------------------------------------------------------------
     # Phase A5: calendar sync log + synchronization
     # ------------------------------------------------------------------

@@ -2434,6 +2434,25 @@ class PostgresSecretaryRepository:
             conn.commit()
         return deleted
 
+    def purge_imported_calendar_events(self, company_id: str) -> int:
+        """Bulk-delete events with no author (created_by IS NULL) — i.e. the ones
+        the buggy pull-import created — plus their Google mappings. One SQL round
+        trip, so it is safe to run even when the per-event endpoint is saturated."""
+        with _PooledConnection(self._pool) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """DELETE FROM clean_google_calendar_mappings m
+                       USING clean_calendar_events e
+                       WHERE m.company_id = %s AND m.backend_event_id = e.id
+                         AND e.company_id = %s AND e.created_by IS NULL""",
+                    (company_id, company_id))
+                cur.execute(
+                    "DELETE FROM clean_calendar_events WHERE company_id = %s AND created_by IS NULL",
+                    (company_id,))
+                n = cur.rowcount
+            conn.commit()
+        return n
+
     # ------------------------------------------------------------------
     # Phase A5: calendar sync log + synchronization
     # ------------------------------------------------------------------

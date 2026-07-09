@@ -93,6 +93,18 @@ def delete_event(
     return {"deleted": True, "id": event_id}
 
 
+@router.post("/events/purge-imported")
+def purge_imported_events(
+    user: UserAccount = Depends(require_permission(Permission.crm_manage)),
+    repository: InMemorySecretaryRepository = Depends(get_repository),
+):
+    """One-shot cleanup: remove calendar events with no author (created_by NULL)
+    — the duplicates the reverted pull-import created — in a single DB statement.
+    User-authored events (created_by set) are untouched."""
+    removed = repository.purge_imported_calendar_events(user.company_id)
+    return {"removed": removed}
+
+
 @router.post("/sync", response_model=CalendarSyncResult)
 def sync_calendar(
     payload: CalendarSyncRequest,
